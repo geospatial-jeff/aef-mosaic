@@ -93,11 +93,15 @@ pub fn create_anonymous_store(bucket: &str) -> Result<Arc<dyn ObjectStore>> {
 fn create_authenticated_store(bucket: &str) -> Result<Arc<dyn ObjectStore>> {
     tracing::info!("Creating authenticated S3 client for bucket: {}", bucket);
 
+    // Buckets with dots in the name require path-style URLs
+    // Virtual-hosted style creates invalid hostnames like "bucket.name.s3.region.amazonaws.com"
+    let use_virtual_hosted = !bucket.contains('.');
+
     let builder = AmazonS3Builder::from_env()
         .with_bucket_name(bucket)
         .with_client_options(create_client_options())
         .with_retry(create_retry_config())
-        .with_virtual_hosted_style_request(true);
+        .with_virtual_hosted_style_request(use_virtual_hosted);
 
     Ok(Arc::new(builder.build()?))
 }
