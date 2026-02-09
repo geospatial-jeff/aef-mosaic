@@ -15,9 +15,6 @@ pub struct Config {
     /// Processing configuration
     pub processing: ProcessingConfig,
 
-    /// AWS/S3 configuration
-    pub aws: AwsConfig,
-
     /// Optional filter to limit processing area and years
     #[serde(default)]
     pub filter: Option<FilterConfig>,
@@ -260,18 +257,6 @@ pub struct FilterConfig {
     pub years: Option<Vec<i32>>,
 }
 
-/// AWS/S3 configuration.
-///
-/// Credentials are automatically loaded from:
-/// - Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
-/// - AWS config files (~/.aws/credentials, ~/.aws/config)
-/// - EC2 instance profile (IMDS)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AwsConfig {
-    /// AWS region
-    pub region: String,
-}
-
 impl Default for ProcessingConfig {
     fn default() -> Self {
         Self {
@@ -291,13 +276,6 @@ impl Default for ProcessingConfig {
     }
 }
 
-impl Default for AwsConfig {
-    fn default() -> Self {
-        Self {
-            region: "us-west-2".to_string(),
-        }
-    }
-}
 
 impl Config {
     /// Load configuration from a YAML or JSON file.
@@ -420,7 +398,6 @@ mod tests {
                 compression_level: 3,
             },
             processing: ProcessingConfig::default(),
-            aws: AwsConfig::default(),
             filter: None,
         };
 
@@ -449,7 +426,6 @@ mod tests {
                 compression_level: 3,
             },
             processing: ProcessingConfig::default(),
-            aws: AwsConfig::default(),
             filter: None,
         };
 
@@ -479,7 +455,6 @@ mod tests {
                 compression_level: 3,
             },
             processing: ProcessingConfig::default(),
-            aws: AwsConfig::default(),
             filter: None,
         };
 

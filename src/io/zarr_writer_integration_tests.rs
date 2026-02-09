@@ -6,7 +6,7 @@
 //! 3. Arc<ZarrWriter> with concurrent writes
 //! 4. Data flow from mosaic → write
 
-use crate::config::{ChunkShape, Config, OutputConfig, InputConfig, AwsConfig, ProcessingConfig};
+use crate::config::{ChunkShape, Config, OutputConfig, InputConfig, ProcessingConfig};
 use crate::index::{OutputChunk, OutputGrid};
 use crate::io::ZarrWriter;
 use futures::stream::{self, StreamExt};
@@ -36,9 +36,6 @@ fn create_test_config(chunk_shape: ChunkShape) -> Config {
             shard_shape: [1, 1],
         },
         processing: ProcessingConfig::default(),
-        aws: AwsConfig {
-            region: "us-west-2".to_string(),
-        },
         filter: None,
     }
 }

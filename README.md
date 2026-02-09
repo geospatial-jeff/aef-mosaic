@@ -97,11 +97,6 @@ processing:
     initial_backoff_ms: 100
     max_backoff_ms: 10000
 
-# === AWS: S3 connection settings ===
-# Credentials are loaded from: env vars, ~/.aws/credentials, or EC2 instance profile
-aws:
-  region: "us-west-2"
-
 # === FILTER: Limit processing area (optional) ===
 # filter:
 #   bounds: [-122.6, 37.2, -121.8, 37.9]  # [min_lon, min_lat, max_lon, max_lat]

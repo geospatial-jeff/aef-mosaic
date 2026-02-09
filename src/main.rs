@@ -116,7 +116,7 @@ fn analyze_work(config: &Config) -> Result<()> {
         tracing::info!("Loading tile index from {}", config.input.index_path);
         let input_index = if config.input.index_path.starts_with("s3://") {
             let (bucket, key) = io::parse_s3_uri(&config.input.index_path)?;
-            let store = io::create_object_store(bucket, &config.aws)?;
+            let store = io::create_anonymous_store(bucket)?;
             let path = object_store::path::Path::from(key);
             InputIndex::from_s3(store, &path).await?
         } else {
@@ -304,11 +304,6 @@ processing:
     max_retries: 3
     initial_backoff_ms: 100
     max_backoff_ms: 10000
-
-# === AWS: S3 connection settings ===
-# Credentials are loaded from: env vars, ~/.aws/credentials, or EC2 instance profile
-aws:
-  region: "us-west-2"
 
 # === FILTER: Limit processing to a subset (optional) ===
 # Uncomment to process only a specific area or time range.

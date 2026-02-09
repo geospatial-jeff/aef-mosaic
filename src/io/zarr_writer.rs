@@ -278,9 +278,6 @@ mod integration_tests {
                 shard_shape: [1, 1],
             },
             processing: crate::config::ProcessingConfig::default(),
-            aws: crate::config::AwsConfig {
-                region: "us-west-2".to_string(),
-            },
             filter: None,
         }
     }
@@ -475,9 +472,6 @@ mod production_test {
                 shard_shape: [1, 1],
             },
             processing: crate::config::ProcessingConfig::default(),
-            aws: crate::config::AwsConfig {
-                region: "us-west-2".to_string(),
-            },
             filter: None,
         };
 
@@ -574,9 +568,6 @@ mod production_test {
                 shard_shape: [1, 1],
             },
             processing: crate::config::ProcessingConfig::default(),
-            aws: crate::config::AwsConfig {
-                region: "us-west-2".to_string(),
-            },
             filter: None,
         };
 
@@ -679,9 +670,6 @@ mod concurrent_test {
                 shard_shape: [1, 1],
             },
             processing: crate::config::ProcessingConfig::default(),
-            aws: crate::config::AwsConfig {
-                region: "us-west-2".to_string(),
-            },
             filter: None,
         };
 

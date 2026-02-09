@@ -3,7 +3,6 @@
 //! This module provides optimized S3 client configuration for high-throughput
 //! data transfer, including connection pool tuning and timeout settings.
 
-use crate::config::AwsConfig;
 use anyhow::{Context, Result};
 
 /// Parse an S3 URI into bucket and key components.
@@ -29,22 +28,6 @@ use object_store::local::LocalFileSystem;
 use object_store::{ClientOptions, ObjectStore, RetryConfig};
 use std::sync::Arc;
 use std::time::Duration;
-
-/// Known public buckets that don't require credentials.
-const PUBLIC_BUCKETS: &[&str] = &[
-    "us-west-2.opendata.source.coop",
-];
-
-/// Check if a bucket is a known public bucket.
-fn is_public_bucket(bucket: &str) -> bool {
-    PUBLIC_BUCKETS.iter().any(|&b| bucket == b || bucket.ends_with(".opendata.source.coop"))
-}
-
-/// Check if a bucket name indicates S3 Express One Zone.
-/// S3 Express bucket names follow the pattern: bucket-name--az-id--x-s3
-fn is_express_bucket(bucket: &str) -> bool {
-    bucket.contains("--") && bucket.ends_with("--x-s3")
-}
 
 /// Create optimized client options for high-throughput S3 access.
 ///
@@ -83,47 +66,49 @@ fn create_retry_config() -> RetryConfig {
     }
 }
 
-/// Create an object store for the given S3 bucket.
+/// Create an anonymous S3 client for reading from source.coop (public bucket).
 ///
-/// Handles public buckets (anonymous) and standard S3.
-/// For private buckets, credentials are loaded from (in order):
-/// - Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
-/// - AWS config files (~/.aws/credentials, ~/.aws/config)
-/// - EC2 instance profile (IMDS)
-pub fn create_object_store(bucket: &str, config: &AwsConfig) -> Result<Arc<dyn ObjectStore>> {
-    // Use from_env() to pick up credentials from environment, config files, and IMDS
-    let mut builder = AmazonS3Builder::from_env()
+/// Used for reading COG tiles and index. No credentials needed.
+/// Hardcoded to us-west-2 where source.coop is hosted.
+pub fn create_anonymous_store(bucket: &str) -> Result<Arc<dyn ObjectStore>> {
+    tracing::info!("Creating anonymous S3 client for bucket: {}", bucket);
+
+    let builder = AmazonS3Builder::new()
         .with_bucket_name(bucket)
-        .with_region(&config.region)
+        .with_region("us-west-2") // source.coop is in us-west-2
         .with_client_options(create_client_options())
-        .with_retry(create_retry_config());
-
-    if is_public_bucket(bucket) {
-        // Public buckets: anonymous access, path-style URLs
-        builder = builder
-            .with_skip_signature(true)
-            .with_virtual_hosted_style_request(false);
-    } else {
-        // Private buckets: use virtual-hosted style
-        // Credentials come from from_env() - config files, env vars, or IMDS
-        builder = builder.with_virtual_hosted_style_request(true);
-
-        if is_express_bucket(bucket) {
-            tracing::info!("Configuring S3 Express One Zone for bucket: {}", bucket);
-        }
-    }
+        .with_retry(create_retry_config())
+        .with_skip_signature(true)
+        .with_virtual_hosted_style_request(false);
 
     Ok(Arc::new(builder.build()?))
 }
 
-/// Create a store for the input COG bucket.
-pub fn create_cog_store(config: &crate::config::Config) -> Result<Arc<dyn ObjectStore>> {
-    create_object_store(&config.input.cog_bucket, &config.aws)
+/// Create an authenticated S3 client for writing.
+///
+/// Credentials and region are loaded from (in order):
+/// - Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION)
+/// - AWS config files (~/.aws/credentials, ~/.aws/config)
+/// - EC2 instance profile (IMDS)
+fn create_authenticated_store(bucket: &str) -> Result<Arc<dyn ObjectStore>> {
+    tracing::info!("Creating authenticated S3 client for bucket: {}", bucket);
+
+    let builder = AmazonS3Builder::from_env()
+        .with_bucket_name(bucket)
+        .with_client_options(create_client_options())
+        .with_retry(create_retry_config())
+        .with_virtual_hosted_style_request(true);
+
+    Ok(Arc::new(builder.build()?))
 }
 
-/// Create a store for the output Zarr.
-/// Uses LocalFileSystem if local_path is set, otherwise S3.
-/// Panics if config is invalid (call validate() first).
+/// Create a store for reading input COG tiles (anonymous, no credentials).
+pub fn create_cog_store(config: &crate::config::Config) -> Result<Arc<dyn ObjectStore>> {
+    create_anonymous_store(&config.input.cog_bucket)
+}
+
+/// Create a store for writing output Zarr (authenticated).
+/// Uses LocalFileSystem if local_path is set, otherwise S3 with credentials.
 pub fn create_output_store(config: &crate::config::Config) -> Result<Arc<dyn ObjectStore>> {
     match (&config.output.local_path, &config.output.bucket) {
         (Some(local_path), _) => {
@@ -134,7 +119,7 @@ pub fn create_output_store(config: &crate::config::Config) -> Result<Arc<dyn Obj
             tracing::info!("Creating LocalFileSystem store at: {}", path.display());
             Ok(Arc::new(LocalFileSystem::new_with_prefix(path)?))
         }
-        (_, Some(bucket)) => create_object_store(bucket, &config.aws),
+        (_, Some(bucket)) => create_authenticated_store(bucket),
         _ => anyhow::bail!("Invalid config: no output destination"),
     }
 }
@@ -155,31 +140,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_create_store() {
-        let config = AwsConfig {
-            region: "us-east-1".to_string(),
-        };
-
-        let result = create_object_store("test-bucket", &config);
+    fn test_create_authenticated_store() {
+        let result = create_authenticated_store("test-bucket");
         assert!(result.is_ok());
     }
 
     #[test]
-    fn test_is_express_bucket() {
-        // Standard bucket names
-        assert!(!is_express_bucket("my-bucket"));
-        assert!(!is_express_bucket("my-bucket-us-west-2"));
-
-        // S3 Express One Zone bucket names
-        assert!(is_express_bucket("my-bucket--usw2-az1--x-s3"));
-        assert!(is_express_bucket("data-bucket--use1-az4--x-s3"));
-    }
-
-    #[test]
-    fn test_is_public_bucket() {
-        assert!(is_public_bucket("us-west-2.opendata.source.coop"));
-        assert!(is_public_bucket("something.opendata.source.coop"));
-        assert!(!is_public_bucket("my-private-bucket"));
+    fn test_create_anonymous_store() {
+        let result = create_anonymous_store("us-west-2.opendata.source.coop");
+        assert!(result.is_ok());
     }
 
     #[test]
