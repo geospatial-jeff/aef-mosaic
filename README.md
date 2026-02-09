@@ -1,6 +1,6 @@
 # aef-mosaic
 
-Mosaic AEF[https://source.coop/tge-labs/aef/README.md] embeddings into a contiguous Zarr array.
+Mosaic [AEF](https://source.coop/tge-labs/aef/README.md) embeddings into a contiguous Zarr array.
 
 ## Quick Start
 
@@ -10,29 +10,37 @@ pixi install
 pixi run build
 
 # Generate a sample config
-./target/release/aef-mosaic generate-config -o config.yaml
+pixi run mosaic generate-config -o config.yaml
 
 # Edit config.yaml, then run
-./target/release/aef-mosaic run -c config.yaml
+pixi run mosaic run -c config.yaml
 ```
 
 ## Commands
 
 ```bash
 # Run the full pipeline
-aef-mosaic run -c config.yaml
+pixi run mosaic run -c config.yaml
 
 # Run with custom concurrency
-aef-mosaic run -c config.yaml --concurrency 512
+pixi run mosaic run -c config.yaml --concurrency 512
 
 # Analyze input data and output grid (without processing)
-aef-mosaic analyze -c config.yaml
+pixi run analyze -c config.yaml
 
 # Validate configuration
-aef-mosaic validate -c config.yaml
+pixi run validate -c config.yaml
 
 # Generate a sample configuration file
-aef-mosaic generate-config -o config.yaml
+pixi run mosaic generate-config -o config.yaml
+```
+
+## Development
+
+```bash
+pixi run check   # Type check
+pixi run test    # Run tests
+pixi run build   # Build release binary
 ```
 
 ## Configuration
@@ -90,11 +98,9 @@ processing:
     max_backoff_ms: 10000
 
 # === AWS: S3 connection settings ===
+# Credentials are loaded from: env vars, ~/.aws/credentials, or EC2 instance profile
 aws:
   region: "us-west-2"
-  use_express: false
-  use_instance_profile: true
-  # endpoint_url: "http://localhost:4566"  # for LocalStack/MinIO
 
 # === FILTER: Limit processing area (optional) ===
 # filter:

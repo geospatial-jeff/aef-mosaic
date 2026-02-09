@@ -85,9 +85,14 @@ fn create_retry_config() -> RetryConfig {
 
 /// Create an object store for the given S3 bucket.
 ///
-/// Handles public buckets (anonymous), S3 Express, and standard S3.
+/// Handles public buckets (anonymous) and standard S3.
+/// For private buckets, credentials are loaded from (in order):
+/// - Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
+/// - AWS config files (~/.aws/credentials, ~/.aws/config)
+/// - EC2 instance profile (IMDS)
 pub fn create_object_store(bucket: &str, config: &AwsConfig) -> Result<Arc<dyn ObjectStore>> {
-    let mut builder = AmazonS3Builder::new()
+    // Use from_env() to pick up credentials from environment, config files, and IMDS
+    let mut builder = AmazonS3Builder::from_env()
         .with_bucket_name(bucket)
         .with_region(&config.region)
         .with_client_options(create_client_options())
@@ -99,18 +104,13 @@ pub fn create_object_store(bucket: &str, config: &AwsConfig) -> Result<Arc<dyn O
             .with_skip_signature(true)
             .with_virtual_hosted_style_request(false);
     } else {
-        // Private buckets: use credentials and virtual-hosted style
-        builder = builder
-            .with_skip_signature(!config.use_instance_profile)
-            .with_virtual_hosted_style_request(true);
+        // Private buckets: use virtual-hosted style
+        // Credentials come from from_env() - config files, env vars, or IMDS
+        builder = builder.with_virtual_hosted_style_request(true);
 
-        if is_express_bucket(bucket) || config.use_express {
+        if is_express_bucket(bucket) {
             tracing::info!("Configuring S3 Express One Zone for bucket: {}", bucket);
         }
-    }
-
-    if let Some(endpoint) = &config.endpoint_url {
-        builder = builder.with_endpoint(endpoint).with_allow_http(true);
     }
 
     Ok(Arc::new(builder.build()?))
@@ -155,12 +155,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_create_store_with_endpoint() {
+    fn test_create_store() {
         let config = AwsConfig {
             region: "us-east-1".to_string(),
-            use_express: false,
-            endpoint_url: Some("http://localhost:4566".to_string()),
-            use_instance_profile: false,
         };
 
         let result = create_object_store("test-bucket", &config);

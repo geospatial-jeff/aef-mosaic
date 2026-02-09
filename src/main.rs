@@ -306,19 +306,9 @@ processing:
     max_backoff_ms: 10000
 
 # === AWS: S3 connection settings ===
+# Credentials are loaded from: env vars, ~/.aws/credentials, or EC2 instance profile
 aws:
-  # AWS region (source.coop is in us-west-2)
   region: "us-west-2"
-
-  # Use S3 Express One Zone (lower latency, if available)
-  use_express: false
-
-  # Custom S3 endpoint (for LocalStack, MinIO, etc.)
-  # endpoint_url: "http://localhost:4566"
-
-  # Use EC2 instance profile for credentials (for output bucket)
-  # Note: source.coop input bucket is public, no credentials needed
-  use_instance_profile: true
 
 # === FILTER: Limit processing to a subset (optional) ===
 # Uncomment to process only a specific area or time range.

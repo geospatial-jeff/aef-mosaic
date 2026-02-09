@@ -1,6 +1,6 @@
 [tool.pixi.workspace]
 channels = ["conda-forge"]
-platforms = ["osx-arm64"]
+platforms = ["osx-arm64", "linux-64"]
 
 [tool.pixi.tasks]
 check = { cmd = "cargo check", env = { PKG_CONFIG_PATH = "$PIXI_PROJECT_ROOT/.pixi/envs/default/lib/pkgconfig", RUSTFLAGS = "-C link-arg=-Wl,-rpath,$PIXI_PROJECT_ROOT/.pixi/envs/default/lib" } }

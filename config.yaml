@@ -80,19 +80,9 @@ processing:
   # metrics_output_path: "outputs/metrics.json"
 
 # === AWS: S3 connection settings ===
+# Credentials are loaded from: env vars, ~/.aws/credentials, or EC2 instance profile
 aws:
-  # AWS region (source.coop is in us-west-2)
   region: "us-west-2"
-
-  # Use S3 Express One Zone (lower latency, if available)
-  use_express: false
-
-  # Custom S3 endpoint (for LocalStack, MinIO, etc.)
-  # endpoint_url: "http://localhost:4566"
-
-  # Use EC2 instance profile for credentials (for output bucket)
-  # Note: source.coop input bucket is public, no credentials needed
-  use_instance_profile: true
 
 filter:
   # Bounding box in WGS84 [min_lon, min_lat, max_lon, max_lat]

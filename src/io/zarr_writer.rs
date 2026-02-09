@@ -280,9 +280,6 @@ mod integration_tests {
             processing: crate::config::ProcessingConfig::default(),
             aws: crate::config::AwsConfig {
                 region: "us-west-2".to_string(),
-                use_express: false,
-                endpoint_url: None,
-                use_instance_profile: false,
             },
             filter: None,
         }
@@ -480,9 +477,6 @@ mod production_test {
             processing: crate::config::ProcessingConfig::default(),
             aws: crate::config::AwsConfig {
                 region: "us-west-2".to_string(),
-                use_express: false,
-                endpoint_url: None,
-                use_instance_profile: false,
             },
             filter: None,
         };
@@ -582,9 +576,6 @@ mod production_test {
             processing: crate::config::ProcessingConfig::default(),
             aws: crate::config::AwsConfig {
                 region: "us-west-2".to_string(),
-                use_express: false,
-                endpoint_url: None,
-                use_instance_profile: false,
             },
             filter: None,
         };
@@ -690,9 +681,6 @@ mod concurrent_test {
             processing: crate::config::ProcessingConfig::default(),
             aws: crate::config::AwsConfig {
                 region: "us-west-2".to_string(),
-                use_express: false,
-                endpoint_url: None,
-                use_instance_profile: false,
             },
             filter: None,
         };

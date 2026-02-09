@@ -261,22 +261,15 @@ pub struct FilterConfig {
 }
 
 /// AWS/S3 configuration.
+///
+/// Credentials are automatically loaded from:
+/// - Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
+/// - AWS config files (~/.aws/credentials, ~/.aws/config)
+/// - EC2 instance profile (IMDS)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AwsConfig {
     /// AWS region
     pub region: String,
-
-    /// Use S3 Express One Zone (if available)
-    #[serde(default)]
-    pub use_express: bool,
-
-    /// Custom endpoint URL (for testing with LocalStack, etc.)
-    #[serde(default)]
-    pub endpoint_url: Option<String>,
-
-    /// Skip credential loading (use instance profile)
-    #[serde(default = "default_true")]
-    pub use_instance_profile: bool,
 }
 
 impl Default for ProcessingConfig {
@@ -302,9 +295,6 @@ impl Default for AwsConfig {
     fn default() -> Self {
         Self {
             region: "us-west-2".to_string(),
-            use_express: false,
-            endpoint_url: None,
-            use_instance_profile: true,
         }
     }
 }

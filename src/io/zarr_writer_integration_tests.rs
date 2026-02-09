@@ -38,9 +38,6 @@ fn create_test_config(chunk_shape: ChunkShape) -> Config {
         processing: ProcessingConfig::default(),
         aws: AwsConfig {
             region: "us-west-2".to_string(),
-            use_express: false,
-            endpoint_url: None,
-            use_instance_profile: false,
         },
         filter: None,
     }
