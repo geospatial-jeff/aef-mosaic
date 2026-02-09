@@ -75,8 +75,8 @@ impl ZarrWriter {
 
         let zarr_store = Arc::new(AsyncObjectStore::new(store.clone()));
 
-        // Create root group - handle empty path for local filesystem
-        let group_path = if path.is_empty() { "/".to_string() } else { format!("{}/", path) };
+        // Create root group - zarrs requires paths to start with /
+        let group_path = if path.is_empty() { "/".to_string() } else { format!("/{}", path) };
         let group = GroupBuilder::new().build(zarr_store.clone(), &group_path)?;
         group.async_store_metadata().await?;
 
@@ -84,8 +84,8 @@ impl ZarrWriter {
         let shape = output_grid.array_shape();
         let chunk_shape = &config.output.chunk_shape;
 
-        // Build the array - handle empty path for local filesystem
-        let array_path = if path.is_empty() { "/embeddings".to_string() } else { format!("{}/embeddings", path) };
+        // Build the array - zarrs requires paths to start with /
+        let array_path = if path.is_empty() { "/embeddings".to_string() } else { format!("/{}/embeddings", path) };
 
         let chunk_grid = vec![
             chunk_shape.time as u64,
