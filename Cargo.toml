@@ -1,0 +1,73 @@
+[package]
+name = "aef-mosaic"
+version = "0.1.0"
+edition = "2021"
+authors = ["AEF Team"]
+description = "High-performance pipeline to mosaic AEF COG files into Zarr arrays"
+license = "MIT"
+
+[[bin]]
+name = "aef-mosaic"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Cloud storage
+object_store = { version = "0.13", features = ["aws"] }
+
+# COG/TIFF reading (using git version for planar TIFF support)
+async-tiff = { git = "https://github.com/developmentseed/async-tiff", features = ["object_store"] }
+
+# Zarr output
+zarrs = { version = "0.23", features = ["zstd", "async"] }
+zarrs_object_store = "0.6"
+
+# Coordinate reprojection
+proj = "0.27"
+
+# Array operations
+ndarray = "0.16"
+
+# CPU parallelism
+rayon = "1.10"
+
+# Parquet index reading
+parquet = { version = "53", default-features = false, features = ["arrow", "async", "snap"] }
+arrow = { version = "53", default-features = false }
+
+# Spatial indexing
+rstar = "0.12"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Error handling
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Utilities
+futures = "0.3"
+bytes = "1"
+url = "2"
+
+# Caching
+lru = "0.12"
+dashmap = "6"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3

@@ -1,0 +1,102 @@
+# AEF Mosaic Pipeline Configuration
+
+# === INPUT: Where to read COG tiles from ===
+input:
+  # Path to parquet index file
+  # Default: AEF v1 index on source.coop (public, no credentials needed)
+  index_path: "s3://us-west-2.opendata.source.coop/tge-labs/aef/v1/annual/aef_index.parquet"
+
+  # S3 bucket containing the COG files
+  cog_bucket: "us-west-2.opendata.source.coop"
+
+# === OUTPUT: Where to write the Zarr array ===
+output:
+  # S3 bucket for output Zarr
+  # bucket: "output-bucket"
+
+  # Path prefix within the bucket
+  # prefix: "zarr/aef-mosaic"
+
+  local_path: "outputs/aef-test-utm.zarr"
+
+  # Output CRS - Using same CRS as input to test without reprojection
+  # EPSG:32610 is UTM zone 10N (same as source COG)
+  crs: "EPSG:32610"
+
+  # Pixel size in CRS units (meters for EPSG:6933)
+  resolution: 10.0
+
+  # Zarr chunk dimensions: (time, embedding, height, width)
+  chunk_shape:
+    time: 1         # One year per chunk (enables incremental updates)
+    embedding: 64   # Full embedding dimension
+    height: 1024    # ~10km at 10m resolution
+    width: 1024
+
+  # Zstd compression level (0-22, higher = smaller but slower)
+  compression_level: 3
+
+  # Enable Zarr V3 sharding (reduces S3 object count)
+  use_sharding: true
+
+  # Chunks per shard [height, width] if sharding enabled
+  shard_shape: [4, 4]
+
+# === PROCESSING: Performance tuning ===
+processing:
+  # Number of output chunks to process concurrently
+  concurrency: 256
+
+  # Max concurrent COG fetches per chunk
+  cog_fetch_concurrency: 32
+
+  # Tokio async worker threads (null = num CPUs)
+  # worker_threads: 64
+
+  # Rayon thread pool size for CPU work (null = num CPUs)
+  # rayon_threads: 64
+
+  # Print throughput metrics during processing
+  enable_metrics: true
+
+  # Metrics reporting interval in seconds
+  metrics_interval_secs: 10
+
+  # Retry configuration for transient S3 failures
+  retry:
+    max_retries: 3
+    initial_backoff_ms: 100
+    max_backoff_ms: 10000
+
+  # Size of meta-tiles for spatial windowing (NxN output chunks per meta-tile)
+  metatile_size: 32
+
+  # Prefetch all tiles for a metatile before processing
+  # true: fewer, larger S3 requests but processing waits for prefetch to complete
+  # false: more, smaller requests but I/O overlaps with compute (default)
+  enable_prefetch: false
+
+  # Optional: save metrics to JSON file after run completes
+  # metrics_output_path: "outputs/metrics.json"
+
+# === AWS: S3 connection settings ===
+aws:
+  # AWS region (source.coop is in us-west-2)
+  region: "us-west-2"
+
+  # Use S3 Express One Zone (lower latency, if available)
+  use_express: false
+
+  # Custom S3 endpoint (for LocalStack, MinIO, etc.)
+  # endpoint_url: "http://localhost:4566"
+
+  # Use EC2 instance profile for credentials (for output bucket)
+  # Note: source.coop input bucket is public, no credentials needed
+  use_instance_profile: true
+
+filter:
+  # Bounding box in WGS84 [min_lon, min_lat, max_lon, max_lat]
+  bounds: [-122.5, 37.7, -122.3, 37.85]  # Small area for quick testing
+
+  # Years to process (omit for all years)
+  years: [2024]     
