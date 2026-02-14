@@ -82,20 +82,35 @@ impl OutputGrid {
             bounds[0], bounds[1], bounds[2], bounds[3]
         );
 
-        // Calculate total dimensions in output CRS units
-        let width = ((bounds[2] - bounds[0]) / resolution).ceil() as usize;
-        let height = ((bounds[3] - bounds[1]) / resolution).ceil() as usize;
+        // Calculate total dimensions in output CRS units, rounded UP to chunk boundaries.
+        // This ensures all chunks are always full-sized (no partial edge chunks).
+        let raw_width = ((bounds[2] - bounds[0]) / resolution).ceil() as usize;
+        let raw_height = ((bounds[3] - bounds[1]) / resolution).ceil() as usize;
 
-        // Calculate chunk counts
-        let time_chunks = (num_years + chunk_shape.time - 1) / chunk_shape.time;
-        let band_chunks = (num_bands + chunk_shape.embedding - 1) / chunk_shape.embedding;
-        let row_chunks = (height + chunk_shape.height - 1) / chunk_shape.height;
-        let col_chunks = (width + chunk_shape.width - 1) / chunk_shape.width;
+        // Round up to nearest chunk multiple
+        let col_chunks = raw_width.div_ceil(chunk_shape.width);
+        let row_chunks = raw_height.div_ceil(chunk_shape.height);
+        let width = col_chunks * chunk_shape.width;
+        let height = row_chunks * chunk_shape.height;
+
+        // Expand bounds to match the chunk-aligned dimensions
+        let bounds = [
+            bounds[0],
+            bounds[1],
+            bounds[0] + width as f64 * resolution,
+            bounds[1] + height as f64 * resolution,
+        ];
+
+        // Calculate chunk counts for time and bands
+        let time_chunks = num_years.div_ceil(chunk_shape.time);
+        let band_chunks = num_bands.div_ceil(chunk_shape.embedding);
 
         tracing::info!(
-            "Output grid: {}x{} pixels, {} chunks ({}x{}x{}x{})",
+            "Output grid: {}x{} pixels (raw {}x{}, chunk-aligned), {} chunks ({}x{}x{}x{})",
             width,
             height,
+            raw_width,
+            raw_height,
             time_chunks * band_chunks * row_chunks * col_chunks,
             time_chunks,
             band_chunks,
@@ -249,13 +264,13 @@ mod tests {
     fn test_grid_dimensions() {
         let grid = create_test_grid();
 
-        // 10 degrees at 0.0001 resolution = 100,000 pixels
-        assert_eq!(grid.width, 100_000);
-        assert_eq!(grid.height, 100_000);
-
-        // 100,000 / 1024 chunks = ~98 chunks per dimension
+        // 10 degrees at 0.0001 resolution = 100,000 raw pixels
+        // Rounded up to chunk boundary: ceil(100,000/1024) = 98 chunks
+        // 98 * 1024 = 100,352 pixels (chunk-aligned)
         assert_eq!(grid.chunk_counts[2], 98);
         assert_eq!(grid.chunk_counts[3], 98);
+        assert_eq!(grid.width, 98 * 1024);  // 100,352
+        assert_eq!(grid.height, 98 * 1024); // 100,352
     }
 
     #[test]

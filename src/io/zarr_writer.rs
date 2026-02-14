@@ -156,61 +156,39 @@ impl ZarrWriter {
 
     /// Write a chunk to the Zarr array asynchronously.
     ///
-    /// Handles partial edge chunks by padding to full chunk size.
+    /// Chunks are always full-sized because OutputGrid rounds dimensions up to chunk boundaries.
     pub async fn write_chunk_async(&self, chunk: &OutputChunk, data: Array4<i8>) -> Result<()> {
         let indices = chunk.chunk_indices();
-        let chunk_indices: Vec<u64> = indices.iter().map(|&i| i as u64).collect();
+        let chunk_indices: [u64; 4] = [
+            indices[0] as u64,
+            indices[1] as u64,
+            indices[2] as u64,
+            indices[3] as u64,
+        ];
 
         let shape = data.shape();
         let chunk_shape = &self.output_grid.chunk_shape;
         let expected_shape = [1, chunk_shape.embedding, chunk_shape.height, chunk_shape.width];
 
-        tracing::debug!(
-            "Writing chunk {:?}: shape={:?}, expected={:?}",
-            chunk_indices, shape, expected_shape
+        // Verify chunk is full-sized (OutputGrid guarantees this by rounding up dimensions)
+        debug_assert_eq!(
+            shape,
+            expected_shape.as_slice(),
+            "Chunk shape mismatch: got {:?}, expected {:?}. OutputGrid should ensure all chunks are full-sized.",
+            shape, expected_shape
         );
 
-        // Check if this is a partial edge chunk that needs padding
-        let needs_padding = shape[0] != expected_shape[0]
-            || shape[1] != expected_shape[1]
-            || shape[2] != expected_shape[2]
-            || shape[3] != expected_shape[3];
+        tracing::debug!(
+            "Writing chunk {:?}: shape={:?}",
+            chunk_indices, shape
+        );
 
-        // For full-size chunks with contiguous memory layout, pass slice directly to avoid copy.
-        // For partial edge chunks, we must pad to full chunk size first.
-        if needs_padding {
-            // Pad to full chunk size with fill value (0)
-            let mut padded = Array4::<i8>::zeros((
-                expected_shape[0],
-                expected_shape[1],
-                expected_shape[2],
-                expected_shape[3],
-            ));
-            // Copy data into the padded array
-            padded
-                .slice_mut(ndarray::s![..shape[0], ..shape[1], ..shape[2], ..shape[3]])
-                .assign(&data);
-            tracing::debug!(
-                "Padded chunk {:?} from {:?} to {:?}",
-                chunk_indices, shape, expected_shape
-            );
+        // Pass slice directly to avoid copy (data should be contiguous)
+        let chunk_data = data.as_slice().expect("chunk data should be contiguous");
 
-            // Padded array is contiguous, use as_slice directly
-            let chunk_data = padded.as_slice().expect("padded array should be contiguous");
-            tracing::debug!("Chunk {:?}: {} elements (padded)", chunk_indices, chunk_data.len());
-
-            self.array
-                .async_store_chunk(&chunk_indices, chunk_data)
-                .await
-        } else {
-            // Full-size chunk: use as_slice to avoid copy (data should be contiguous)
-            let chunk_data = data.as_slice().expect("chunk data should be contiguous");
-            tracing::debug!("Chunk {:?}: {} elements", chunk_indices, chunk_data.len());
-
-            self.array
-                .async_store_chunk(&chunk_indices, chunk_data)
-                .await
-        }
+        self.array
+            .async_store_chunk(&chunk_indices, chunk_data)
+            .await
             .map_err(|e| {
                 tracing::error!(
                     "Chunk {:?} write failed: {:?}. Data shape: {:?}",
@@ -380,47 +358,8 @@ mod integration_tests {
         assert!(chunk_path.exists(), "Chunk file should exist at {:?}", chunk_path);
     }
 
-    #[tokio::test]
-    async fn test_zarr_writer_writes_partial_chunk() {
-        let temp_dir = TempDir::new().unwrap();
-        let zarr_path = temp_dir.path().join("test.zarr");
-        std::fs::create_dir_all(&zarr_path).unwrap();
-
-        let store = Arc::new(LocalFileSystem::new_with_prefix(&zarr_path).unwrap());
-        let chunk_shape = ChunkShape {
-            time: 1,
-            embedding: 4,
-            height: 4,
-            width: 4,
-        };
-        let config = create_test_config(chunk_shape.clone());
-        // Grid is 6x6, so edge chunks will be partial (2 pixels instead of 4)
-        let grid = Arc::new(create_test_grid(6, 6, &chunk_shape));
-
-        let writer = ZarrWriter::create(store, "", grid, &config).await.unwrap();
-
-        // Create test data - partial chunk (edge case: 2x2 instead of 4x4)
-        let data = Array4::from_elem((1, 4, 2, 2), 42i8);
-        let chunk = OutputChunk {
-            time_idx: 0,
-            row_idx: 1, // Second row - partial
-            col_idx: 1, // Second col - partial
-        };
-
-        // Write partial chunk - should be padded internally
-        let result = writer.write_chunk_async(&chunk, data).await;
-        println!("Partial chunk write result: {:?}", result);
-        result.unwrap();
-
-        writer.finalize().unwrap();
-
-        // Check chunk file exists
-        let chunk_path = zarr_path.join("embeddings").join("c").join("0").join("0").join("1").join("1");
-        println!("Files in {:?}:", zarr_path.join("embeddings"));
-        list_dir_recursive(&zarr_path.join("embeddings"), 0);
-
-        assert!(chunk_path.exists(), "Partial chunk file should exist at {:?}", chunk_path);
-    }
+    // Note: test_zarr_writer_writes_partial_chunk was removed because OutputGrid now
+    // guarantees all chunks are full-sized by rounding dimensions up to chunk boundaries.
 
     fn list_dir_recursive(path: &PathBuf, depth: usize) {
         if let Ok(entries) = std::fs::read_dir(path) {

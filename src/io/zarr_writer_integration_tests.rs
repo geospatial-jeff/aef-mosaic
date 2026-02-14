@@ -41,22 +41,23 @@ fn create_test_config(chunk_shape: ChunkShape) -> Config {
 }
 
 fn create_test_grid(height: usize, width: usize, chunk_shape: &ChunkShape) -> OutputGrid {
+    // Round up to chunk boundaries (matching OutputGrid::new behavior)
+    let row_chunks = height.div_ceil(chunk_shape.height);
+    let col_chunks = width.div_ceil(chunk_shape.width);
+    let aligned_height = row_chunks * chunk_shape.height;
+    let aligned_width = col_chunks * chunk_shape.width;
+
     OutputGrid {
-        bounds: [0.0, 0.0, width as f64 * 10.0, height as f64 * 10.0],
+        bounds: [0.0, 0.0, aligned_width as f64 * 10.0, aligned_height as f64 * 10.0],
         crs: "EPSG:4326".to_string(),
         resolution: 10.0,
         num_years: 1,
         start_year: 2024,
         num_bands: 64,
-        height,
-        width,
+        height: aligned_height,
+        width: aligned_width,
         chunk_shape: chunk_shape.clone(),
-        chunk_counts: [
-            1,
-            1,
-            (height + chunk_shape.height - 1) / chunk_shape.height,
-            (width + chunk_shape.width - 1) / chunk_shape.width,
-        ],
+        chunk_counts: [1, 1, row_chunks, col_chunks],
     }
 }
 
@@ -110,95 +111,10 @@ async fn test_production_full_chunk_size() {
     std::fs::remove_dir_all(&test_dir).ok();
 }
 
-/// Test 2: Partial edge chunk (non-full width)
-#[tokio::test]
-async fn test_partial_width_chunk() {
-    let test_dir = std::path::PathBuf::from("target/test-zarr-partial-width");
-    if test_dir.exists() {
-        std::fs::remove_dir_all(&test_dir).unwrap();
-    }
-    std::fs::create_dir_all(&test_dir).unwrap();
+// Note: Partial edge chunk tests (test_partial_width_chunk, test_partial_height_chunk) were removed
+// because OutputGrid now guarantees all chunks are full-sized by rounding dimensions up to chunk boundaries.
 
-    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new_with_prefix(&test_dir).unwrap());
-    let chunk_shape = ChunkShape {
-        time: 1,
-        embedding: 64,
-        height: 1024,
-        width: 1024,
-    };
-    let config = create_test_config(chunk_shape.clone());
-    // Grid with 1500 width = 2 chunks, second one is partial (476 pixels wide)
-    let grid = Arc::new(create_test_grid(1024, 1500, &chunk_shape));
-
-    let writer = ZarrWriter::create(store, "", grid, &config).await.unwrap();
-
-    // Partial chunk: (1, 64, 1024, 476) - like production edge chunks
-    let data = Array4::from_elem((1, 64, 1024, 476), 42i8);
-    println!("Created partial data with {} elements (expected: {})",
-             data.len(), 1 * 64 * 1024 * 476);
-
-    let chunk = OutputChunk {
-        time_idx: 0,
-        row_idx: 0,
-        col_idx: 1, // Second column = partial
-    };
-
-    let result = writer.write_chunk_async(&chunk, data).await;
-    println!("Partial write result: {:?}", result);
-    result.unwrap();
-
-    writer.finalize().unwrap();
-
-    let chunk_path = test_dir.join("embeddings").join("c").join("0").join("0").join("0").join("1");
-    assert!(chunk_path.exists(), "Partial width chunk should exist at {:?}", chunk_path);
-
-    std::fs::remove_dir_all(&test_dir).ok();
-}
-
-/// Test 3: Partial edge chunk (non-full height)
-#[tokio::test]
-async fn test_partial_height_chunk() {
-    let test_dir = std::path::PathBuf::from("target/test-zarr-partial-height");
-    if test_dir.exists() {
-        std::fs::remove_dir_all(&test_dir).unwrap();
-    }
-    std::fs::create_dir_all(&test_dir).unwrap();
-
-    let store: Arc<dyn ObjectStore> = Arc::new(LocalFileSystem::new_with_prefix(&test_dir).unwrap());
-    let chunk_shape = ChunkShape {
-        time: 1,
-        embedding: 64,
-        height: 1024,
-        width: 1024,
-    };
-    let config = create_test_config(chunk_shape.clone());
-    // Grid with 1500 height = 2 chunks, second one is partial (476 pixels tall)
-    let grid = Arc::new(create_test_grid(1500, 1024, &chunk_shape));
-
-    let writer = ZarrWriter::create(store, "", grid, &config).await.unwrap();
-
-    // Partial chunk: (1, 64, 476, 1024)
-    let data = Array4::from_elem((1, 64, 476, 1024), 42i8);
-
-    let chunk = OutputChunk {
-        time_idx: 0,
-        row_idx: 1, // Second row = partial
-        col_idx: 0,
-    };
-
-    let result = writer.write_chunk_async(&chunk, data).await;
-    println!("Partial height write result: {:?}", result);
-    result.unwrap();
-
-    writer.finalize().unwrap();
-
-    let chunk_path = test_dir.join("embeddings").join("c").join("0").join("0").join("1").join("0");
-    assert!(chunk_path.exists(), "Partial height chunk should exist at {:?}", chunk_path);
-
-    std::fs::remove_dir_all(&test_dir).ok();
-}
-
-/// Test 4: Multiple chunks via Arc<ZarrWriter> with buffer_unordered (production pattern)
+/// Test 2: Multiple chunks via Arc<ZarrWriter> with buffer_unordered (production pattern)
 #[tokio::test]
 async fn test_arc_writer_buffer_unordered() {
     let test_dir = std::path::PathBuf::from("target/test-zarr-arc-buffered");
@@ -262,7 +178,8 @@ async fn test_arc_writer_buffer_unordered() {
     std::fs::remove_dir_all(&test_dir).ok();
 }
 
-/// Test 5: Production-like grid dimensions (7719x7116 like SF Bay Area run)
+/// Test 3: Production-like grid dimensions (7719x7116 like SF Bay Area run)
+/// Note: Grid is now chunk-aligned, so all chunks are full 1024x1024
 #[tokio::test]
 async fn test_production_grid_dimensions() {
     let test_dir = std::path::PathBuf::from("target/test-zarr-prod-grid");
@@ -279,15 +196,21 @@ async fn test_production_grid_dimensions() {
         width: 1024,
     };
     let config = create_test_config(chunk_shape.clone());
-    // Exact production dimensions from SF Bay Area run
+    // Request 7116x7719, will be aligned to 7168x8192 (7x8 chunks)
     let grid = Arc::new(create_test_grid(7116, 7719, &chunk_shape));
 
-    println!("Grid: {}x{} pixels, chunk_counts: {:?}",
+    // Verify chunk alignment
+    assert_eq!(grid.height, 7 * 1024, "Height should be chunk-aligned");
+    assert_eq!(grid.width, 8 * 1024, "Width should be chunk-aligned");
+    assert_eq!(grid.chunk_counts[2], 7, "Should have 7 row chunks");
+    assert_eq!(grid.chunk_counts[3], 8, "Should have 8 col chunks");
+
+    println!("Grid: {}x{} pixels (chunk-aligned), chunk_counts: {:?}",
              grid.height, grid.width, grid.chunk_counts);
 
     let writer = Arc::new(ZarrWriter::create(store, "", grid.clone(), &config).await.unwrap());
 
-    // Write first chunk and last chunk (corner cases)
+    // Write first chunk and last chunk (both full-sized now)
     let first_chunk = OutputChunk { time_idx: 0, row_idx: 0, col_idx: 0 };
     let last_row = grid.chunk_counts[2] - 1;
     let last_col = grid.chunk_counts[3] - 1;
@@ -296,18 +219,13 @@ async fn test_production_grid_dimensions() {
     println!("First chunk: {:?}", first_chunk);
     println!("Last chunk: {:?} (row={}, col={})", last_chunk, last_row, last_col);
 
-    // First chunk is full size
+    // All chunks are full size (1024x1024) due to chunk alignment
     let first_data = Array4::from_elem((1, 64, 1024, 1024), 42i8);
     let result1 = writer.write_chunk_async(&first_chunk, first_data).await;
     println!("First chunk result: {:?}", result1);
     result1.unwrap();
 
-    // Last chunk is partial: height=7116%1024=1020, width=7719%1024=551
-    let last_height = 7116 - (last_row * 1024);
-    let last_width = 7719 - (last_col * 1024);
-    println!("Last chunk dimensions: {}x{}", last_height, last_width);
-
-    let last_data = Array4::from_elem((1, 64, last_height, last_width), 42i8);
+    let last_data = Array4::from_elem((1, 64, 1024, 1024), 42i8);
     let result2 = writer.write_chunk_async(&last_chunk, last_data).await;
     println!("Last chunk result: {:?}", result2);
     result2.unwrap();
@@ -635,42 +553,19 @@ async fn test_production_store_creation() {
     std::fs::remove_dir_all(test_path).ok();
 }
 
-/// Test 10: Exact production failure case - chunk [0, 0, 0, 7] with partial width 551
-/// This is the exact scenario that failed with CodecError in production.
+// Note: test_production_failure_chunk_0_0_0_7 was removed because OutputGrid now
+// guarantees all chunks are full-sized by rounding dimensions up to chunk boundaries.
+// The partial chunk scenario this test was designed to catch can no longer occur.
+
+/// Test 8: Verify corner chunks work correctly with aligned grid
 #[tokio::test]
-async fn test_production_failure_chunk_0_0_0_7() {
+async fn test_aligned_corner_chunks() {
     use crate::io::create_output_store;
 
-    let test_path = "target/test-zarr-failure-case";
+    let test_path = "target/test-zarr-aligned-corner";
     if std::path::Path::new(test_path).exists() {
         std::fs::remove_dir_all(test_path).unwrap();
     }
-
-    // Production dimensions: 7116 x 7719 pixels with 1024x1024 chunks
-    // Column 7 = pixels 7168-7719 = 551 pixels wide (partial chunk)
-    // Row chunks: 8 (7719 / 1024 = 7.54)
-    // Col chunks: 7 (7116 / 1024 = 6.95)
-    // So col_idx 7 is actually beyond the grid for a 7116 width!
-
-    // Let me verify: 7116 / 1024 = 6.95 → 7 chunks (0-6)
-    // col_idx 7 would be the 8th column chunk, which doesn't exist...
-    // Unless the width is 7719 and height is 7116
-
-    // From production log: width = 7116, height = 7719
-    // row_chunks = ceil(7719 / 1024) = 8 (0-7)
-    // col_chunks = ceil(7116 / 1024) = 7 (0-6)
-
-    // So chunk [0, 0, 0, 7] would be row=0, col=7
-    // But there are only 7 col chunks (0-6)!
-
-    // Wait, looking at the zarrs array format: [time, band, row, col]
-    // chunk_indices = [time_idx, 0, row_idx, col_idx]
-    // So [0, 0, 0, 7] means time=0, band=0, row=0, col=7
-
-    // With 7 col chunks, col_idx=7 would be out of bounds...
-    // Unless I got the dimensions swapped
-
-    // Let me create the exact production scenario with 7719 height and 7116 width
 
     let chunk_shape = ChunkShape {
         time: 1,
@@ -679,95 +574,45 @@ async fn test_production_failure_chunk_0_0_0_7() {
         width: 1024,
     };
 
-    // Exact production dimensions
-    let total_height = 7719;  // 8 row chunks (0-7), chunk 7 is partial
-    let total_width = 7116;   // 7 col chunks (0-6)
-
     let mut config = create_test_config(chunk_shape.clone());
     config.output.local_path = Some(test_path.to_string());
 
     let store = create_output_store(&config).unwrap();
 
-    // Create grid with production dimensions
-    let grid = Arc::new(OutputGrid {
-        bounds: [-1000000.0, 4000000.0, -1000000.0 + (total_width as f64 * 10.0), 4000000.0 + (total_height as f64 * 10.0)],
-        crs: "EPSG:6933".to_string(),
-        resolution: 10.0,
-        num_years: 1,
-        start_year: 2024,
-        num_bands: 64,
-        height: total_height,
-        width: total_width,
-        chunk_shape: chunk_shape.clone(),
-        chunk_counts: [1, 1, 8, 7],  // Production: 1 time, 1 band chunk, 8 rows, 7 cols
-    });
+    // Use create_test_grid which now rounds up to chunk boundaries
+    // Request 7719x7116, will get 8192x7168 (8x7 full chunks)
+    let grid = Arc::new(create_test_grid(7719, 7116, &chunk_shape));
 
-    println!("Grid: {}x{} pixels, chunks: {:?}", total_width, total_height, grid.chunk_counts);
+    // Verify alignment
+    assert_eq!(grid.height, 8 * 1024, "Height should be 8 chunks");
+    assert_eq!(grid.width, 7 * 1024, "Width should be 7 chunks");
+    assert_eq!(grid.chunk_counts[2], 8);
+    assert_eq!(grid.chunk_counts[3], 7);
+
+    println!("Grid: {}x{} pixels (aligned), chunks: {:?}",
+             grid.width, grid.height, grid.chunk_counts);
 
     let prefix = crate::io::get_output_prefix(&config);
     let writer = ZarrWriter::create(store, prefix, grid.clone(), &config).await.unwrap();
 
-    // Chunk [0, 0, 0, 7] from the error log - but that's row=0, col=7
-    // With only 7 columns (0-6), col=7 doesn't exist
-    // The actual failing chunk must be row=7, col=something
+    // Test corner chunk [0, 0, 7, 6] - all chunks are now full 1024x1024
+    let corner_chunk = OutputChunk { time_idx: 0, row_idx: 7, col_idx: 6 };
+    let data = Array4::from_elem((1, 64, 1024, 1024), 42i8);
 
-    // Let's test chunk [0, 0, 7, 0] - the last row chunk
-    // Row 7 spans pixels 7168-7719 = 551 pixels high (partial chunk!)
-    let chunk_row_7 = OutputChunk { time_idx: 0, row_idx: 7, col_idx: 0 };
-    println!("Testing chunk {:?} (row 7, col 0) - partial height 551", chunk_row_7.chunk_indices());
-
-    // Partial height: 7719 - 7*1024 = 7719 - 7168 = 551
-    let partial_height = total_height - 7 * 1024;  // 551
-    assert_eq!(partial_height, 551);
-
-    // Create data with PARTIAL height (as would come from mosaic)
-    let data_partial = Array4::from_elem((1, 64, partial_height, 1024), 42i8);
-    println!("Partial data shape: {:?}", data_partial.shape());
-
-    let result = writer.write_chunk_async(&chunk_row_7, data_partial).await;
-    println!("Partial height chunk write result: {:?}", result);
-    result.expect("Partial height chunk should write successfully");
-
-    // Also test last column partial width
-    // Col 6 spans pixels 6144-7116 = 972 pixels wide (partial!)
-    let partial_width = total_width - 6 * 1024;  // 972
-    let chunk_col_6 = OutputChunk { time_idx: 0, row_idx: 0, col_idx: 6 };
-    let data_partial_width = Array4::from_elem((1, 64, 1024, partial_width), 43i8);
-    println!("Testing chunk {:?} - partial width {}", chunk_col_6.chunk_indices(), partial_width);
-
-    let result2 = writer.write_chunk_async(&chunk_col_6, data_partial_width).await;
-    println!("Partial width chunk write result: {:?}", result2);
-    result2.expect("Partial width chunk should write successfully");
-
-    // Test corner case: both partial height and width
-    let chunk_corner = OutputChunk { time_idx: 0, row_idx: 7, col_idx: 6 };
-    let data_corner = Array4::from_elem((1, 64, partial_height, partial_width), 44i8);
-    println!("Testing corner chunk {:?} - {}x{}", chunk_corner.chunk_indices(), partial_height, partial_width);
-
-    let result3 = writer.write_chunk_async(&chunk_corner, data_corner).await;
-    println!("Corner chunk write result: {:?}", result3);
-    result3.expect("Corner chunk should write successfully");
+    let result = writer.write_chunk_async(&corner_chunk, data).await;
+    println!("Corner chunk write result: {:?}", result);
+    result.expect("Corner chunk should write successfully");
 
     writer.finalize().unwrap();
 
-    // Verify all chunks exist
-    let chunk_path_row7 = std::path::Path::new(test_path)
-        .join("embeddings").join("c").join("0").join("0").join("7").join("0");
-    let chunk_path_col6 = std::path::Path::new(test_path)
-        .join("embeddings").join("c").join("0").join("0").join("0").join("6");
-    let chunk_path_corner = std::path::Path::new(test_path)
+    let chunk_path = std::path::Path::new(test_path)
         .join("embeddings").join("c").join("0").join("0").join("7").join("6");
-
-    assert!(chunk_path_row7.exists(), "Row 7 chunk should exist");
-    assert!(chunk_path_col6.exists(), "Col 6 chunk should exist");
-    assert!(chunk_path_corner.exists(), "Corner chunk should exist");
-
-    println!("All partial chunks written successfully!");
+    assert!(chunk_path.exists(), "Corner chunk should exist at {:?}", chunk_path);
 
     std::fs::remove_dir_all(test_path).ok();
 }
 
-/// Test 11: Simulate the exact chunk_processor flow
+/// Test 9: Simulate the exact chunk_processor flow with aligned grid
 /// Tests spawning mosaic work in spawn_blocking then writing via Arc<ZarrWriter>
 #[tokio::test]
 async fn test_chunk_processor_flow_simulation() {
@@ -779,10 +624,6 @@ async fn test_chunk_processor_flow_simulation() {
         std::fs::remove_dir_all(test_path).unwrap();
     }
 
-    // Production dimensions
-    let total_height = 7719;
-    let total_width = 7116;
-
     let chunk_shape = ChunkShape {
         time: 1,
         embedding: 64,
@@ -795,18 +636,15 @@ async fn test_chunk_processor_flow_simulation() {
 
     let store = create_output_store(&config).unwrap();
 
-    let grid = Arc::new(OutputGrid {
-        bounds: [0.0, 0.0, total_width as f64 * 10.0, total_height as f64 * 10.0],
-        crs: "EPSG:6933".to_string(),
-        resolution: 10.0,
-        num_years: 1,
-        start_year: 2024,
-        num_bands: 64,
-        height: total_height,
-        width: total_width,
-        chunk_shape: chunk_shape.clone(),
-        chunk_counts: [1, 1, 8, 7],
-    });
+    // Use create_test_grid which auto-aligns to chunk boundaries
+    // Request 7719x7116, will get 8192x7168 (8x7 full chunks)
+    let grid = Arc::new(create_test_grid(7719, 7116, &chunk_shape));
+
+    // Verify alignment
+    assert_eq!(grid.height, 8 * 1024);
+    assert_eq!(grid.width, 7 * 1024);
+    assert_eq!(grid.chunk_counts[2], 8);
+    assert_eq!(grid.chunk_counts[3], 7);
 
     let prefix = crate::io::get_output_prefix(&config);
     let writer = Arc::new(ZarrWriter::create(store, prefix, grid.clone(), &config).await.unwrap());
@@ -822,21 +660,15 @@ async fn test_chunk_processor_flow_simulation() {
     println!("Processing {} chunks...", chunks.len());
 
     // Process chunks exactly like chunk_processor does
+    // All chunks are now full 1024x1024 due to grid alignment
     let results: Vec<Result<(), anyhow::Error>> = stream::iter(chunks)
         .map(|chunk| {
             let writer = writer.clone();
-            let grid = grid.clone();
             async move {
-                // Calculate actual chunk dimensions
-                let row_start = chunk.row_idx * 1024;
-                let col_start = chunk.col_idx * 1024;
-                let height = std::cmp::min(1024, total_height - row_start);
-                let width = std::cmp::min(1024, total_width - col_start);
-
                 // Simulate mosaic work in spawn_blocking (like production)
+                // All chunks are full 1024x1024 now
                 let mosaic = tokio::task::spawn_blocking(move || {
-                    // Create data with actual chunk dimensions
-                    Array4::from_elem((1, 64, height, width), (chunk.row_idx * 7 + chunk.col_idx) as i8)
+                    Array4::from_elem((1, 64, 1024, 1024), (chunk.row_idx * 7 + chunk.col_idx) as i8)
                 })
                 .await
                 .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {}", e))?;
