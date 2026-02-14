@@ -46,13 +46,37 @@ impl RTreeObject for CogTile {
     }
 }
 
+/// Newtype wrapper for Arc<CogTile> to implement RTreeObject.
+/// This avoids cloning the underlying CogTile data when building the R-tree.
+#[derive(Debug, Clone)]
+pub struct ArcTile(pub Arc<CogTile>);
+
+impl std::ops::Deref for ArcTile {
+    type Target = CogTile;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl RTreeObject for ArcTile {
+    type Envelope = AABB<[f64; 2]>;
+
+    fn envelope(&self) -> Self::Envelope {
+        AABB::from_corners(
+            [self.bounds_wgs84[0], self.bounds_wgs84[1]],
+            [self.bounds_wgs84[2], self.bounds_wgs84[3]],
+        )
+    }
+}
+
 /// Index of all input COG tiles with spatial query support.
 pub struct InputIndex {
-    /// All tiles loaded from the parquet index
-    tiles: Vec<CogTile>,
+    /// All tiles loaded from the parquet index (wrapped in Arc for cheap cloning)
+    tiles: Vec<Arc<CogTile>>,
 
-    /// R-tree for efficient spatial queries
-    rtree: RTree<CogTile>,
+    /// R-tree for efficient spatial queries (uses ArcTile wrapper)
+    rtree: RTree<ArcTile>,
 }
 
 impl InputIndex {
@@ -70,7 +94,11 @@ impl InputIndex {
             Self::extract_tiles_from_batch(&batch, &mut tiles)?;
         }
 
-        let rtree = RTree::bulk_load(tiles.clone());
+        // Wrap tiles in Arc for cheap cloning
+        let tiles: Vec<Arc<CogTile>> = tiles.into_iter().map(Arc::new).collect();
+        // Build RTree using ArcTile wrapper (cloning Arc is cheap)
+        let rtree_tiles: Vec<ArcTile> = tiles.iter().map(|t| ArcTile(Arc::clone(t))).collect();
+        let rtree = RTree::bulk_load(rtree_tiles);
 
         tracing::info!("Loaded {} tiles from parquet index", tiles.len());
 
@@ -99,7 +127,11 @@ impl InputIndex {
             Self::extract_tiles_from_batch(&batch, &mut tiles)?;
         }
 
-        let rtree = RTree::bulk_load(tiles.clone());
+        // Wrap tiles in Arc for cheap cloning
+        let tiles: Vec<Arc<CogTile>> = tiles.into_iter().map(Arc::new).collect();
+        // Build RTree using ArcTile wrapper (cloning Arc is cheap)
+        let rtree_tiles: Vec<ArcTile> = tiles.iter().map(|t| ArcTile(Arc::clone(t))).collect();
+        let rtree = RTree::bulk_load(rtree_tiles);
 
         tracing::info!("Loaded {} tiles from parquet index", tiles.len());
 
@@ -216,16 +248,20 @@ impl InputIndex {
     }
 
     /// Query tiles that intersect the given WGS84 bounding box.
-    pub fn query_intersecting(&self, bounds: &[f64; 4]) -> Vec<&CogTile> {
+    /// Returns Arc clones (cheap reference count increment).
+    pub fn query_intersecting(&self, bounds: &[f64; 4]) -> Vec<Arc<CogTile>> {
         let envelope = AABB::from_corners(
             [bounds[0], bounds[1]],
             [bounds[2], bounds[3]],
         );
-        self.rtree.locate_in_envelope_intersecting(&envelope).collect()
+        self.rtree
+            .locate_in_envelope_intersecting(&envelope)
+            .map(|arc_tile| Arc::clone(&arc_tile.0))
+            .collect()
     }
 
     /// Get all tiles.
-    pub fn all_tiles(&self) -> &[CogTile] {
+    pub fn all_tiles(&self) -> &[Arc<CogTile>] {
         &self.tiles
     }
 
@@ -267,8 +303,9 @@ impl InputIndex {
     /// - Match one of the given years (if provided)
     ///
     /// If both bounds and years are None, returns a clone of self.
+    /// Note: This clones Arc references (cheap), not the underlying CogTile data.
     pub fn filter(&self, bounds: Option<&[f64; 4]>, years: Option<&[i32]>) -> Self {
-        let filtered: Vec<CogTile> = self.tiles.iter()
+        let filtered: Vec<Arc<CogTile>> = self.tiles.iter()
             .filter(|tile| {
                 // Filter by bounds if specified
                 if let Some(b) = bounds {
@@ -294,7 +331,9 @@ impl InputIndex {
             .cloned()
             .collect();
 
-        let rtree = RTree::bulk_load(filtered.clone());
+        // Build RTree using ArcTile wrapper (cloning Arc is cheap)
+        let rtree_tiles: Vec<ArcTile> = filtered.iter().map(|t| ArcTile(Arc::clone(t))).collect();
+        let rtree = RTree::bulk_load(rtree_tiles);
 
         tracing::info!(
             "Filtered {} -> {} tiles (bounds: {:?}, years: {:?})",
@@ -333,25 +372,27 @@ mod tests {
     }
 
     fn create_test_index() -> InputIndex {
-        let tiles = vec![
-            create_test_tile("t1", [-122.5, 37.5, -122.0, 38.0], 2023),
-            create_test_tile("t2", [-122.0, 37.5, -121.5, 38.0], 2023),
-            create_test_tile("t3", [-123.0, 38.0, -122.5, 38.5], 2024),
-            create_test_tile("t4", [-121.5, 37.0, -121.0, 37.5], 2024),
+        let tiles: Vec<Arc<CogTile>> = vec![
+            Arc::new(create_test_tile("t1", [-122.5, 37.5, -122.0, 38.0], 2023)),
+            Arc::new(create_test_tile("t2", [-122.0, 37.5, -121.5, 38.0], 2023)),
+            Arc::new(create_test_tile("t3", [-123.0, 38.0, -122.5, 38.5], 2024)),
+            Arc::new(create_test_tile("t4", [-121.5, 37.0, -121.0, 37.5], 2024)),
         ];
-        let rtree = RTree::bulk_load(tiles.clone());
+        let rtree_tiles: Vec<ArcTile> = tiles.iter().map(|t| ArcTile(Arc::clone(t))).collect();
+        let rtree = RTree::bulk_load(rtree_tiles);
         InputIndex { tiles, rtree }
     }
 
     #[test]
     fn test_rtree_query() {
-        let tiles = vec![
-            create_test_tile("t1", [-122.5, 37.5, -122.0, 38.0], 2024),
-            create_test_tile("t2", [-122.0, 37.5, -121.5, 38.0], 2024),
-            create_test_tile("t3", [-123.0, 38.0, -122.5, 38.5], 2024),
+        let tiles: Vec<Arc<CogTile>> = vec![
+            Arc::new(create_test_tile("t1", [-122.5, 37.5, -122.0, 38.0], 2024)),
+            Arc::new(create_test_tile("t2", [-122.0, 37.5, -121.5, 38.0], 2024)),
+            Arc::new(create_test_tile("t3", [-123.0, 38.0, -122.5, 38.5], 2024)),
         ];
 
-        let rtree = RTree::bulk_load(tiles.clone());
+        let rtree_tiles: Vec<ArcTile> = tiles.iter().map(|t| ArcTile(Arc::clone(t))).collect();
+        let rtree = RTree::bulk_load(rtree_tiles);
 
         // Query overlapping t1 and t2
         let envelope = AABB::from_corners([-122.3, 37.6], [-121.8, 37.9]);
@@ -375,8 +416,8 @@ mod tests {
     #[test]
     fn test_bounds_wgs84_empty() {
         let index = InputIndex {
-            tiles: vec![],
-            rtree: RTree::new(),
+            tiles: Vec::<Arc<CogTile>>::new(),
+            rtree: RTree::<ArcTile>::new(),
         };
         assert!(index.bounds_wgs84().is_none());
     }
@@ -477,8 +518,8 @@ mod tests {
         assert!(!index.is_empty());
 
         let empty = InputIndex {
-            tiles: vec![],
-            rtree: RTree::new(),
+            tiles: Vec::<Arc<CogTile>>::new(),
+            rtree: RTree::<ArcTile>::new(),
         };
         assert_eq!(empty.len(), 0);
         assert!(empty.is_empty());

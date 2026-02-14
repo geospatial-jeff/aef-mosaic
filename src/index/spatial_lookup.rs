@@ -52,16 +52,18 @@ impl SpatialLookup {
     }
 
     /// Find all input COG tiles that intersect the given output chunk.
+    /// Returns Arc clones (cheap reference count increment).
     ///
     /// Returns an error if coordinate transformation fails.
-    pub fn tiles_for_chunk(&self, chunk: &OutputChunk) -> Result<Vec<&CogTile>> {
+    pub fn tiles_for_chunk(&self, chunk: &OutputChunk) -> Result<Vec<Arc<CogTile>>> {
         let bounds_crs = self.output_grid.chunk_bounds(chunk);
         let bounds_wgs84 = self.transform_to_wgs84(&bounds_crs)?;
         Ok(self.input_index.query_intersecting(&bounds_wgs84))
     }
 
     /// Find all input COG tiles that intersect the given WGS84 bounds.
-    pub fn tiles_for_bounds(&self, bounds: &[f64; 4]) -> Vec<&CogTile> {
+    /// Returns Arc clones (cheap reference count increment).
+    pub fn tiles_for_bounds(&self, bounds: &[f64; 4]) -> Vec<Arc<CogTile>> {
         self.input_index.query_intersecting(bounds)
     }
 
@@ -158,6 +160,7 @@ impl std::fmt::Display for CoverageStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::ArcTile;
     use rstar::RTree;
 
     fn create_test_tile(id: &str, bounds: [f64; 4]) -> CogTile {
@@ -174,15 +177,16 @@ mod tests {
 
     #[test]
     fn test_spatial_lookup() {
-        // Create test tiles
-        let tiles = vec![
-            create_test_tile("t1", [-1.0, -1.0, 0.0, 0.0]),
-            create_test_tile("t2", [0.0, 0.0, 1.0, 1.0]),
-            create_test_tile("t3", [1.0, 1.0, 2.0, 2.0]),
+        // Create test tiles wrapped in Arc
+        let tiles: Vec<Arc<CogTile>> = vec![
+            Arc::new(create_test_tile("t1", [-1.0, -1.0, 0.0, 0.0])),
+            Arc::new(create_test_tile("t2", [0.0, 0.0, 1.0, 1.0])),
+            Arc::new(create_test_tile("t3", [1.0, 1.0, 2.0, 2.0])),
         ];
 
-        // Build index manually for testing
-        let rtree = RTree::bulk_load(tiles.clone());
+        // Build index manually for testing using ArcTile wrapper
+        let rtree_tiles: Vec<ArcTile> = tiles.iter().map(|t| ArcTile(Arc::clone(t))).collect();
+        let rtree = RTree::bulk_load(rtree_tiles);
 
         // Query overlapping t2
         let bounds = [0.5, 0.5, 0.6, 0.6];

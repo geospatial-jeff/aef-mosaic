@@ -162,7 +162,7 @@ impl ChunkProcessor {
     /// * `chunk_bounds_wgs84` - Chunk bounds in WGS84 for intersection calculation
     async fn fetch_tile_windows(
         &self,
-        tiles: &[&CogTile],
+        tiles: &[Arc<CogTile>],
         chunk_bounds_wgs84: &[f64; 4],
     ) -> Result<Vec<WindowData>> {
         use futures::future::join_all;
@@ -173,7 +173,8 @@ impl ChunkProcessor {
                 let reader = self.cog_reader.clone();
                 let bounds = *chunk_bounds_wgs84;
                 let cache = self.proj_cache.clone();
-                let tile = (*tile).clone();
+                // Clone Arc (cheap reference count increment), not the CogTile data
+                let tile = Arc::clone(tile);
                 async move {
                     // Get the geotransform from the TIFF header
                     let geo_transform = reader.get_geo_transform(&tile).await?
