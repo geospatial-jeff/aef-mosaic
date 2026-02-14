@@ -164,9 +164,19 @@ impl Default for ChunkShape {
 /// Processing configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessingConfig {
-    /// Number of concurrent chunk processors
+    /// Number of concurrent COG fetch tasks (network I/O bound)
     #[serde(default = "default_concurrency")]
     pub concurrency: usize,
+
+    /// Number of concurrent mosaic/reproject tasks (CPU bound)
+    /// Defaults to half of concurrency, capped at 16
+    #[serde(default)]
+    pub mosaic_concurrency: Option<usize>,
+
+    /// Number of concurrent Zarr write tasks (I/O bound)
+    /// Defaults to half of concurrency, capped at 16
+    #[serde(default)]
+    pub write_concurrency: Option<usize>,
 
     /// Enable metrics reporting
     #[serde(default = "default_true")]
@@ -239,6 +249,8 @@ impl Default for ProcessingConfig {
     fn default() -> Self {
         Self {
             concurrency: 16,
+            mosaic_concurrency: None,
+            write_concurrency: None,
             enable_metrics: true,
             metrics_interval_secs: 10,
             retry: RetryConfig::default(),
@@ -246,6 +258,20 @@ impl Default for ProcessingConfig {
             metadata_cache_entries: 10_000,
             metrics_output_path: None,
         }
+    }
+}
+
+impl ProcessingConfig {
+    /// Get effective mosaic concurrency (uses default formula if not set)
+    pub fn effective_mosaic_concurrency(&self) -> usize {
+        self.mosaic_concurrency
+            .unwrap_or_else(|| 16.min(self.concurrency / 2).max(1))
+    }
+
+    /// Get effective write concurrency (uses default formula if not set)
+    pub fn effective_write_concurrency(&self) -> usize {
+        self.write_concurrency
+            .unwrap_or_else(|| 16.min(self.concurrency / 2).max(1))
     }
 }
 
