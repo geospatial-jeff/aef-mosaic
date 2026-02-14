@@ -279,7 +279,7 @@ output:
 # === PROCESSING: Performance tuning ===
 processing:
   # Number of output chunks to process concurrently
-  concurrency: 256
+  concurrency: 16
 
   # Print throughput metrics during processing
   enable_metrics: true

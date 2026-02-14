@@ -188,16 +188,6 @@ pub struct ProcessingConfig {
     #[serde(default = "default_metadata_cache_entries")]
     pub metadata_cache_entries: usize,
 
-    /// Size of meta-tiles for spatial windowing (NxN output chunks per meta-tile)
-    #[serde(default = "default_metatile_size")]
-    pub metatile_size: usize,
-
-    /// Enable prefetching all tiles for a metatile before processing
-    /// When true: fewer, larger S3 requests but processing waits for prefetch
-    /// When false: more, smaller requests but I/O overlaps with compute
-    #[serde(default)]
-    pub enable_prefetch: bool,
-
     /// Optional path to save metrics JSON after run completes
     #[serde(default)]
     pub metrics_output_path: Option<String>,
@@ -248,14 +238,12 @@ pub struct FilterConfig {
 impl Default for ProcessingConfig {
     fn default() -> Self {
         Self {
-            concurrency: 256,
+            concurrency: 16,
             enable_metrics: true,
             metrics_interval_secs: 10,
             retry: RetryConfig::default(),
             tile_cache_gb: 32.0,
             metadata_cache_entries: 10_000,
-            metatile_size: 32,
-            enable_prefetch: false,
             metrics_output_path: None,
         }
     }
@@ -332,7 +320,7 @@ fn default_resolution() -> f64 { 10.0 }
 fn default_time_chunks() -> usize { 1 }
 fn default_embedding_chunks() -> usize { 64 }
 fn default_spatial_chunks() -> usize { 1024 }
-fn default_concurrency() -> usize { 256 }
+fn default_concurrency() -> usize { 16 }
 fn default_true() -> bool { true }
 fn default_metrics_interval() -> u64 { 10 }
 fn default_max_retries() -> usize { 3 }
@@ -345,7 +333,6 @@ fn default_num_bands() -> usize { 64 }
 fn default_compression_level() -> i32 { 3 }
 fn default_tile_cache_gb() -> f64 { 32.0 }
 fn default_metadata_cache_entries() -> usize { 10_000 }
-fn default_metatile_size() -> usize { 32 }
 
 #[cfg(test)]
 mod tests {

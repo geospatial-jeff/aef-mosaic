@@ -155,10 +155,6 @@ pub async fn run_pipeline(config: Config) -> Result<pipeline::SchedulerStats> {
         skip_empty: true,
         enable_metrics: config.processing.enable_metrics,
         metrics_interval_secs: config.processing.metrics_interval_secs,
-        spatial_ordering: true,
-        enable_metatiling: true,
-        metatile_size: config.processing.metatile_size,
-        enable_prefetch: config.processing.enable_prefetch,
         metrics_output_path: config.processing.metrics_output_path.clone(),
     };
 
