@@ -176,7 +176,9 @@ impl ZarrWriter {
             || shape[2] != expected_shape[2]
             || shape[3] != expected_shape[3];
 
-        let chunk_elements: Vec<i8> = if needs_padding {
+        // For full-size chunks with contiguous memory layout, pass slice directly to avoid copy.
+        // For partial edge chunks, we must pad to full chunk size first.
+        if needs_padding {
             // Pad to full chunk size with fill value (0)
             let mut padded = Array4::<i8>::zeros((
                 expected_shape[0],
@@ -192,22 +194,27 @@ impl ZarrWriter {
                 "Padded chunk {:?} from {:?} to {:?}",
                 chunk_indices, shape, expected_shape
             );
-            padded.iter().copied().collect()
+
+            // Padded array is contiguous, use as_slice directly
+            let chunk_data = padded.as_slice().expect("padded array should be contiguous");
+            tracing::debug!("Chunk {:?}: {} elements (padded)", chunk_indices, chunk_data.len());
+
+            self.array
+                .async_store_chunk(&chunk_indices, chunk_data)
+                .await
         } else {
-            data.iter().copied().collect()
-        };
+            // Full-size chunk: use as_slice to avoid copy (data should be contiguous)
+            let chunk_data = data.as_slice().expect("chunk data should be contiguous");
+            tracing::debug!("Chunk {:?}: {} elements", chunk_indices, chunk_data.len());
 
-        tracing::debug!("Chunk {:?}: {} elements", chunk_indices, chunk_elements.len());
-
-        // Use async_store_chunk with chunk indices directly
-        // zarrs::Array is safe for concurrent writes to different chunks
-        self.array
-            .async_store_chunk(&chunk_indices, chunk_elements.as_slice())
-            .await
+            self.array
+                .async_store_chunk(&chunk_indices, chunk_data)
+                .await
+        }
             .map_err(|e| {
                 tracing::error!(
-                    "Chunk {:?} write failed: {:?}. Data shape: {:?}, elements: {}",
-                    chunk_indices, e, shape, chunk_elements.len()
+                    "Chunk {:?} write failed: {:?}. Data shape: {:?}",
+                    chunk_indices, e, shape
                 );
                 anyhow::anyhow!("Failed to write chunk {:?}: {:?}", chunk_indices, e)
             })?;
