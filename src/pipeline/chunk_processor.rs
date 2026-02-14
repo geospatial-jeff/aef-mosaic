@@ -167,14 +167,12 @@ impl ChunkProcessor {
     ) -> Result<Vec<WindowData>> {
         use futures::future::join_all;
 
-        let proj_cache = self.proj_cache.clone();
-
         // Create futures for all tile fetches
         let futures: Vec<_> = tiles.iter()
             .map(|tile| {
                 let reader = self.cog_reader.clone();
                 let bounds = *chunk_bounds_wgs84;
-                let cache = proj_cache.clone();
+                let cache = self.proj_cache.clone();
                 let tile = (*tile).clone();
                 async move {
                     // Get the geotransform from the TIFF header
