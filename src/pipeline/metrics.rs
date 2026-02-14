@@ -51,9 +51,6 @@ pub struct Metrics {
     /// Time spent writing to Zarr (microseconds)
     pub zarr_write_us: AtomicU64,
 
-    /// Time spent prefetching tiles (microseconds)
-    pub prefetch_us: AtomicU64,
-
     // Cache metrics
     /// TIFF metadata cache hits
     pub metadata_cache_hits: AtomicU64,
@@ -98,7 +95,6 @@ impl Metrics {
             reproject_us: AtomicU64::new(0),
             mosaic_us: AtomicU64::new(0),
             zarr_write_us: AtomicU64::new(0),
-            prefetch_us: AtomicU64::new(0),
             metadata_cache_hits: AtomicU64::new(0),
             metadata_cache_misses: AtomicU64::new(0),
             tile_cache_hits: AtomicU64::new(0),
@@ -159,11 +155,6 @@ impl Metrics {
     /// Record time spent writing to Zarr (in microseconds).
     pub fn add_zarr_write_time(&self, duration: Duration) {
         self.zarr_write_us.fetch_add(duration.as_micros() as u64, Ordering::Relaxed);
-    }
-
-    /// Record time spent prefetching tiles (in microseconds).
-    pub fn add_prefetch_time(&self, duration: Duration) {
-        self.prefetch_us.fetch_add(duration.as_micros() as u64, Ordering::Relaxed);
     }
 
     /// Record a metadata cache hit.
@@ -247,7 +238,6 @@ impl Metrics {
         let reproject_us = self.reproject_us.load(Ordering::Relaxed);
         let mosaic_us = self.mosaic_us.load(Ordering::Relaxed);
         let zarr_write_us = self.zarr_write_us.load(Ordering::Relaxed);
-        let prefetch_us = self.prefetch_us.load(Ordering::Relaxed);
 
         MetricsSnapshot {
             bytes_read: self.bytes_read.load(Ordering::Relaxed),
@@ -264,7 +254,6 @@ impl Metrics {
             reproject_secs: reproject_us as f64 / 1_000_000.0,
             mosaic_secs: mosaic_us as f64 / 1_000_000.0,
             zarr_write_secs: zarr_write_us as f64 / 1_000_000.0,
-            prefetch_secs: prefetch_us as f64 / 1_000_000.0,
             metadata_cache_hits: self.metadata_cache_hits.load(Ordering::Relaxed),
             metadata_cache_misses: self.metadata_cache_misses.load(Ordering::Relaxed),
             tile_cache_hits: self.tile_cache_hits.load(Ordering::Relaxed),
@@ -300,8 +289,6 @@ pub struct MetricsSnapshot {
     pub mosaic_secs: f64,
     /// Total CPU time spent writing to Zarr (seconds, summed across threads)
     pub zarr_write_secs: f64,
-    /// Total time spent prefetching tiles (seconds, wall-clock)
-    pub prefetch_secs: f64,
     /// Metadata cache hits
     pub metadata_cache_hits: u64,
     /// Metadata cache misses
@@ -334,18 +321,17 @@ impl MetricsSnapshot {
 
 impl std::fmt::Display for MetricsSnapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Calculate percentage of time in each component (including prefetch)
-        let total_component_time = self.prefetch_secs + self.cog_read_secs + self.reproject_secs + self.mosaic_secs + self.zarr_write_secs;
-        let (prefetch_pct, read_pct, reproj_pct, mosaic_pct, write_pct) = if total_component_time > 0.0 {
+        // Calculate percentage of time in each component
+        let total_component_time = self.cog_read_secs + self.reproject_secs + self.mosaic_secs + self.zarr_write_secs;
+        let (read_pct, reproj_pct, mosaic_pct, write_pct) = if total_component_time > 0.0 {
             (
-                self.prefetch_secs / total_component_time * 100.0,
                 self.cog_read_secs / total_component_time * 100.0,
                 self.reproject_secs / total_component_time * 100.0,
                 self.mosaic_secs / total_component_time * 100.0,
                 self.zarr_write_secs / total_component_time * 100.0,
             )
         } else {
-            (0.0, 0.0, 0.0, 0.0, 0.0)
+            (0.0, 0.0, 0.0, 0.0)
         };
 
         // Cache hit rates
@@ -381,7 +367,7 @@ impl std::fmt::Display for MetricsSnapshot {
             "Chunks: {} processed, {} skipped | Tiles: {} | Reqs: {} ({:.1} tiles/req, {:.0}KB avg) | \
              Read: {:.2} GB @ {:.2} GB/s | Write: {:.2} GB @ {:.2} GB/s | \
              Rate: {:.1} chunks/s | Failures: {} | Elapsed: {:.1}s | \
-             Time: Prefetch {:.0}% | COG {:.0}% | Reproj {:.0}% | Mosaic {:.0}% | Zarr {:.0}% | \
+             Time: COG {:.0}% | Reproj {:.0}% | Mosaic {:.0}% | Zarr {:.0}% | \
              Cache: meta {:.0}% tile {:.0}%",
             self.chunks_processed,
             self.chunks_skipped,
@@ -396,7 +382,6 @@ impl std::fmt::Display for MetricsSnapshot {
             self.chunks_per_second,
             self.failures,
             self.elapsed.as_secs_f64(),
-            prefetch_pct,
             read_pct,
             reproj_pct,
             mosaic_pct,
@@ -479,12 +464,9 @@ impl MetricsReporter {
         println!("Failures: {}", snapshot.failures);
 
         // Component time breakdown
-        let total_component = snapshot.prefetch_secs + snapshot.cog_read_secs + snapshot.reproject_secs + snapshot.mosaic_secs + snapshot.zarr_write_secs;
+        let total_component = snapshot.cog_read_secs + snapshot.reproject_secs + snapshot.mosaic_secs + snapshot.zarr_write_secs;
         if total_component > 0.0 {
             println!("\n--- Component Time Breakdown ---");
-            if snapshot.prefetch_secs > 0.0 {
-                println!("Prefetch:    {:>7.1}s ({:>5.1}%)", snapshot.prefetch_secs, snapshot.prefetch_secs / total_component * 100.0);
-            }
             println!("COG read:    {:>7.1}s ({:>5.1}%)", snapshot.cog_read_secs, snapshot.cog_read_secs / total_component * 100.0);
             println!("Reproject:   {:>7.1}s ({:>5.1}%)", snapshot.reproject_secs, snapshot.reproject_secs / total_component * 100.0);
             println!("Mosaic:      {:>7.1}s ({:>5.1}%)", snapshot.mosaic_secs, snapshot.mosaic_secs / total_component * 100.0);
@@ -628,7 +610,6 @@ mod tests {
             reproject_secs: 2.0,
             mosaic_secs: 1.0,
             zarr_write_secs: 2.0,
-            prefetch_secs: 0.0,
             metadata_cache_hits: 400,
             metadata_cache_misses: 100,
             tile_cache_hits: 300,
@@ -671,7 +652,6 @@ mod tests {
             reproject_secs: 0.0,
             mosaic_secs: 0.0,
             zarr_write_secs: 0.0,
-            prefetch_secs: 0.0,
             metadata_cache_hits: 80,
             metadata_cache_misses: 20,
             tile_cache_hits: 50,
