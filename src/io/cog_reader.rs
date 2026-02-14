@@ -615,10 +615,13 @@ impl CogReader {
             Ok(tile) => {
                 let tile_arc = Arc::new(tile);
 
-                // Cache it
+                // Cache it and track bytes
                 {
                     let mut cache = self.tile_cache.cache.write().await;
                     cache.put(key.clone(), tile_arc.clone());
+                }
+                if let Some(ref m) = self.metrics {
+                    m.add_tile_cache_bytes(tile_arc.data.data().as_ref().len() as u64);
                 }
 
                 // Notify waiters and remove from in-flight

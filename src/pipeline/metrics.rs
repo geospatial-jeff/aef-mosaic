@@ -175,6 +175,11 @@ impl Metrics {
         self.tile_cache_bytes.store(bytes, Ordering::Relaxed);
     }
 
+    /// Add bytes to tile cache size counter.
+    pub fn add_tile_cache_bytes(&self, bytes: u64) {
+        self.tile_cache_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
     /// Get elapsed time since start.
     pub fn elapsed(&self) -> Duration {
         self.start_time.map_or(Duration::ZERO, |t| t.elapsed())
