@@ -69,15 +69,6 @@ pub struct Metrics {
 
     /// Current tile cache size in bytes
     pub tile_cache_bytes: AtomicU64,
-
-    /// Number of HTTP batch requests made (for measuring request coalescing)
-    pub tile_batch_requests: AtomicU64,
-
-    /// Number of tiles fetched via batch requests
-    pub tiles_fetched_in_batches: AtomicU64,
-
-    /// Raw bytes fetched in batch requests (compressed, before decoding)
-    pub tile_batch_bytes: AtomicU64,
 }
 
 impl Metrics {
@@ -101,9 +92,6 @@ impl Metrics {
             tile_cache_misses: AtomicU64::new(0),
             tile_cache_coalesced: AtomicU64::new(0),
             tile_cache_bytes: AtomicU64::new(0),
-            tile_batch_requests: AtomicU64::new(0),
-            tiles_fetched_in_batches: AtomicU64::new(0),
-            tile_batch_bytes: AtomicU64::new(0),
         })
     }
 
@@ -187,13 +175,6 @@ impl Metrics {
         self.tile_cache_bytes.store(bytes, Ordering::Relaxed);
     }
 
-    /// Record a batch tile request (one HTTP request fetching multiple tiles).
-    pub fn add_tile_batch_request(&self, tiles_in_batch: u64, bytes: u64) {
-        self.tile_batch_requests.fetch_add(1, Ordering::Relaxed);
-        self.tiles_fetched_in_batches.fetch_add(tiles_in_batch, Ordering::Relaxed);
-        self.tile_batch_bytes.fetch_add(bytes, Ordering::Relaxed);
-    }
-
     /// Get elapsed time since start.
     pub fn elapsed(&self) -> Duration {
         self.start_time.map_or(Duration::ZERO, |t| t.elapsed())
@@ -260,9 +241,6 @@ impl Metrics {
             tile_cache_misses: self.tile_cache_misses.load(Ordering::Relaxed),
             tile_cache_coalesced: self.tile_cache_coalesced.load(Ordering::Relaxed),
             tile_cache_bytes: self.tile_cache_bytes.load(Ordering::Relaxed),
-            tile_batch_requests: self.tile_batch_requests.load(Ordering::Relaxed),
-            tiles_fetched_in_batches: self.tiles_fetched_in_batches.load(Ordering::Relaxed),
-            tile_batch_bytes: self.tile_batch_bytes.load(Ordering::Relaxed),
         }
     }
 }
@@ -301,12 +279,6 @@ pub struct MetricsSnapshot {
     pub tile_cache_coalesced: u64,
     /// Tile cache size in bytes
     pub tile_cache_bytes: u64,
-    /// Number of HTTP batch requests made
-    pub tile_batch_requests: u64,
-    /// Number of tiles fetched via batch requests
-    pub tiles_fetched_in_batches: u64,
-    /// Raw bytes fetched in batch requests
-    pub tile_batch_bytes: u64,
 }
 
 impl MetricsSnapshot {
@@ -349,22 +321,9 @@ impl std::fmt::Display for MetricsSnapshot {
             0.0
         };
 
-        // Request coalescing ratio
-        let tiles_per_request = if self.tile_batch_requests > 0 {
-            self.tiles_fetched_in_batches as f64 / self.tile_batch_requests as f64
-        } else {
-            0.0
-        };
-
-        let avg_request_kb = if self.tile_batch_requests > 0 {
-            self.tile_batch_bytes as f64 / self.tile_batch_requests as f64 / 1024.0
-        } else {
-            0.0
-        };
-
         write!(
             f,
-            "Chunks: {} processed, {} skipped | Tiles: {} | Reqs: {} ({:.1} tiles/req, {:.0}KB avg) | \
+            "Chunks: {} processed, {} skipped | Tiles: {} | \
              Read: {:.2} GB @ {:.2} GB/s | Write: {:.2} GB @ {:.2} GB/s | \
              Rate: {:.1} chunks/s | Failures: {} | Elapsed: {:.1}s | \
              Time: COG {:.0}% | Reproj {:.0}% | Mosaic {:.0}% | Zarr {:.0}% | \
@@ -372,9 +331,6 @@ impl std::fmt::Display for MetricsSnapshot {
             self.chunks_processed,
             self.chunks_skipped,
             self.tiles_read,
-            self.tile_batch_requests,
-            tiles_per_request,
-            avg_request_kb,
             self.bytes_read as f64 / (1024.0 * 1024.0 * 1024.0),
             self.read_throughput_gbps,
             self.bytes_written as f64 / (1024.0 * 1024.0 * 1024.0),
@@ -498,19 +454,6 @@ impl MetricsReporter {
                 );
             }
         }
-
-        // Request coalescing statistics
-        if snapshot.tile_batch_requests > 0 {
-            let tiles_per_request = snapshot.tiles_fetched_in_batches as f64 / snapshot.tile_batch_requests as f64;
-            let avg_request_kb = snapshot.tile_batch_bytes as f64 / snapshot.tile_batch_requests as f64 / 1024.0;
-            let total_batch_mb = snapshot.tile_batch_bytes as f64 / (1024.0 * 1024.0);
-            println!("\n--- Request Coalescing ---");
-            println!("Batch requests: {}", snapshot.tile_batch_requests);
-            println!("Tiles fetched: {}", snapshot.tiles_fetched_in_batches);
-            println!("Tiles per request: {:.2}", tiles_per_request);
-            println!("Total batch bytes: {:.2} MB", total_batch_mb);
-            println!("Avg request size: {:.1} KB", avg_request_kb);
-        }
         println!("========================\n");
     }
 }
@@ -616,9 +559,6 @@ mod tests {
             tile_cache_misses: 150,
             tile_cache_coalesced: 50,
             tile_cache_bytes: 100 * 1024 * 1024,
-            tile_batch_requests: 50,
-            tiles_fetched_in_batches: 150,
-            tile_batch_bytes: 50 * 100 * 1024, // 50 requests * 100KB each = 5MB
         };
 
         let display = format!("{}", snapshot);
@@ -628,9 +568,6 @@ mod tests {
         assert!(display.contains("10 skipped"));
         assert!(display.contains("500")); // tiles
         assert!(display.contains("Failures: 2"));
-        assert!(display.contains("Reqs: 50"));
-        assert!(display.contains("3.0 tiles/req"));
-        assert!(display.contains("100KB avg"));
     }
 
     #[test]
@@ -658,9 +595,6 @@ mod tests {
             tile_cache_misses: 30,
             tile_cache_coalesced: 20,
             tile_cache_bytes: 0,
-            tile_batch_requests: 0,
-            tiles_fetched_in_batches: 0,
-            tile_batch_bytes: 0,
         };
 
         let display = format!("{}", snapshot);
