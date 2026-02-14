@@ -34,7 +34,7 @@ use std::time::Duration;
 /// Key settings:
 /// - Large connection pool (256 connections per host) for high concurrency
 /// - Keep-alive to reuse TCP connections
-/// - HTTP/2 for multiplexing multiple requests over single connection
+/// - Note: HTTP/2 is NOT enabled as S3 path-style URLs don't support it reliably
 fn create_client_options() -> ClientOptions {
     ClientOptions::new()
         // Request timeout (per request, not connection)
@@ -45,8 +45,6 @@ fn create_client_options() -> ClientOptions {
         .with_pool_idle_timeout(Duration::from_secs(90))
         // TCP connection timeout
         .with_connect_timeout(Duration::from_secs(10))
-        // Enable HTTP/2 for connection multiplexing
-        .with_http2_only()
 }
 
 /// Create an anonymous S3 client for reading from source.coop (public bucket).
@@ -57,7 +55,7 @@ fn create_client_options() -> ClientOptions {
 /// Connection pool is configured for high throughput (256 connections, HTTP/2).
 pub fn create_anonymous_store(bucket: &str) -> Result<Arc<dyn ObjectStore>> {
     tracing::info!(
-        "Creating anonymous S3 client for bucket: {} (pool_size=256, http2=true)",
+        "Creating anonymous S3 client for bucket: {} (pool_size=256, idle_timeout=90s)",
         bucket
     );
 
