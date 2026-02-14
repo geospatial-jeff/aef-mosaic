@@ -29,19 +29,37 @@ use object_store::{ClientOptions, ObjectStore};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Create client options for S3 access.
-/// Uses sensible defaults - only override what's necessary.
+/// Create client options for S3 access optimized for high-throughput.
+///
+/// Key settings:
+/// - Large connection pool (256 connections per host) for high concurrency
+/// - Keep-alive to reuse TCP connections
+/// - HTTP/2 for multiplexing multiple requests over single connection
 fn create_client_options() -> ClientOptions {
     ClientOptions::new()
-        .with_timeout(Duration::from_secs(30))
+        // Request timeout (per request, not connection)
+        .with_timeout(Duration::from_secs(60))
+        // Allow many concurrent connections to S3
+        .with_pool_max_idle_per_host(256)
+        // Keep connections alive longer for reuse
+        .with_pool_idle_timeout(Duration::from_secs(90))
+        // TCP connection timeout
+        .with_connect_timeout(Duration::from_secs(10))
+        // Enable HTTP/2 for connection multiplexing
+        .with_http2_only()
 }
 
 /// Create an anonymous S3 client for reading from source.coop (public bucket).
 ///
 /// Used for reading COG tiles and index. No credentials needed.
 /// Hardcoded to us-west-2 where source.coop is hosted.
+///
+/// Connection pool is configured for high throughput (256 connections, HTTP/2).
 pub fn create_anonymous_store(bucket: &str) -> Result<Arc<dyn ObjectStore>> {
-    tracing::info!("Creating anonymous S3 client for bucket: {}", bucket);
+    tracing::info!(
+        "Creating anonymous S3 client for bucket: {} (pool_size=256, http2=true)",
+        bucket
+    );
 
     let builder = AmazonS3Builder::new()
         .with_bucket_name(bucket)

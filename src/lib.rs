@@ -56,13 +56,13 @@ pub async fn run_pipeline(config: Config) -> Result<pipeline::SchedulerStats> {
     let cog_store = io::create_cog_store(&config)?;
     let output_store = io::create_output_store(&config)?;
 
-    // Load input index
+    // Load input index (reuse cog_store if loading from same bucket)
     tracing::info!("Loading tile index from {}", config.input.index_path);
     let input_index = if config.input.index_path.starts_with("s3://") {
-        let (bucket, key) = io::parse_s3_uri(&config.input.index_path)?;
-        let store = io::create_anonymous_store(bucket)?;
+        let (_bucket, key) = io::parse_s3_uri(&config.input.index_path)?;
+        // Reuse the cog_store instead of creating a new connection pool
         let path = object_store::path::Path::from(key);
-        InputIndex::from_s3(store, &path).await?
+        InputIndex::from_s3(cog_store.clone(), &path).await?
     } else {
         InputIndex::from_local_parquet(&config.input.index_path)?
     };
