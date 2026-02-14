@@ -42,9 +42,6 @@ pub struct ChunkProcessor {
     /// Configuration
     config: Arc<Config>,
 
-    /// Maximum concurrent COG fetches per chunk
-    cog_fetch_concurrency: usize,
-
     /// CRS transformation cache
     proj_cache: Arc<ProjCache>,
 }
@@ -63,7 +60,6 @@ impl ChunkProcessor {
             zarr_writer,
             spatial_lookup,
             metrics,
-            cog_fetch_concurrency: config.processing.cog_fetch_concurrency,
             config,
             proj_cache: Arc::new(ProjCache::new()),
         }
@@ -169,10 +165,12 @@ impl ChunkProcessor {
         tiles: &[&CogTile],
         chunk_bounds_wgs84: &[f64; 4],
     ) -> Result<Vec<WindowData>> {
-        use futures::stream::{self, StreamExt};
+        use futures::future::join_all;
 
         let proj_cache = self.proj_cache.clone();
-        let results: Vec<_> = stream::iter(tiles.iter())
+
+        // Create futures for all tile fetches
+        let futures: Vec<_> = tiles.iter()
             .map(|tile| {
                 let reader = self.cog_reader.clone();
                 let bounds = *chunk_bounds_wgs84;
@@ -191,9 +189,10 @@ impl ChunkProcessor {
                     reader.read_window(&tile, window, intersection_bounds).await
                 }
             })
-            .buffer_unordered(self.cog_fetch_concurrency)
-            .collect()
-            .await;
+            .collect();
+
+        // Fetch all tiles concurrently
+        let results = join_all(futures).await;
 
         // Collect successful reads, log failures
         let mut window_data = Vec::with_capacity(results.len());

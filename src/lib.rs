@@ -185,26 +185,3 @@ pub async fn run_pipeline(config: Config) -> Result<pipeline::SchedulerStats> {
 
     Ok(stats)
 }
-
-/// Build a Tokio runtime with the specified configuration.
-pub fn build_runtime(worker_threads: Option<usize>) -> Result<tokio::runtime::Runtime> {
-    let mut builder = tokio::runtime::Builder::new_multi_thread();
-
-    if let Some(threads) = worker_threads {
-        builder.worker_threads(threads);
-    }
-
-    builder.enable_all();
-
-    Ok(builder.build()?)
-}
-
-/// Initialize the Rayon thread pool.
-pub fn init_rayon(threads: Option<usize>) -> Result<()> {
-    if let Some(threads) = threads {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build_global()?;
-    }
-    Ok(())
-}

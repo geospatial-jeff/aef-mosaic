@@ -168,18 +168,6 @@ pub struct ProcessingConfig {
     #[serde(default = "default_concurrency")]
     pub concurrency: usize,
 
-    /// Maximum concurrent COG fetches per chunk
-    #[serde(default = "default_cog_fetch_concurrency")]
-    pub cog_fetch_concurrency: usize,
-
-    /// Number of Tokio worker threads
-    #[serde(default)]
-    pub worker_threads: Option<usize>,
-
-    /// Rayon thread pool size for CPU-bound work
-    #[serde(default)]
-    pub rayon_threads: Option<usize>,
-
     /// Enable metrics reporting
     #[serde(default = "default_true")]
     pub enable_metrics: bool,
@@ -261,9 +249,6 @@ impl Default for ProcessingConfig {
     fn default() -> Self {
         Self {
             concurrency: 256,
-            cog_fetch_concurrency: 8,
-            worker_threads: None,
-            rayon_threads: None,
             enable_metrics: true,
             metrics_interval_secs: 10,
             retry: RetryConfig::default(),
@@ -348,7 +333,6 @@ fn default_time_chunks() -> usize { 1 }
 fn default_embedding_chunks() -> usize { 64 }
 fn default_spatial_chunks() -> usize { 1024 }
 fn default_concurrency() -> usize { 256 }
-fn default_cog_fetch_concurrency() -> usize { 8 }
 fn default_true() -> bool { true }
 fn default_metrics_interval() -> u64 { 10 }
 fn default_max_retries() -> usize { 3 }

@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-use aef_mosaic::{build_runtime, init_rayon, run_pipeline, Config};
+use aef_mosaic::{run_pipeline, Config};
 
 #[derive(Parser)]
 #[command(name = "aef-mosaic")]
@@ -89,11 +89,8 @@ fn run_command(config_path: PathBuf, concurrency: Option<usize>, dry_run: bool) 
         return analyze_work(&config);
     }
 
-    // Initialize Rayon
-    init_rayon(config.processing.rayon_threads)?;
-
-    // Build and run Tokio runtime
-    let runtime = build_runtime(config.processing.worker_threads)?;
+    // Build and run Tokio runtime (uses default thread counts)
+    let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async { run_pipeline(config).await })?;
 
     Ok(())
@@ -106,7 +103,7 @@ fn analyze_command(config_path: PathBuf) -> Result<()> {
 }
 
 fn analyze_work(config: &Config) -> Result<()> {
-    let runtime = build_runtime(None)?;
+    let runtime = tokio::runtime::Runtime::new()?;
 
     runtime.block_on(async {
         use aef_mosaic::{io, InputIndex, OutputGrid, SpatialLookup};
@@ -283,15 +280,6 @@ output:
 processing:
   # Number of output chunks to process concurrently
   concurrency: 256
-
-  # Max concurrent COG fetches per chunk
-  cog_fetch_concurrency: 8
-
-  # Tokio async worker threads (null = num CPUs)
-  # worker_threads: 64
-
-  # Rayon thread pool size for CPU work (null = num CPUs)
-  # rayon_threads: 64
 
   # Print throughput metrics during processing
   enable_metrics: true

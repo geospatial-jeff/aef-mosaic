@@ -25,45 +25,15 @@ pub fn parse_s3_uri(uri: &str) -> Result<(&str, &str)> {
 }
 use object_store::aws::AmazonS3Builder;
 use object_store::local::LocalFileSystem;
-use object_store::{ClientOptions, ObjectStore, RetryConfig};
+use object_store::{ClientOptions, ObjectStore};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Create optimized client options for high-throughput S3 access.
-///
-/// These settings are tuned for:
-/// - EC2 instances with 100 Gbps network
-/// - High-concurrency workloads (512+ concurrent requests)
-/// - Large file transfers
+/// Create client options for S3 access.
+/// Uses sensible defaults - only override what's necessary.
 fn create_client_options() -> ClientOptions {
     ClientOptions::new()
-        // Connection timeout: how long to wait for a connection to be established
-        .with_connect_timeout(Duration::from_secs(5))
-        // Request timeout: total time allowed for a request including retries
         .with_timeout(Duration::from_secs(30))
-        // Pool idle timeout: how long to keep idle connections in the pool
-        .with_pool_idle_timeout(Duration::from_secs(90))
-        // Maximum idle connections per host - increased for 512+ concurrency
-        .with_pool_max_idle_per_host(512)
-        // HTTP/2 keep-alive settings for long-running connections
-        .with_http2_keep_alive_interval(Duration::from_secs(15))
-        .with_http2_keep_alive_while_idle()
-}
-
-/// Create retry configuration for transient failures.
-fn create_retry_config() -> RetryConfig {
-    RetryConfig {
-        // Maximum number of retries per request
-        max_retries: 5,
-        // Initial backoff (doubles each retry)
-        backoff: object_store::BackoffConfig {
-            init_backoff: Duration::from_millis(100),
-            max_backoff: Duration::from_secs(10),
-            base: 2.0,
-        },
-        // Retry on 429 (rate limiting) and 5xx (server errors)
-        retry_timeout: Duration::from_secs(120),
-    }
 }
 
 /// Create an anonymous S3 client for reading from source.coop (public bucket).
@@ -75,9 +45,8 @@ pub fn create_anonymous_store(bucket: &str) -> Result<Arc<dyn ObjectStore>> {
 
     let builder = AmazonS3Builder::new()
         .with_bucket_name(bucket)
-        .with_region("us-west-2") // source.coop is in us-west-2
+        .with_region("us-west-2")
         .with_client_options(create_client_options())
-        .with_retry(create_retry_config())
         .with_skip_signature(true)
         .with_virtual_hosted_style_request(false);
 
@@ -100,7 +69,6 @@ fn create_authenticated_store(bucket: &str) -> Result<Arc<dyn ObjectStore>> {
     let builder = AmazonS3Builder::from_env()
         .with_bucket_name(bucket)
         .with_client_options(create_client_options())
-        .with_retry(create_retry_config())
         .with_virtual_hosted_style_request(use_virtual_hosted);
 
     Ok(Arc::new(builder.build()?))
