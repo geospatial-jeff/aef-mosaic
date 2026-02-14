@@ -4,6 +4,7 @@ platforms = ["osx-arm64", "linux-64"]
 
 [tool.pixi.tasks]
 check = { cmd = "cargo check", env = { PKG_CONFIG_PATH = "$PIXI_PROJECT_ROOT/.pixi/envs/default/lib/pkgconfig", RUSTFLAGS = "-C link-arg=-Wl,-rpath,$PIXI_PROJECT_ROOT/.pixi/envs/default/lib" } }
+clippy = { cmd = "cargo clippy --all-targets", env = { PKG_CONFIG_PATH = "$PIXI_PROJECT_ROOT/.pixi/envs/default/lib/pkgconfig", RUSTFLAGS = "-C link-arg=-Wl,-rpath,$PIXI_PROJECT_ROOT/.pixi/envs/default/lib" } }
 build = { cmd = "cargo build --release", env = { PKG_CONFIG_PATH = "$PIXI_PROJECT_ROOT/.pixi/envs/default/lib/pkgconfig", RUSTFLAGS = "-C link-arg=-Wl,-rpath,$PIXI_PROJECT_ROOT/.pixi/envs/default/lib" } }
 test = { cmd = "cargo test", env = { PKG_CONFIG_PATH = "$PIXI_PROJECT_ROOT/.pixi/envs/default/lib/pkgconfig", RUSTFLAGS = "-C link-arg=-Wl,-rpath,$PIXI_PROJECT_ROOT/.pixi/envs/default/lib", PROJ_DATA = "$PIXI_PROJECT_ROOT/.pixi/envs/default/share/proj" } }
 test-integration = { cmd = "cargo test -- --ignored", env = { PKG_CONFIG_PATH = "$PIXI_PROJECT_ROOT/.pixi/envs/default/lib/pkgconfig", RUSTFLAGS = "-C link-arg=-Wl,-rpath,$PIXI_PROJECT_ROOT/.pixi/envs/default/lib", PROJ_DATA = "$PIXI_PROJECT_ROOT/.pixi/envs/default/share/proj" } }
