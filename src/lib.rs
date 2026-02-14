@@ -35,7 +35,7 @@ pub mod transform;
 pub use config::{Config, FilterConfig};
 pub use index::{InputIndex, OutputGrid, SpatialLookup};
 pub use io::{CogReader, ZarrWriter};
-pub use pipeline::{ChunkProcessor, Metrics, Scheduler, SchedulerConfig};
+pub use pipeline::{ChunkProcessor, Metrics, MetricsReporter, Pipeline, PipelineConfig, Scheduler, SchedulerConfig};
 pub use transform::MosaicAccumulator;
 
 use anyhow::Result;
@@ -139,43 +139,99 @@ pub async fn run_pipeline(config: Config) -> Result<pipeline::SchedulerStats> {
     // Create COG reader with metrics for cache tracking
     let cog_reader = Arc::new(CogReader::with_metrics(cog_store, metrics.clone()));
 
-    // Create chunk processor
-    // Note: Reprojector is created per-task inside spawn_blocking (Proj is not Send)
-    let processor = Arc::new(ChunkProcessor::new(
-        cog_reader,
-        zarr_writer.clone(),
-        spatial_lookup.clone(),
-        metrics.clone(),
-        config.clone(),
-    ));
+    // Collect chunks to process (pre-filter empty chunks)
+    let mut chunks: Vec<_> = output_grid
+        .enumerate_chunks()
+        .filter(|chunk| spatial_lookup.chunk_has_data(chunk))
+        .collect();
 
-    // Create scheduler
-    let scheduler_config = SchedulerConfig {
-        concurrency: config.processing.concurrency,
-        skip_empty: true,
-        enable_metrics: config.processing.enable_metrics,
-        metrics_interval_secs: config.processing.metrics_interval_secs,
-        metrics_output_path: config.processing.metrics_output_path.clone(),
-    };
+    // Sort by row first, then column (row-major order) for cache locality
+    chunks.sort_by_key(|c| (c.row_idx, c.col_idx));
 
-    let scheduler = Scheduler::new(
-        processor,
-        spatial_lookup,
-        output_grid,
-        metrics,
-        scheduler_config,
+    let total_chunks = chunks.len();
+    tracing::info!(
+        "Work estimate: {} chunks with data (filtered from {} total)",
+        total_chunks,
+        output_grid.num_chunks()
     );
 
-    // Print work estimate
-    let estimate = scheduler.estimate_total_work();
-    tracing::info!("Work estimate: {}", estimate);
+    // Create pipeline config
+    let pipeline_config = PipelineConfig {
+        fetch_concurrency: config.processing.concurrency,
+        mosaic_concurrency: 8.min(config.processing.concurrency / 2).max(1),
+        write_concurrency: 16.min(config.processing.concurrency / 2).max(1),
+        fetch_buffer: 16,
+        mosaic_buffer: 8,
+    };
+
+    tracing::info!(
+        "Pipeline config: fetch={}, mosaic={}, write={}",
+        pipeline_config.fetch_concurrency,
+        pipeline_config.mosaic_concurrency,
+        pipeline_config.write_concurrency
+    );
+
+    // Create decoupled pipeline
+    let pipeline = Pipeline::new(
+        cog_reader,
+        zarr_writer.clone(),
+        spatial_lookup,
+        output_grid,
+        metrics.clone(),
+        pipeline_config,
+    );
+
+    // Start metrics reporter if enabled
+    let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let reporter_handle = if config.processing.enable_metrics {
+        let reporter = MetricsReporter::new(
+            metrics.clone(),
+            config.processing.metrics_interval_secs,
+            total_chunks as u64,
+        );
+        Some(tokio::spawn(reporter.run(shutdown_rx)))
+    } else {
+        drop(shutdown_rx);
+        None
+    };
 
     // Run the pipeline
     tracing::info!("Starting chunk processing...");
-    let stats = scheduler.run().await?;
+    let pipeline_stats = pipeline.run(chunks).await?;
+
+    // Shutdown metrics reporter
+    let _ = shutdown_tx.send(()).await;
+    if let Some(handle) = reporter_handle {
+        let _ = handle.await;
+    }
+
+    // Print final summary
+    if config.processing.enable_metrics {
+        let reporter = MetricsReporter::new(
+            metrics.clone(),
+            config.processing.metrics_interval_secs,
+            total_chunks as u64,
+        );
+        reporter.print_summary();
+
+        if let Some(ref path) = config.processing.metrics_output_path {
+            let snapshot = metrics.snapshot();
+            if let Err(e) = snapshot.save_to_file(path) {
+                tracing::warn!("Failed to save metrics to {}: {}", path, e);
+            }
+        }
+    }
 
     // Finalize
     zarr_writer.finalize()?;
+
+    // Convert pipeline stats to scheduler stats for backward compatibility
+    let stats = pipeline::SchedulerStats {
+        total_chunks: pipeline_stats.total_chunks,
+        chunks_processed: pipeline_stats.chunks_processed,
+        chunks_skipped: pipeline_stats.chunks_skipped,
+        chunks_failed: 0, // Pipeline doesn't track failures separately
+    };
 
     tracing::info!("Pipeline complete: {}", stats);
 
