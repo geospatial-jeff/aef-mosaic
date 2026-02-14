@@ -654,11 +654,13 @@ impl CogReader {
         let ifd = cached.tiff.ifds().first()
             .ok_or_else(|| anyhow::anyhow!("No IFDs in TIFF"))?;
 
-        // Fetch single tile using async-tiff
+        // Fetch single tile using async-tiff (this is the HTTP request)
+        let fetch_start = std::time::Instant::now();
         let tile = ifd
             .fetch_tile(tx, ty, cached.reader.as_ref())
             .await
             .with_context(|| format!("Failed to fetch tile ({}, {})", tx, ty))?;
+        let fetch_elapsed = fetch_start.elapsed();
 
         // Track bytes read
         let raw_bytes: u64 = match tile.compressed_bytes() {
@@ -666,8 +668,21 @@ impl CogReader {
             async_tiff::CompressedBytes::Planar(vec) => vec.iter().map(|b| b.len() as u64).sum(),
         };
 
+        // Log HTTP request timing
+        let fetch_ms = fetch_elapsed.as_secs_f64() * 1000.0;
+        let throughput_mbps = if fetch_elapsed.as_secs_f64() > 0.0 {
+            (raw_bytes as f64 / 1024.0 / 1024.0) / fetch_elapsed.as_secs_f64()
+        } else {
+            0.0
+        };
+        tracing::debug!(
+            "HTTP fetch tile ({},{}) {}KB in {:.1}ms ({:.1} MB/s)",
+            tx, ty, raw_bytes / 1024, fetch_ms, throughput_mbps
+        );
+
         if let Some(ref m) = self.metrics {
             m.add_bytes_read(raw_bytes);
+            m.add_http_request(fetch_elapsed);
         }
 
         // Decode the tile

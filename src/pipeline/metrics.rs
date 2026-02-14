@@ -69,6 +69,13 @@ pub struct Metrics {
 
     /// Current tile cache size in bytes
     pub tile_cache_bytes: AtomicU64,
+
+    // HTTP request metrics
+    /// Number of HTTP requests made
+    pub http_requests: AtomicU64,
+
+    /// Total HTTP request time (microseconds)
+    pub http_request_us: AtomicU64,
 }
 
 impl Metrics {
@@ -92,6 +99,8 @@ impl Metrics {
             tile_cache_misses: AtomicU64::new(0),
             tile_cache_coalesced: AtomicU64::new(0),
             tile_cache_bytes: AtomicU64::new(0),
+            http_requests: AtomicU64::new(0),
+            http_request_us: AtomicU64::new(0),
         })
     }
 
@@ -180,6 +189,12 @@ impl Metrics {
         self.tile_cache_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
+    /// Record an HTTP request with its duration.
+    pub fn add_http_request(&self, duration: Duration) {
+        self.http_requests.fetch_add(1, Ordering::Relaxed);
+        self.http_request_us.fetch_add(duration.as_micros() as u64, Ordering::Relaxed);
+    }
+
     /// Get elapsed time since start.
     pub fn elapsed(&self) -> Duration {
         self.start_time.map_or(Duration::ZERO, |t| t.elapsed())
@@ -224,6 +239,14 @@ impl Metrics {
         let reproject_us = self.reproject_us.load(Ordering::Relaxed);
         let mosaic_us = self.mosaic_us.load(Ordering::Relaxed);
         let zarr_write_us = self.zarr_write_us.load(Ordering::Relaxed);
+        let http_requests = self.http_requests.load(Ordering::Relaxed);
+        let http_request_us = self.http_request_us.load(Ordering::Relaxed);
+        let http_request_secs = http_request_us as f64 / 1_000_000.0;
+        let http_avg_latency_ms = if http_requests > 0 {
+            (http_request_us as f64 / http_requests as f64) / 1000.0
+        } else {
+            0.0
+        };
 
         MetricsSnapshot {
             bytes_read: self.bytes_read.load(Ordering::Relaxed),
@@ -246,6 +269,9 @@ impl Metrics {
             tile_cache_misses: self.tile_cache_misses.load(Ordering::Relaxed),
             tile_cache_coalesced: self.tile_cache_coalesced.load(Ordering::Relaxed),
             tile_cache_bytes: self.tile_cache_bytes.load(Ordering::Relaxed),
+            http_requests,
+            http_request_secs,
+            http_avg_latency_ms,
         }
     }
 }
@@ -284,6 +310,12 @@ pub struct MetricsSnapshot {
     pub tile_cache_coalesced: u64,
     /// Tile cache size in bytes
     pub tile_cache_bytes: u64,
+    /// Number of HTTP requests made
+    pub http_requests: u64,
+    /// Total HTTP request time (seconds)
+    pub http_request_secs: f64,
+    /// Average HTTP request latency (milliseconds)
+    pub http_avg_latency_ms: f64,
 }
 
 impl MetricsSnapshot {
@@ -459,6 +491,21 @@ impl MetricsReporter {
                 );
             }
         }
+
+        // HTTP request statistics
+        if snapshot.http_requests > 0 {
+            println!("\n--- HTTP Statistics ---");
+            println!(
+                "HTTP requests: {} total, {:.1}s cumulative, {:.1}ms avg latency",
+                snapshot.http_requests, snapshot.http_request_secs, snapshot.http_avg_latency_ms
+            );
+            // Calculate effective throughput per request
+            let bytes_per_request = snapshot.bytes_read as f64 / snapshot.http_requests as f64;
+            println!(
+                "Avg request size: {:.1} KB",
+                bytes_per_request / 1024.0
+            );
+        }
         println!("========================\n");
     }
 }
@@ -564,6 +611,9 @@ mod tests {
             tile_cache_misses: 150,
             tile_cache_coalesced: 50,
             tile_cache_bytes: 100 * 1024 * 1024,
+            http_requests: 500,
+            http_request_secs: 25.0,
+            http_avg_latency_ms: 50.0,
         };
 
         let display = format!("{}", snapshot);
@@ -600,6 +650,9 @@ mod tests {
             tile_cache_misses: 30,
             tile_cache_coalesced: 20,
             tile_cache_bytes: 0,
+            http_requests: 0,
+            http_request_secs: 0.0,
+            http_avg_latency_ms: 0.0,
         };
 
         let display = format!("{}", snapshot);
