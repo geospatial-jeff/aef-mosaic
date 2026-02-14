@@ -3,7 +3,7 @@
 use crate::io::WindowData;
 use crate::transform::{ReprojectConfig, Reprojector};
 use anyhow::Result;
-use ndarray::{Array3, Array4};
+use ndarray::{s, Array2, Array3, Array4, Axis, Zip};
 
 /// Accumulator for mosaicing multiple tiles using mean aggregation.
 ///
@@ -15,8 +15,8 @@ pub struct MosaicAccumulator {
     /// Sum of values for each pixel: (1, bands, height, width)
     sum: Array4<i16>,
 
-    /// Count of contributions for each pixel: (1, height, width)
-    count: Array3<u16>,
+    /// Count of contributions for each pixel: (height, width)
+    count: Array2<u16>,
 
     /// Number of bands
     bands: usize,
@@ -35,7 +35,7 @@ impl MosaicAccumulator {
     pub fn new(bands: usize, height: usize, width: usize) -> Self {
         Self {
             sum: Array4::zeros((1, bands, height, width)),
-            count: Array3::zeros((1, height, width)),
+            count: Array2::zeros((height, width)),
             bands,
             height,
             width,
@@ -47,34 +47,42 @@ impl MosaicAccumulator {
     /// The input data should be in shape (bands, height, width) and already
     /// reprojected to the output grid. Values of 0 are treated as nodata.
     ///
-    /// Optimized: Uses early-exit check then single-pass accumulation.
-    /// For pixels with data: scans bands once to find first non-zero, then accumulates all.
-    /// For pixels without data: scans bands once and exits early.
+    /// Uses ndarray operations for better performance and readability.
     pub fn add(&mut self, data: &Array3<i8>) {
         let (bands, height, width) = data.dim();
         assert_eq!(bands, self.bands, "Band count mismatch");
         assert_eq!(height, self.height, "Height mismatch");
         assert_eq!(width, self.width, "Width mismatch");
 
-        for row in 0..height {
-            for col in 0..width {
-                // Quick check: sample first band to skip obviously empty pixels
-                // Most empty pixels have all zeros, so checking band 0 is a good heuristic
-                let first_val = data[[0, row, col]];
-                if first_val == 0 {
-                    // Check remaining bands
-                    let has_data = (1..bands).any(|b| data[[b, row, col]] != 0);
-                    if !has_data {
-                        continue; // Skip this pixel entirely
-                    }
-                }
+        // Create a mask: true where ANY band has non-zero data
+        // Use fold_axis to check across all bands for each pixel
+        let has_data: Array2<bool> = data
+            .map(|&v| v != 0)
+            .fold_axis(Axis(0), false, |acc, &val| *acc || val);
 
-                // This pixel has data - accumulate all bands
-                for band in 0..bands {
-                    self.sum[[0, band, row, col]] += data[[band, row, col]] as i16;
+        // Update count where we have data using Zip
+        Zip::from(&mut self.count)
+            .and(&has_data)
+            .for_each(|count, &has| {
+                if has {
+                    *count += 1;
                 }
-                self.count[[0, row, col]] += 1;
-            }
+            });
+
+        // Add data to sum where has_data is true
+        // We need to iterate over bands and use the mask
+        for b in 0..bands {
+            let data_band = data.slice(s![b, .., ..]);
+            let mut sum_band = self.sum.slice_mut(s![0, b, .., ..]);
+
+            Zip::from(&mut sum_band)
+                .and(&data_band)
+                .and(&has_data)
+                .for_each(|sum, &val, &has| {
+                    if has {
+                        *sum += val as i16;
+                    }
+                });
         }
     }
 
@@ -82,37 +90,39 @@ impl MosaicAccumulator {
     ///
     /// Returns an int8 array: (1, bands, height, width)
     ///
-    /// Optimized: Uses integer division with rounding instead of f64.
+    /// Uses ndarray operations for element-wise division with rounding.
     pub fn finalize(self) -> Array4<i8> {
-        let mut result = Array4::zeros((1, self.bands, self.height, self.width));
+        let mut result = Array4::<i8>::zeros((1, self.bands, self.height, self.width));
 
-        for row in 0..self.height {
-            for col in 0..self.width {
-                let count = self.count[[0, row, col]] as i16;
-                if count > 0 {
-                    // Pre-compute half count for rounding
-                    let half_count = count / 2;
-                    for band in 0..self.bands {
-                        let sum = self.sum[[0, band, row, col]];
-                        // Rounded integer division: (sum + count/2) / count
-                        // Handles negative sums correctly
-                        let mean = if sum >= 0 {
-                            ((sum + half_count) / count) as i8
+        // Process each band using Zip
+        for b in 0..self.bands {
+            let sum_band = self.sum.slice(s![0, b, .., ..]);
+            let mut result_band = result.slice_mut(s![0, b, .., ..]);
+
+            Zip::from(&mut result_band)
+                .and(&sum_band)
+                .and(&self.count)
+                .for_each(|result, &sum, &count| {
+                    if count > 0 {
+                        let c = count as i16;
+                        let half_c = c / 2;
+                        // Rounded integer division
+                        *result = if sum >= 0 {
+                            ((sum + half_c) / c) as i8
                         } else {
-                            ((sum - half_count) / count) as i8
+                            ((sum - half_c) / c) as i8
                         };
-                        result[[0, band, row, col]] = mean;
                     }
-                }
-            }
+                });
         }
 
         result
     }
 
     /// Get the number of tiles that contributed to each pixel.
-    pub fn coverage(&self) -> &Array3<u16> {
-        &self.count
+    /// Returns a view as 3D array for backwards compatibility.
+    pub fn coverage(&self) -> Array3<u16> {
+        self.count.clone().insert_axis(Axis(0))
     }
 
     /// Get the maximum overlap count.
@@ -244,11 +254,11 @@ mod tests {
         .unwrap();
         acc.add(&data1);
 
-        // Check coverage
-        assert_eq!(acc.count[[0, 0, 0]], 1); // (0,0) has data
-        assert_eq!(acc.count[[0, 0, 1]], 0); // (0,1) is nodata (all zeros)
-        assert_eq!(acc.count[[0, 1, 0]], 0); // (1,0) is nodata
-        assert_eq!(acc.count[[0, 1, 1]], 1); // (1,1) has data
+        // Check coverage (using 2D count array)
+        assert_eq!(acc.count[[0, 0]], 1); // (0,0) has data
+        assert_eq!(acc.count[[0, 1]], 0); // (0,1) is nodata (all zeros)
+        assert_eq!(acc.count[[1, 0]], 0); // (1,0) is nodata
+        assert_eq!(acc.count[[1, 1]], 1); // (1,1) has data
     }
 
     #[test]
