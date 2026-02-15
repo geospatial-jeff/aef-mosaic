@@ -278,8 +278,20 @@ output:
 
 # === PROCESSING: Performance tuning ===
 processing:
-  # Number of output chunks to process concurrently
-  concurrency: 16
+  # Number of chunks to fetch concurrently (network I/O bound)
+  fetch_concurrency: 8
+
+  # Number of chunks to mosaic/reproject concurrently (CPU bound)
+  mosaic_concurrency: 8
+
+  # Number of chunks to write concurrently (I/O bound)
+  write_concurrency: 8
+
+  # Maximum memory for decoded tile cache in GB
+  tile_cache_gb: 32.0
+
+  # Maximum entries in TIFF metadata cache
+  metadata_cache_entries: 10000
 
   # Print throughput metrics during processing
   enable_metrics: true
