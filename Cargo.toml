@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
+async-channel = "2"
 
 # Cloud storage
 object_store = { version = "0.13", features = ["aws"] }

@@ -79,7 +79,7 @@ fn run_command(config_path: PathBuf, concurrency: Option<usize>, dry_run: bool) 
 
     // Apply overrides
     if let Some(c) = concurrency {
-        config.processing.concurrency = c;
+        config.processing.fetch_concurrency = c;
     }
 
     config.validate()?;

@@ -164,19 +164,17 @@ impl Default for ChunkShape {
 /// Processing configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessingConfig {
-    /// Number of concurrent COG fetch tasks (network I/O bound)
-    #[serde(default = "default_concurrency")]
-    pub concurrency: usize,
+    /// Number of chunks to fetch concurrently (network I/O bound)
+    #[serde(default = "default_fetch_concurrency")]
+    pub fetch_concurrency: usize,
 
-    /// Number of concurrent mosaic/reproject tasks (CPU bound)
-    /// Defaults to half of concurrency, capped at 16
-    #[serde(default)]
-    pub mosaic_concurrency: Option<usize>,
+    /// Number of chunks to mosaic/reproject concurrently (CPU bound)
+    #[serde(default = "default_mosaic_concurrency")]
+    pub mosaic_concurrency: usize,
 
-    /// Number of concurrent Zarr write tasks (I/O bound)
-    /// Defaults to half of concurrency, capped at 16
-    #[serde(default)]
-    pub write_concurrency: Option<usize>,
+    /// Number of chunks to write concurrently (I/O bound)
+    #[serde(default = "default_write_concurrency")]
+    pub write_concurrency: usize,
 
     /// Enable metrics reporting
     #[serde(default = "default_true")]
@@ -248,9 +246,9 @@ pub struct FilterConfig {
 impl Default for ProcessingConfig {
     fn default() -> Self {
         Self {
-            concurrency: 16,
-            mosaic_concurrency: None,
-            write_concurrency: None,
+            fetch_concurrency: 8,
+            mosaic_concurrency: 8,
+            write_concurrency: 8,
             enable_metrics: true,
             metrics_interval_secs: 10,
             retry: RetryConfig::default(),
@@ -258,20 +256,6 @@ impl Default for ProcessingConfig {
             metadata_cache_entries: 10_000,
             metrics_output_path: None,
         }
-    }
-}
-
-impl ProcessingConfig {
-    /// Get effective mosaic concurrency (uses default formula if not set)
-    pub fn effective_mosaic_concurrency(&self) -> usize {
-        self.mosaic_concurrency
-            .unwrap_or_else(|| 16.min(self.concurrency / 2).max(1))
-    }
-
-    /// Get effective write concurrency (uses default formula if not set)
-    pub fn effective_write_concurrency(&self) -> usize {
-        self.write_concurrency
-            .unwrap_or_else(|| 16.min(self.concurrency / 2).max(1))
     }
 }
 
@@ -330,8 +314,10 @@ impl Config {
         if self.output.chunk_shape.height == 0 || self.output.chunk_shape.width == 0 {
             anyhow::bail!("Spatial chunk sizes must be > 0");
         }
-        if self.processing.concurrency == 0 {
-            anyhow::bail!("Concurrency must be > 0");
+        if self.processing.fetch_concurrency == 0
+            || self.processing.mosaic_concurrency == 0
+            || self.processing.write_concurrency == 0 {
+            anyhow::bail!("Concurrency values must be > 0");
         }
         if self.output.compression_level < 0 || self.output.compression_level > 22 {
             anyhow::bail!("Compression level must be 0-22 for zstd");
@@ -346,7 +332,9 @@ fn default_resolution() -> f64 { 10.0 }
 fn default_time_chunks() -> usize { 1 }
 fn default_embedding_chunks() -> usize { 64 }
 fn default_spatial_chunks() -> usize { 1024 }
-fn default_concurrency() -> usize { 16 }
+fn default_fetch_concurrency() -> usize { 8 }
+fn default_mosaic_concurrency() -> usize { 8 }
+fn default_write_concurrency() -> usize { 8 }
 fn default_true() -> bool { true }
 fn default_metrics_interval() -> u64 { 10 }
 fn default_max_retries() -> usize { 3 }

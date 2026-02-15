@@ -35,6 +35,14 @@ struct FetchRequest {
     intersection_bounds: [f64; 4],
 }
 
+/// Pre-computed work item for a chunk (computed before spawning workers).
+struct ChunkWorkItem {
+    chunk: OutputChunk,
+    tiles: Vec<Arc<CogTile>>,
+    chunk_bounds: [f64; 4],
+    chunk_bounds_wgs84: [f64; 4],
+}
+
 /// Data passed from COG fetcher to mosaic worker.
 pub struct FetchedChunk {
     pub chunk: OutputChunk,
@@ -66,9 +74,9 @@ pub struct PipelineConfig {
 impl Default for PipelineConfig {
     fn default() -> Self {
         Self {
-            fetch_concurrency: 32,
+            fetch_concurrency: 8,
             mosaic_concurrency: 8,
-            write_concurrency: 16,
+            write_concurrency: 8,
             fetch_buffer: 16,
             mosaic_buffer: 8,
         }
@@ -133,92 +141,108 @@ impl Pipeline {
         })
     }
 
-    /// Run the fetch stage - processes chunks and sends to mosaic stage.
+    /// Run the fetch stage - spawns fetch_concurrency workers that each process chunks sequentially.
     async fn run_fetch_stage(
         &self,
         chunks: Vec<OutputChunk>,
         mosaic_tx: mpsc::Sender<FetchedChunk>,
     ) {
-        // Process chunks with bounded concurrency using buffer_unordered
-        let reader = self.cog_reader.clone();
-        let spatial_lookup = self.spatial_lookup.clone();
-        let output_grid = self.output_grid.clone();
-        let metrics = self.metrics.clone();
         let fetch_concurrency = self.config.fetch_concurrency;
 
-        // Create a ProjCache for this stage (not Send, so kept in main task)
-        let proj_cache = ProjCache::new();
-
-        // Process each chunk
+        // Pre-compute tile lookups and bounds (uses SpatialLookup which is not Send)
+        let mut work_items = Vec::with_capacity(chunks.len());
         for chunk in chunks {
-            // Find intersecting tiles
-            let tiles = match spatial_lookup.tiles_for_chunk(&chunk) {
+            let tiles = match self.spatial_lookup.tiles_for_chunk(&chunk) {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::warn!("Failed to find tiles for chunk {:?}: {}", chunk.chunk_indices(), e);
-                    metrics.add_failure();
+                    self.metrics.add_failure();
                     continue;
                 }
             };
 
             if tiles.is_empty() {
-                metrics.add_chunk_skipped();
+                self.metrics.add_chunk_skipped();
                 continue;
             }
 
-            let chunk_bounds = output_grid.chunk_bounds(&chunk);
-            let chunk_bounds_wgs84 = match output_grid.chunk_bounds_wgs84(&chunk) {
+            let chunk_bounds = self.output_grid.chunk_bounds(&chunk);
+            let chunk_bounds_wgs84 = match self.output_grid.chunk_bounds_wgs84(&chunk) {
                 Ok(b) => b,
                 Err(e) => {
                     tracing::warn!("Failed to transform chunk bounds: {}", e);
-                    metrics.add_failure();
+                    self.metrics.add_failure();
                     continue;
                 }
             };
 
-            // Pre-compute fetch requests (pixel windows) - this uses proj_cache
-            // but happens in the main task, not spawned
-            let fetch_requests: Vec<_> = tiles
-                .iter()
-                .filter_map(|tile| {
-                    // Get geotransform - we need to fetch this async, but for pre-computing
-                    // windows we'll defer to fetch time and do the transform there
-                    // Actually, we need the geotransform to compute pixel window...
-                    // For now, pass tile with bounds and compute window at fetch time
-                    Some(Arc::clone(tile))
-                })
-                .collect();
+            let tile_refs: Vec<_> = tiles.iter().map(|t| Arc::clone(t)).collect();
 
-            // Fetch all tile windows concurrently
-            let cog_start = Instant::now();
-            let window_data = fetch_tile_windows_concurrent(
-                &reader,
-                &fetch_requests,
-                &chunk_bounds_wgs84,
-                &proj_cache,
-                &metrics,
-                fetch_concurrency,
-            ).await;
-            metrics.add_cog_read_time(cog_start.elapsed());
-
-            if window_data.is_empty() {
-                metrics.add_chunk_skipped();
-                continue;
-            }
-
-            metrics.add_tiles_read(window_data.len() as u64);
-
-            // Send to mosaic stage
-            let fetched = FetchedChunk {
+            work_items.push(ChunkWorkItem {
                 chunk,
-                window_data,
+                tiles: tile_refs,
                 chunk_bounds,
-            };
+                chunk_bounds_wgs84,
+            });
+        }
 
-            if mosaic_tx.send(fetched).await.is_err() {
-                tracing::debug!("Mosaic receiver dropped, stopping fetch stage");
-                break;
-            }
+        // Create a shared work queue
+        let (work_tx, work_rx) = async_channel::bounded::<ChunkWorkItem>(work_items.len().max(1));
+
+        // Send all work items to the queue
+        for item in work_items {
+            let _ = work_tx.send(item).await;
+        }
+        work_tx.close();
+
+        // Spawn fetch_concurrency workers
+        let mut handles = Vec::with_capacity(fetch_concurrency);
+        for _ in 0..fetch_concurrency {
+            let reader = self.cog_reader.clone();
+            let metrics = self.metrics.clone();
+            let mosaic_tx = mosaic_tx.clone();
+            let work_rx = work_rx.clone();
+
+            let handle = tokio::spawn(async move {
+                // Process chunks sequentially from the shared queue
+                while let Ok(work) = work_rx.recv().await {
+                    // Fetch all tile windows for this chunk
+                    let cog_start = Instant::now();
+                    let window_data = fetch_tile_windows(
+                        &reader,
+                        &work.tiles,
+                        work.chunk_bounds_wgs84,
+                        &metrics,
+                    ).await;
+                    metrics.add_cog_read_time(cog_start.elapsed());
+
+                    if window_data.is_empty() {
+                        metrics.add_chunk_skipped();
+                        continue;
+                    }
+
+                    metrics.add_tiles_read(window_data.len() as u64);
+
+                    // Send to mosaic stage
+                    let fetched = FetchedChunk {
+                        chunk: work.chunk,
+                        window_data,
+                        chunk_bounds: work.chunk_bounds,
+                    };
+
+                    if mosaic_tx.send(fetched).await.is_err() {
+                        tracing::debug!("Mosaic receiver dropped, stopping fetch worker");
+                        break;
+                    }
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        // Wait for all workers to complete
+        for handle in handles {
+            let _ = handle.await;
         }
     }
 
@@ -374,66 +398,37 @@ impl Pipeline {
     }
 }
 
-/// Fetch tile windows concurrently using buffer_unordered.
-async fn fetch_tile_windows_concurrent(
+/// Fetch tile windows for a single chunk.
+/// HTTP requests within a chunk are concurrent (up to 32).
+async fn fetch_tile_windows(
     reader: &CogReader,
     tiles: &[Arc<CogTile>],
-    chunk_bounds_wgs84: &[f64; 4],
-    proj_cache: &ProjCache,
+    chunk_bounds_wgs84: [f64; 4],
     metrics: &Metrics,
-    concurrency: usize,
 ) -> Vec<WindowData> {
-    // Pre-compute pixel windows in the current task (uses proj_cache which is not Send)
-    // We need to fetch geotransform first, so we'll structure this as:
-    // 1. First fetch all geotransforms concurrently
-    // 2. Then compute pixel windows (sync, uses proj_cache)
-    // 3. Then fetch tile data concurrently
+    // Fixed HTTP concurrency within a chunk
+    const HTTP_CONCURRENCY: usize = 32;
 
-    // Step 1: Fetch geotransforms
-    let geo_transforms: Vec<_> = stream::iter(tiles.iter())
+    // Clone tiles for owned iteration
+    let tiles_owned: Vec<_> = tiles.iter().cloned().collect();
+
+    // Step 1: Fetch geotransforms concurrently (async)
+    let geo_transforms: Vec<_> = stream::iter(tiles_owned)
         .map(|tile| {
             let reader = reader;
-            let tile = Arc::clone(tile);
             async move {
                 let gt = reader.get_geo_transform(&tile).await;
                 (tile, gt)
             }
         })
-        .buffer_unordered(concurrency)
+        .buffer_unordered(HTTP_CONCURRENCY)
         .collect()
         .await;
 
-    // Step 2: Compute pixel windows (sync)
-    let fetch_requests: Vec<_> = geo_transforms
-        .into_iter()
-        .filter_map(|(tile, gt_result)| {
-            let geo_transform = match gt_result {
-                Ok(Some(gt)) => gt,
-                Ok(None) => {
-                    tracing::warn!("No geotransform for tile {}", tile.tile_id);
-                    return None;
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to get geotransform for {}: {}", tile.tile_id, e);
-                    return None;
-                }
-            };
+    // Step 2: Compute pixel windows (sync - ProjCache created here, not held across await)
+    let fetch_requests = compute_fetch_requests(geo_transforms, &chunk_bounds_wgs84);
 
-            match compute_pixel_window(&tile, chunk_bounds_wgs84, proj_cache, &geo_transform) {
-                Ok((window, intersection)) => Some(FetchRequest {
-                    tile,
-                    window,
-                    intersection_bounds: intersection,
-                }),
-                Err(e) => {
-                    tracing::debug!("No intersection for tile: {}", e);
-                    None
-                }
-            }
-        })
-        .collect();
-
-    // Step 3: Fetch tile data concurrently
+    // Step 3: Fetch tile data concurrently (async)
     let results: Vec<_> = stream::iter(fetch_requests)
         .map(|req| {
             let reader = reader;
@@ -441,7 +436,7 @@ async fn fetch_tile_windows_concurrent(
                 reader.read_window(&req.tile, req.window, req.intersection_bounds).await
             }
         })
-        .buffer_unordered(concurrency)
+        .buffer_unordered(HTTP_CONCURRENCY)
         .collect()
         .await;
 
@@ -462,6 +457,44 @@ async fn fetch_tile_windows_concurrent(
     }
 
     window_data
+}
+
+/// Compute fetch requests from geotransforms (sync, creates ProjCache internally).
+fn compute_fetch_requests(
+    geo_transforms: Vec<(Arc<CogTile>, Result<Option<GeoTransform>, anyhow::Error>)>,
+    chunk_bounds_wgs84: &[f64; 4],
+) -> Vec<FetchRequest> {
+    // Create ProjCache here - not held across any await
+    let proj_cache = ProjCache::new();
+
+    geo_transforms
+        .into_iter()
+        .filter_map(|(tile, gt_result)| {
+            let geo_transform = match gt_result {
+                Ok(Some(gt)) => gt,
+                Ok(None) => {
+                    tracing::warn!("No geotransform for tile {}", tile.tile_id);
+                    return None;
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to get geotransform for {}: {}", tile.tile_id, e);
+                    return None;
+                }
+            };
+
+            match compute_pixel_window(&tile, chunk_bounds_wgs84, &proj_cache, &geo_transform) {
+                Ok((window, intersection)) => Some(FetchRequest {
+                    tile,
+                    window,
+                    intersection_bounds: intersection,
+                }),
+                Err(e) => {
+                    tracing::debug!("No intersection for tile: {}", e);
+                    None
+                }
+            }
+        })
+        .collect()
 }
 
 /// Compute pixel window for a tile intersection.
@@ -531,8 +564,8 @@ mod tests {
     #[test]
     fn test_pipeline_config_default() {
         let config = PipelineConfig::default();
-        assert_eq!(config.fetch_concurrency, 32);
+        assert_eq!(config.fetch_concurrency, 8);
         assert_eq!(config.mosaic_concurrency, 8);
-        assert_eq!(config.write_concurrency, 16);
+        assert_eq!(config.write_concurrency, 8);
     }
 }

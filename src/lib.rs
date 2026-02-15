@@ -157,9 +157,9 @@ pub async fn run_pipeline(config: Config) -> Result<pipeline::SchedulerStats> {
 
     // Create pipeline config
     let pipeline_config = PipelineConfig {
-        fetch_concurrency: config.processing.concurrency,
-        mosaic_concurrency: config.processing.effective_mosaic_concurrency(),
-        write_concurrency: config.processing.effective_write_concurrency(),
+        fetch_concurrency: config.processing.fetch_concurrency,
+        mosaic_concurrency: config.processing.mosaic_concurrency,
+        write_concurrency: config.processing.write_concurrency,
         fetch_buffer: 16,
         mosaic_buffer: 8,
     };
