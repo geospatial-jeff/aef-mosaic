@@ -35,14 +35,14 @@ pub mod transform;
 pub use config::{Config, FilterConfig};
 pub use index::{InputIndex, OutputGrid, SpatialLookup};
 pub use io::{CogReader, ZarrWriter};
-pub use pipeline::{ChunkProcessor, Metrics, MetricsReporter, Pipeline, PipelineConfig, Scheduler, SchedulerConfig};
+pub use pipeline::{Metrics, MetricsReporter, Pipeline, PipelineConfig, PipelineStats};
 pub use transform::MosaicAccumulator;
 
 use anyhow::Result;
 use std::sync::Arc;
 
 /// Run the full mosaic pipeline with the given configuration.
-pub async fn run_pipeline(config: Config) -> Result<pipeline::SchedulerStats> {
+pub async fn run_pipeline(config: Config) -> Result<PipelineStats> {
     // Validate configuration
     config.validate()?;
 
@@ -225,15 +225,7 @@ pub async fn run_pipeline(config: Config) -> Result<pipeline::SchedulerStats> {
     // Finalize
     zarr_writer.finalize()?;
 
-    // Convert pipeline stats to scheduler stats for backward compatibility
-    let stats = pipeline::SchedulerStats {
-        total_chunks: pipeline_stats.total_chunks,
-        chunks_processed: pipeline_stats.chunks_processed,
-        chunks_skipped: pipeline_stats.chunks_skipped,
-        chunks_failed: 0, // Pipeline doesn't track failures separately
-    };
+    tracing::info!("Pipeline complete: {}", pipeline_stats);
 
-    tracing::info!("Pipeline complete: {}", stats);
-
-    Ok(stats)
+    Ok(pipeline_stats)
 }
