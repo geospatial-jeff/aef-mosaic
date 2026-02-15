@@ -1,16 +1,19 @@
-//! Coordinate reprojection using GDAL.
+//! Coordinate reprojection using sparse grid + bilinear interpolation.
 //!
-//! Uses GDAL's optimized warp implementation which includes:
-//! - Approximate transformers (sparse grid + interpolation)
-//! - Efficient C implementation
-//! - Proper handling of edge cases
+//! This approach samples coordinates at sparse grid points and interpolates
+//! for pixels in between. This is ~1000x faster than projecting every pixel
+//! while maintaining sufficient accuracy for 10m resolution data.
+//!
+//! The key insight is that CRS transforms are smooth functions - they don't
+//! change rapidly between adjacent pixels.
 
 use anyhow::{Context, Result};
-use gdal::spatial_ref::SpatialRef;
-use gdal::DriverManager;
-use ndarray::Array3;
-use std::collections::HashMap;
-use std::sync::RwLock;
+use ndarray::{Array2, Array3};
+use proj::Proj;
+
+/// Grid spacing for sparse coordinate sampling.
+/// At 32-pixel spacing on a 2048x2048 tile, we transform ~4K points instead of 4M.
+const GRID_SPACING: usize = 32;
 
 /// Configuration for reprojection.
 #[derive(Debug, Clone)]
@@ -31,51 +34,24 @@ pub struct ReprojectConfig {
     pub num_bands: usize,
 }
 
-/// Reprojector for transforming tile data to the output CRS using GDAL.
+/// Reprojector using sparse grid + bilinear interpolation.
 pub struct Reprojector {
-    /// Cache of SpatialRef by CRS string
-    srs_cache: RwLock<HashMap<String, SpatialRef>>,
-
-    /// Target SpatialRef (cached)
-    target_srs: SpatialRef,
+    // Stateless - all config passed to reproject_tile
 }
 
 impl Reprojector {
     /// Create a new reprojector for the given target CRS.
-    pub fn new(target_crs: &str) -> Self {
-        let target_srs = SpatialRef::from_definition(target_crs)
-            .expect("Failed to create target SpatialRef");
-
-        Self {
-            srs_cache: RwLock::new(HashMap::new()),
-            target_srs,
-        }
+    pub fn new(_target_crs: &str) -> Self {
+        Self {}
     }
 
-    /// Get or create a SpatialRef for the given CRS.
-    fn get_srs(&self, crs: &str) -> Result<SpatialRef> {
-        // Check cache first
-        {
-            let cache = self.srs_cache.read().unwrap_or_else(|e| e.into_inner());
-            if let Some(srs) = cache.get(crs) {
-                return Ok(srs.clone());
-            }
-        }
-
-        // Create new SpatialRef
-        let srs = SpatialRef::from_definition(crs)
-            .with_context(|| format!("Failed to create SpatialRef for {}", crs))?;
-
-        // Cache it
-        {
-            let mut cache = self.srs_cache.write().unwrap_or_else(|e| e.into_inner());
-            cache.insert(crs.to_string(), srs.clone());
-        }
-
-        Ok(srs)
+    /// Create a Proj transformation for the given CRS pair.
+    fn create_proj(from_crs: &str, to_crs: &str) -> Result<Proj> {
+        Proj::new_known_crs(from_crs, to_crs, None)
+            .with_context(|| format!("Failed to create Proj for {} -> {}", from_crs, to_crs))
     }
 
-    /// Reproject a single tile to the target grid using GDAL.
+    /// Reproject a single tile to the target grid using sparse grid interpolation.
     ///
     /// Input: (bands, src_height, src_width) array in source CRS
     ///        Source uses bottom-up orientation (row 0 at south, AEF COG format)
@@ -91,128 +67,118 @@ impl Reprojector {
         let (bands, src_height, src_width) = data.dim();
         let (dst_height, dst_width) = config.target_shape;
 
-        // Calculate source geotransform
-        // Source is bottom-up: origin at (min_x, min_y), positive y scale
+        // Create inverse proj transformation (target -> source, for inverse mapping)
+        let inv_proj = Self::create_proj(&config.target_crs, source_crs)?;
+
+        // Source pixel size
         let src_pixel_x = (source_bounds[2] - source_bounds[0]) / src_width as f64;
         let src_pixel_y = (source_bounds[3] - source_bounds[1]) / src_height as f64;
 
-        // For bottom-up data, we need to flip vertically when creating the GDAL dataset
-        // GDAL expects top-down (origin at top-left, negative y scale)
-        // GeoTransform: [origin_x, pixel_width, rotation, origin_y, rotation, pixel_height]
-        let src_geotransform = [
-            source_bounds[0],           // origin x (min_x)
-            src_pixel_x,                // pixel width
-            0.0,                        // rotation
-            source_bounds[3],           // origin y (max_y for top-down)
-            0.0,                        // rotation
-            -src_pixel_y,               // pixel height (negative for top-down)
-        ];
+        // Build sparse grid of target coordinates and transform to source
+        let grid_rows = (dst_height + GRID_SPACING - 1) / GRID_SPACING + 1;
+        let grid_cols = (dst_width + GRID_SPACING - 1) / GRID_SPACING + 1;
 
-        // Target geotransform (top-down)
-        let dst_geotransform = [
-            config.target_bounds[0],    // origin x (min_x)
-            config.target_resolution,   // pixel width
-            0.0,                        // rotation
-            config.target_bounds[3],    // origin y (max_y)
-            0.0,                        // rotation
-            -config.target_resolution,  // pixel height (negative)
-        ];
+        // Grid of source coordinates (x, y) for each sparse grid point
+        let mut src_x_grid = Array2::<f64>::zeros((grid_rows, grid_cols));
+        let mut src_y_grid = Array2::<f64>::zeros((grid_rows, grid_cols));
 
-        tracing::debug!(
-            "GDAL reproject: src_crs={}, src_shape={}x{}, dst_crs={}, dst_shape={}x{}",
-            source_crs, src_width, src_height,
-            config.target_crs, dst_width, dst_height
-        );
+        // Transform sparse grid points from target CRS to source CRS
+        for grid_row in 0..grid_rows {
+            let dst_row = (grid_row * GRID_SPACING).min(dst_height.saturating_sub(1));
+            // Target is top-down: row 0 is at max_y
+            let dst_y = config.target_bounds[3] - (dst_row as f64 + 0.5) * config.target_resolution;
 
-        // Get MEM driver
-        let mem_driver = DriverManager::get_driver_by_name("MEM")
-            .context("Failed to get MEM driver")?;
+            for grid_col in 0..grid_cols {
+                let dst_col = (grid_col * GRID_SPACING).min(dst_width.saturating_sub(1));
+                let dst_x = config.target_bounds[0] + (dst_col as f64 + 0.5) * config.target_resolution;
 
-        // Create source dataset
-        let mut src_dataset = mem_driver
-            .create_with_band_type::<i8, _>(
-                "",
-                src_width,
-                src_height,
-                bands,
-            )
-            .context("Failed to create source dataset")?;
+                // Transform to source CRS
+                let (src_x, src_y) = inv_proj.convert((dst_x, dst_y))
+                    .unwrap_or((f64::NAN, f64::NAN));
 
-        // Set source geotransform and CRS
-        src_dataset.set_geo_transform(&src_geotransform)
-            .context("Failed to set source geotransform")?;
-
-        let src_srs = self.get_srs(source_crs)?;
-        src_dataset.set_spatial_ref(&src_srs)
-            .context("Failed to set source CRS")?;
-
-        // Write data to source dataset (flip vertically for GDAL's top-down expectation)
-        for band_idx in 0..bands {
-            let mut band = src_dataset.rasterband(band_idx + 1)
-                .context("Failed to get source band")?;
-
-            // Flip data vertically: row 0 in our bottom-up data becomes row (height-1) in GDAL
-            let mut flipped_band: Vec<i8> = Vec::with_capacity(src_height * src_width);
-            for row in (0..src_height).rev() {
-                for col in 0..src_width {
-                    flipped_band.push(data[[band_idx, row, col]]);
-                }
+                src_x_grid[[grid_row, grid_col]] = src_x;
+                src_y_grid[[grid_row, grid_col]] = src_y;
             }
-
-            band.write(
-                (0, 0),
-                (src_width, src_height),
-                &mut gdal::raster::Buffer::new((src_width, src_height), flipped_band),
-            ).context("Failed to write source band")?;
         }
 
-        // Create destination dataset
-        let mut dst_dataset = mem_driver
-            .create_with_band_type::<i8, _>(
-                "",
-                dst_width,
-                dst_height,
-                bands,
-            )
-            .context("Failed to create destination dataset")?;
-
-        // Set destination geotransform and CRS
-        dst_dataset.set_geo_transform(&dst_geotransform)
-            .context("Failed to set destination geotransform")?;
-
-        dst_dataset.set_spatial_ref(&self.target_srs)
-            .context("Failed to set destination CRS")?;
-
-        // Perform reprojection
-        gdal::raster::reproject(&src_dataset, &dst_dataset)
-            .context("GDAL reproject failed")?;
-
-        // Read result into output array
+        // Create output array
         let mut output = Array3::<i8>::zeros((bands, dst_height, dst_width));
 
-        for band_idx in 0..bands {
-            let band = dst_dataset.rasterband(band_idx + 1)
-                .context("Failed to get destination band")?;
+        // For each output pixel, interpolate source coordinates and sample
+        for dst_row in 0..dst_height {
+            let grid_row = dst_row / GRID_SPACING;
+            let grid_row_next = (grid_row + 1).min(grid_rows - 1);
+            let t_row = if grid_row_next > grid_row {
+                (dst_row % GRID_SPACING) as f64 / GRID_SPACING as f64
+            } else {
+                0.0
+            };
 
-            let buffer = band.read_as::<i8>(
-                (0, 0),
-                (dst_width, dst_height),
-                (dst_width, dst_height),
-                None,
-            ).context("Failed to read destination band")?;
+            for dst_col in 0..dst_width {
+                let grid_col = dst_col / GRID_SPACING;
+                let grid_col_next = (grid_col + 1).min(grid_cols - 1);
+                let t_col = if grid_col_next > grid_col {
+                    (dst_col % GRID_SPACING) as f64 / GRID_SPACING as f64
+                } else {
+                    0.0
+                };
 
-            // Copy to output array
-            for row in 0..dst_height {
-                for col in 0..dst_width {
-                    output[[band_idx, row, col]] = buffer.data()[row * dst_width + col];
+                // Bilinear interpolation of source coordinates
+                let x00 = src_x_grid[[grid_row, grid_col]];
+                let x01 = src_x_grid[[grid_row, grid_col_next]];
+                let x10 = src_x_grid[[grid_row_next, grid_col]];
+                let x11 = src_x_grid[[grid_row_next, grid_col_next]];
+
+                let y00 = src_y_grid[[grid_row, grid_col]];
+                let y01 = src_y_grid[[grid_row, grid_col_next]];
+                let y10 = src_y_grid[[grid_row_next, grid_col]];
+                let y11 = src_y_grid[[grid_row_next, grid_col_next]];
+
+                // Check for NaN (transformation failed)
+                if x00.is_nan() || x01.is_nan() || x10.is_nan() || x11.is_nan() {
+                    continue; // Leave as zero (nodata)
+                }
+
+                let src_x = x00 * (1.0 - t_row) * (1.0 - t_col)
+                    + x01 * (1.0 - t_row) * t_col
+                    + x10 * t_row * (1.0 - t_col)
+                    + x11 * t_row * t_col;
+
+                let src_y = y00 * (1.0 - t_row) * (1.0 - t_col)
+                    + y01 * (1.0 - t_row) * t_col
+                    + y10 * t_row * (1.0 - t_col)
+                    + y11 * t_row * t_col;
+
+                // Convert source CRS coordinates to pixel coordinates
+                // Source is bottom-up: row 0 is at min_y
+                let src_px = (src_x - source_bounds[0]) / src_pixel_x - 0.5;
+                let src_py = (src_y - source_bounds[1]) / src_pixel_y - 0.5;
+
+                // Nearest neighbor sampling (for i8 embeddings, interpolation doesn't make sense)
+                let src_col = src_px.round() as isize;
+                let src_row = src_py.round() as isize;
+
+                // Bounds check
+                if src_col < 0 || src_col >= src_width as isize
+                    || src_row < 0 || src_row >= src_height as isize
+                {
+                    continue; // Outside source bounds
+                }
+
+                let src_col = src_col as usize;
+                let src_row = src_row as usize;
+
+                // Copy all bands
+                for band in 0..bands {
+                    output[[band, dst_row, dst_col]] = data[[band, src_row, src_col]];
                 }
             }
         }
 
         let non_zero = output.iter().filter(|&&v| v != 0).count();
         tracing::debug!(
-            "GDAL reproject result: {} non-zero pixels out of {}",
-            non_zero, dst_height * dst_width * bands
+            "Sparse grid reproject: {}x{} -> {}x{}, {} non-zero pixels",
+            src_width, src_height, dst_width, dst_height, non_zero
         );
 
         Ok(output)
@@ -225,16 +191,16 @@ mod tests {
     use ndarray::Array3;
 
     #[test]
-    fn test_reprojector_cache() {
-        let reprojector = Reprojector::new("EPSG:4326");
+    fn test_proj_creation() {
+        // Test that we can create Proj transformations
+        let proj1 = Reprojector::create_proj("EPSG:32610", "EPSG:4326").unwrap();
+        let proj2 = Reprojector::create_proj("EPSG:32610", "EPSG:6933").unwrap();
 
-        // Create two SRS for the same CRS
-        let srs1 = reprojector.get_srs("EPSG:32610").unwrap();
-        let srs2 = reprojector.get_srs("EPSG:32610").unwrap();
-
-        // Should both be valid (can't easily check if same object with SpatialRef)
-        assert!(srs1.to_wkt().is_ok());
-        assert!(srs2.to_wkt().is_ok());
+        // Both should work
+        let result1 = proj1.convert((500000.0, 4000000.0));
+        let result2 = proj2.convert((500000.0, 4000000.0));
+        assert!(result1.is_ok());
+        assert!(result2.is_ok());
     }
 
     #[test]
@@ -261,5 +227,21 @@ mod tests {
         );
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_sparse_grid_spacing() {
+        // Verify grid dimensions
+        let dst_height = 1024;
+        let dst_width = 1024;
+        let grid_rows = (dst_height + GRID_SPACING - 1) / GRID_SPACING + 1;
+        let grid_cols = (dst_width + GRID_SPACING - 1) / GRID_SPACING + 1;
+
+        // With 32-pixel spacing, 1024 pixels needs 33 grid points
+        assert_eq!(grid_rows, 33);
+        assert_eq!(grid_cols, 33);
+
+        // Total grid points: 33 * 33 = 1089 instead of 1024 * 1024 = 1M
+        assert!(grid_rows * grid_cols < 2000);
     }
 }
