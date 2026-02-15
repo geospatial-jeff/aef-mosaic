@@ -685,10 +685,14 @@ impl CogReader {
             m.add_http_request(fetch_elapsed);
         }
 
-        // Decode the tile
-        let array = tile
-            .decode(&self.decoder_registry)
-            .map_err(|e| anyhow::anyhow!("Failed to decode tile ({}, {}): {:?}", tx, ty, e))?;
+        // Decode the tile in a blocking thread (decompression is CPU-bound)
+        let decoder_registry = self.decoder_registry.clone();
+        let array = tokio::task::spawn_blocking(move || {
+            tile.decode(&decoder_registry)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Decode task panicked: {}", e))?
+        .map_err(|e| anyhow::anyhow!("Failed to decode tile ({}, {}): {:?}", tx, ty, e))?;
 
         // Calculate actual tile dimensions (may be smaller at image edges)
         let actual_width = tile_width.min(image_width - tx * tile_width);
