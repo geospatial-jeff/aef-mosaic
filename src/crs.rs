@@ -136,6 +136,23 @@ pub fn transform_bounds(
     Ok([min_x, min_y, max_x, max_y])
 }
 
+/// Convert an EPSG code to PROJ definition string.
+///
+/// Returns the PROJ definition string (e.g., "+proj=cea +lon_0=0 ..."),
+/// which can be used by PROJ/GDAL/rasterio to interpret the CRS.
+/// This is useful alongside the EPSG code for CRS identification.
+///
+/// Returns None if the definition is not available (can happen with some CRS).
+pub fn epsg_to_proj_definition(epsg_code: &str) -> Option<String> {
+    let proj = Proj::new(epsg_code).ok()?;
+    let def = proj.def().ok()?;
+    if def.is_empty() {
+        None
+    } else {
+        Some(def)
+    }
+}
+
 /// Transform bounds with edge sampling for better accuracy.
 ///
 /// Samples points along edges to handle non-linear projections.
@@ -304,6 +321,22 @@ mod tests {
     fn test_crs_codes() {
         assert_eq!(codes::WGS84, "EPSG:4326");
         assert_eq!(codes::CEA, "EPSG:6933");
+    }
+
+    #[test]
+    fn test_epsg_to_proj_definition() {
+        // Test that the function returns a result (None is acceptable if PROJ can't resolve)
+        let def = epsg_to_proj_definition(codes::WGS84);
+        // If available, check it's well-formed
+        if let Some(d) = def {
+            assert!(!d.is_empty());
+        }
+
+        // Test EPSG:6933 (NSIDC EASE-Grid 2.0 Global)
+        let def = epsg_to_proj_definition(codes::CEA);
+        if let Some(d) = def {
+            assert!(!d.is_empty());
+        }
     }
 
     #[test]

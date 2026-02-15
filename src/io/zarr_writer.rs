@@ -1,6 +1,7 @@
 //! Async Zarr writing using zarrs.
 
 use crate::config::Config;
+use crate::crs::epsg_to_proj_definition;
 use crate::index::{OutputChunk, OutputGrid};
 use anyhow::Result;
 use futures::StreamExt;
@@ -118,6 +119,14 @@ impl ZarrWriter {
         // Add attributes for geospatial metadata
         let mut attributes = serde_json::Map::new();
         attributes.insert("crs".to_string(), serde_json::json!(output_grid.crs));
+        // Add GeoZarr proj: namespace attribute for emerging GeoZarr ecosystem compatibility
+        attributes.insert("proj:code".to_string(), serde_json::json!(output_grid.crs));
+
+        // Add CRS as PROJ definition for additional CRS identification
+        if let Some(proj_def) = epsg_to_proj_definition(&output_grid.crs) {
+            attributes.insert("crs_proj4".to_string(), serde_json::json!(proj_def));
+        }
+
         attributes.insert(
             "transform".to_string(),
             serde_json::json!([
@@ -137,10 +146,25 @@ impl ZarrWriter {
             "resolution".to_string(),
             serde_json::json!(output_grid.resolution),
         );
+
+        // Add time dimension metadata
+        attributes.insert("start_year".to_string(), serde_json::json!(output_grid.start_year));
+        attributes.insert("num_years".to_string(), serde_json::json!(output_grid.num_years));
+
+        // Add CF Conventions attribute for compatibility
+        attributes.insert("Conventions".to_string(), serde_json::json!("CF-1.8"));
+
         builder.attributes(attributes);
 
         let array = builder.build(zarr_store.clone(), &array_path)?;
         array.async_store_metadata().await?;
+
+        // Create coordinate arrays for xarray compatibility
+        Self::create_coordinate_arrays(
+            &zarr_store,
+            &path,
+            &output_grid,
+        ).await?;
 
         tracing::info!(
             "Created Zarr array at {} with shape {:?}",
@@ -213,6 +237,79 @@ impl ZarrWriter {
     /// consistency and future extensibility (e.g., writing consolidated metadata).
     pub fn finalize(&self) -> Result<()> {
         tracing::info!("Zarr array finalized");
+        Ok(())
+    }
+
+    /// Create coordinate arrays for xarray compatibility.
+    ///
+    /// Creates three 1D arrays:
+    /// - `/x` - Float64 array of x-coordinates (column centers)
+    /// - `/y` - Float64 array of y-coordinates (row centers)
+    /// - `/time` - Int32 array of years
+    async fn create_coordinate_arrays(
+        zarr_store: &Arc<AsyncObjectStore<Arc<dyn ObjectStore>>>,
+        path: &str,
+        output_grid: &OutputGrid,
+    ) -> Result<()> {
+        // Compute coordinate values
+        let x_coords: Vec<f64> = (0..output_grid.width)
+            .map(|i| output_grid.bounds[0] + (i as f64 + 0.5) * output_grid.resolution)
+            .collect();
+
+        let y_coords: Vec<f64> = (0..output_grid.height)
+            .map(|i| output_grid.bounds[3] - (i as f64 + 0.5) * output_grid.resolution)
+            .collect();
+
+        let time_coords: Vec<i32> = (0..output_grid.num_years)
+            .map(|i| output_grid.start_year + i as i32)
+            .collect();
+
+        // Create x coordinate array
+        let x_path = if path.is_empty() { "/x".to_string() } else { format!("/{}/x", path) };
+        let x_array = ArrayBuilder::new(
+            vec![output_grid.width as u64],
+            vec![output_grid.width as u64], // Single chunk
+            "float64",
+            0.0f64,
+        )
+        .dimension_names(Some(vec![Some("x".to_string())]))
+        .build(zarr_store.clone(), &x_path)?;
+        x_array.async_store_metadata().await?;
+        x_array.async_store_chunk(&[0], &x_coords).await?;
+
+        // Create y coordinate array
+        let y_path = if path.is_empty() { "/y".to_string() } else { format!("/{}/y", path) };
+        let y_array = ArrayBuilder::new(
+            vec![output_grid.height as u64],
+            vec![output_grid.height as u64], // Single chunk
+            "float64",
+            0.0f64,
+        )
+        .dimension_names(Some(vec![Some("y".to_string())]))
+        .build(zarr_store.clone(), &y_path)?;
+        y_array.async_store_metadata().await?;
+        y_array.async_store_chunk(&[0], &y_coords).await?;
+
+        // Create time coordinate array
+        let time_path = if path.is_empty() { "/time".to_string() } else { format!("/{}/time", path) };
+        let time_array = ArrayBuilder::new(
+            vec![output_grid.num_years as u64],
+            vec![output_grid.num_years as u64], // Single chunk
+            "int32",
+            0i32,
+        )
+        .dimension_names(Some(vec![Some("time".to_string())]))
+        .build(zarr_store.clone(), &time_path)?;
+        time_array.async_store_metadata().await?;
+        time_array.async_store_chunk(&[0], &time_coords).await?;
+
+        tracing::info!(
+            "Created coordinate arrays: x[{}], y[{}], time[{}]",
+            x_coords.len(),
+            y_coords.len(),
+            time_coords.len()
+        );
+
         Ok(())
     }
 }
