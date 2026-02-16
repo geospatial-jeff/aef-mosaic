@@ -95,11 +95,14 @@ impl ZarrWriter {
             chunk_shape.width as u64,
         ];
 
+        // Use -128 as fill value to match AEF COG nodata convention
+        const NODATA: i8 = -128;
+
         let mut builder = ArrayBuilder::new(
             vec![shape[0] as u64, shape[1] as u64, shape[2] as u64, shape[3] as u64],
             chunk_grid,
             "int8",  // Data type as string
-            0i8,     // Fill value
+            NODATA,  // Fill value matches AEF COG nodata
         );
 
         // Add dimension names
