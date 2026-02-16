@@ -71,9 +71,9 @@ output:
   num_bands: 64              # embedding dimensions
 
   chunk_shape:
-    time: 1
-    embedding: 64
-    height: 1024
+    time: 1         # One year per chunk
+    embedding: 64   # Full embedding dimension
+    height: 1024    # ~10km at 10m resolution
     width: 1024
 
   compression_level: 3       # zstd 0-22
@@ -82,15 +82,13 @@ output:
 
 # === PROCESSING: Performance tuning ===
 processing:
-  concurrency: 256           # concurrent chunks
-  cog_fetch_concurrency: 8   # COG fetches per chunk
-  metatile_size: 32          # spatial locality grouping
-  tile_cache_gb: 32.0        # decoded tile cache
+  fetch_concurrency: 8       # concurrent COG fetches (network I/O)
+  mosaic_concurrency: 8      # concurrent mosaic/reproject (CPU)
+  write_concurrency: 8       # concurrent Zarr writes (I/O)
+  tile_cache_gb: 32.0        # decoded tile cache in GB
   metadata_cache_entries: 10000
   enable_metrics: true
   metrics_interval_secs: 10
-  # worker_threads: 64       # Tokio threads (default: num CPUs)
-  # rayon_threads: 64        # Rayon threads (default: num CPUs)
 
   retry:
     max_retries: 3
@@ -124,4 +122,22 @@ output:
 
 aws:
   region: "us-west-2"
+```
+
+## Output Format
+
+The pipeline produces a Zarr V3 array with shape `(time, band, y, x)`:
+
+- **Data type**: Int8 embeddings (-128 = NoData)
+- **Compression**: Zstd
+- **Coordinate arrays**: `/x`, `/y`, `/time` for xarray compatibility
+
+Geospatial attributes follow both CF Conventions and GeoZarr `proj:` namespace:
+
+```python
+import xarray as xr
+
+ds = xr.open_zarr("/tmp/aef-mosaic.zarr")
+print(ds.embeddings.attrs['crs'])        # "EPSG:6933"
+print(ds.embeddings.attrs['proj:code'])  # "EPSG:6933" (GeoZarr)
 ```
