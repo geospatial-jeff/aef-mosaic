@@ -71,11 +71,44 @@ pub fn create_anonymous_store(bucket: &str) -> Result<Arc<dyn ObjectStore>> {
 
 /// Create an authenticated S3 client for writing.
 ///
-/// Credentials and region are loaded from (in order):
-/// - Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION)
-/// - AWS config files (~/.aws/credentials, ~/.aws/config)
-/// - EC2 instance profile (IMDS)
+/// Credentials are loaded from environment variables:
+/// - AWS_ACCESS_KEY_ID (required)
+/// - AWS_SECRET_ACCESS_KEY (required)
+/// - AWS_REGION or AWS_DEFAULT_REGION (required)
+/// - AWS_SESSION_TOKEN (optional, for temporary credentials)
+///
+/// Tip: Use `aws-vault exec <profile> -- <command>` to export credentials from a profile.
 fn create_authenticated_store(bucket: &str) -> Result<Arc<dyn ObjectStore>> {
+    // Check for required environment variables upfront
+    let missing: Vec<&str> = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
+        .into_iter()
+        .filter(|var| std::env::var(var).is_err())
+        .collect();
+
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "Missing required AWS credentials: {}\n\
+            \n\
+            Set these environment variables, or use aws-vault:\n\
+            \n\
+            Option 1: Export credentials directly\n\
+            export AWS_ACCESS_KEY_ID=<your-access-key>\n\
+            export AWS_SECRET_ACCESS_KEY=<your-secret-key>\n\
+            export AWS_REGION=<region>\n\
+            \n\
+            Option 2: Use aws-vault with a profile\n\
+            aws-vault exec <profile> -- pixi run mosaic -c config.yaml",
+            missing.join(", ")
+        );
+    }
+
+    // Check for region
+    if std::env::var("AWS_REGION").is_err() && std::env::var("AWS_DEFAULT_REGION").is_err() {
+        anyhow::bail!(
+            "Missing AWS_REGION or AWS_DEFAULT_REGION environment variable"
+        );
+    }
+
     tracing::info!("Creating authenticated S3 client for bucket: {}", bucket);
 
     // Buckets with dots in the name require path-style URLs
@@ -128,9 +161,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_create_authenticated_store() {
+    fn test_create_authenticated_store_missing_credentials() {
+        // Clear any existing credentials to test error handling
+        std::env::remove_var("AWS_ACCESS_KEY_ID");
+        std::env::remove_var("AWS_SECRET_ACCESS_KEY");
+
         let result = create_authenticated_store("test-bucket");
-        assert!(result.is_ok());
+        assert!(result.is_err());
+
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Missing required AWS credentials"));
     }
 
     #[test]
