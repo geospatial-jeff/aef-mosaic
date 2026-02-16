@@ -302,12 +302,6 @@ processing:
   # Metrics reporting interval in seconds
   metrics_interval_secs: 10
 
-  # Retry configuration for transient S3 failures
-  retry:
-    max_retries: 3
-    initial_backoff_ms: 100
-    max_backoff_ms: 10000
-
 # === FILTER: Limit processing to a subset (optional) ===
 # Uncomment to process only a specific area or time range.
 # Useful for testing on a small area before full production runs.

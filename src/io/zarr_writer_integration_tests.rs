@@ -28,8 +28,6 @@ fn create_test_config(chunk_shape: ChunkShape) -> Config {
             crs: "EPSG:4326".to_string(),
             resolution: 10.0,
             chunk_shape,
-            num_years: 1,
-            start_year: 2024,
             num_bands: 64,
             compression_level: 3,
         },
