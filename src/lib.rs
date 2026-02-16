@@ -90,14 +90,29 @@ pub async fn run_pipeline(config: Config) -> Result<PipelineStats> {
             .ok_or_else(|| anyhow::anyhow!("No tiles in index"))?,
     };
 
+    // Determine years to process: from filter or from input data
+    let years: Vec<i32> = match &config.filter {
+        Some(f) if f.years.as_ref().map_or(false, |y| !y.is_empty()) => {
+            let mut y = f.years.clone().unwrap();
+            y.sort();
+            y
+        }
+        _ => input_index.unique_years(), // All years in input data (already sorted)
+    };
+
+    if years.is_empty() {
+        anyhow::bail!("No years to process - check filter configuration or input data");
+    }
+
     let input_index = Arc::new(input_index);
 
     tracing::info!(
-        "Processing bounds: [{:.4}, {:.4}, {:.4}, {:.4}]",
+        "Processing bounds: [{:.4}, {:.4}, {:.4}, {:.4}], years: {:?}",
         bounds[0],
         bounds[1],
         bounds[2],
-        bounds[3]
+        bounds[3],
+        years
     );
 
     // Create output grid
@@ -105,8 +120,7 @@ pub async fn run_pipeline(config: Config) -> Result<PipelineStats> {
         bounds,
         config.output.crs.clone(),
         config.output.resolution,
-        config.output.num_years,
-        config.output.start_year,
+        years,
         config.output.num_bands,
         config.output.chunk_shape.clone(),
     )?);
@@ -145,8 +159,10 @@ pub async fn run_pipeline(config: Config) -> Result<PipelineStats> {
         .filter(|chunk| spatial_lookup.chunk_has_data(chunk))
         .collect();
 
-    // Sort by row first, then column (row-major order) for cache locality
-    chunks.sort_by_key(|c| (c.row_idx, c.col_idx));
+    // Sort by time first, then row, then column for cache locality
+    // Processing all chunks for one year before moving to the next maximizes
+    // tile cache hits since tiles from the same year are reused across spatial chunks
+    chunks.sort_by_key(|c| (c.time_idx, c.row_idx, c.col_idx));
 
     let total_chunks = chunks.len();
     tracing::info!(

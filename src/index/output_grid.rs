@@ -37,11 +37,8 @@ pub struct OutputGrid {
     /// Resolution in output CRS units
     pub resolution: f64,
 
-    /// Number of years (time dimension)
-    pub num_years: usize,
-
-    /// Starting year
-    pub start_year: i32,
+    /// Sorted list of years to process (time dimension)
+    pub years: Vec<i32>,
 
     /// Number of embedding dimensions
     pub num_bands: usize,
@@ -63,12 +60,12 @@ impl OutputGrid {
     /// Create a new output grid from WGS84 bounds and configuration.
     ///
     /// The bounds_wgs84 are transformed to the output CRS before calculating dimensions.
+    /// The `years` parameter should be a sorted list of years to process.
     pub fn new(
         bounds_wgs84: [f64; 4],
         crs: String,
         resolution: f64,
-        num_years: usize,
-        start_year: i32,
+        years: Vec<i32>,
         num_bands: usize,
         chunk_shape: ChunkShape,
     ) -> Result<Self> {
@@ -102,11 +99,12 @@ impl OutputGrid {
         ];
 
         // Calculate chunk counts for time and bands
+        let num_years = years.len();
         let time_chunks = num_years.div_ceil(chunk_shape.time);
         let band_chunks = num_bands.div_ceil(chunk_shape.embedding);
 
         tracing::info!(
-            "Output grid: {}x{} pixels (raw {}x{}, chunk-aligned), {} chunks ({}x{}x{}x{})",
+            "Output grid: {}x{} pixels (raw {}x{}, chunk-aligned), {} chunks ({}x{}x{}x{}), years: {:?}",
             width,
             height,
             raw_width,
@@ -115,15 +113,15 @@ impl OutputGrid {
             time_chunks,
             band_chunks,
             row_chunks,
-            col_chunks
+            col_chunks,
+            years
         );
 
         Ok(Self {
             bounds,
             crs,
             resolution,
-            num_years,
-            start_year,
+            years,
             num_bands,
             height,
             width,
@@ -158,7 +156,17 @@ impl OutputGrid {
 
     /// Get the Zarr array shape.
     pub fn array_shape(&self) -> [usize; 4] {
-        [self.num_years, self.num_bands, self.height, self.width]
+        [self.years.len(), self.num_bands, self.height, self.width]
+    }
+
+    /// Get the number of years (time dimension).
+    pub fn num_years(&self) -> usize {
+        self.years.len()
+    }
+
+    /// Get the starting year (first year in the sorted list).
+    pub fn start_year(&self) -> i32 {
+        self.years.first().copied().unwrap_or(2024)
     }
 
     /// Enumerate all output chunks.
@@ -215,7 +223,16 @@ impl OutputGrid {
 
     /// Get the year for a time index.
     pub fn year_for_time_idx(&self, time_idx: usize) -> i32 {
-        self.start_year + time_idx as i32
+        self.years.get(time_idx).copied().unwrap_or_else(|| {
+            // Fallback: compute based on first year + offset
+            self.start_year() + time_idx as i32
+        })
+    }
+
+    /// Get the time index for a given year.
+    /// Returns None if the year is not in the years list.
+    pub fn time_idx_for_year(&self, year: i32) -> Option<usize> {
+        self.years.iter().position(|&y| y == year)
     }
 
     /// Convert output CRS coordinates to pixel coordinates.
@@ -253,8 +270,7 @@ mod tests {
             [-124.0, 32.0, -114.0, 42.0], // ~California
             "EPSG:4326".to_string(),
             0.0001, // ~10m resolution
-            1,
-            2024,
+            vec![2024],
             64,
             ChunkShape::default(),
         ).unwrap()
@@ -279,8 +295,7 @@ mod tests {
             [0.0, 0.0, 1.0, 1.0],
             "EPSG:4326".to_string(),
             0.5, // 2x2 pixels
-            1,
-            2024,
+            vec![2024],
             64,
             ChunkShape {
                 time: 1,
@@ -301,8 +316,7 @@ mod tests {
             [0.0, 0.0, 2.0, 2.0],
             "EPSG:4326".to_string(),
             1.0,
-            1,
-            2024,
+            vec![2024],
             64,
             ChunkShape {
                 time: 1,
@@ -338,8 +352,7 @@ mod tests {
             [0.0, 0.0, 10.0, 10.0],
             crs::codes::WGS84.to_string(),
             0.01, // 1000x1000 grid
-            1,
-            2024,
+            vec![2024],
             64,
             ChunkShape::default(),
         ).unwrap();
@@ -366,8 +379,7 @@ mod tests {
             [0.0, 0.0, 10.0, 10.0],
             crs::codes::WGS84.to_string(),
             0.01,
-            1,
-            2024,
+            vec![2024],
             64,
             ChunkShape::default(),
         ).unwrap();
@@ -400,8 +412,7 @@ mod tests {
             [0.0, 0.0, 1.0, 1.0],  // [min_lon, min_lat, max_lon, max_lat]
             crs::codes::WGS84.to_string(),
             0.001,  // ~111m resolution at equator
-            1,
-            2024,
+            vec![2024],
             64,
             ChunkShape {
                 time: 1,
@@ -439,8 +450,7 @@ mod tests {
             [0.0, 0.0, 1.0, 2.0],  // 2 degrees tall, 1 degree wide
             crs::codes::WGS84.to_string(),
             0.001,  // 1000 pixels per degree
-            1,
-            2024,
+            vec![2024],
             64,
             ChunkShape {
                 time: 1,
@@ -490,8 +500,7 @@ mod tests {
             [0.0, 0.0, 1.0, 1.0],  // 1x1 degree grid
             crs::codes::WGS84.to_string(),
             0.001,  // 1000x1000 pixels
-            1,
-            2024,
+            vec![2024],
             64,
             ChunkShape {
                 time: 1,
@@ -540,8 +549,7 @@ mod tests {
             [-122.5, 37.7, -122.3, 37.85],  // WGS84 filter bounds
             "EPSG:32610".to_string(),       // UTM Zone 10N
             10.0,
-            1,
-            2024,
+            vec![2024],
             64,
             ChunkShape {
                 time: 1,

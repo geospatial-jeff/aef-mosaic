@@ -142,6 +142,16 @@ fn analyze_work(config: &Config) -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("No tiles in index"))?,
         };
 
+        // Determine years to process: from filter or from input data
+        let years: Vec<i32> = match &config.filter {
+            Some(f) if f.years.as_ref().map_or(false, |y| !y.is_empty()) => {
+                let mut y = f.years.clone().unwrap();
+                y.sort();
+                y
+            }
+            _ => input_index.unique_years(), // All years in input data (already sorted)
+        };
+
         let input_index = Arc::new(input_index);
 
         // Create output grid
@@ -149,9 +159,8 @@ fn analyze_work(config: &Config) -> Result<()> {
             bounds,
             config.output.crs.clone(),
             config.output.resolution,
-            1,
-            2024,
-            64,
+            years.clone(),
+            config.output.num_bands,
             config.output.chunk_shape.clone(),
         )?);
 

@@ -54,11 +54,23 @@ impl SpatialLookup {
     /// Find all input COG tiles that intersect the given output chunk.
     /// Returns Arc clones (cheap reference count increment).
     ///
+    /// This method filters tiles by both spatial intersection AND year,
+    /// ensuring that only tiles matching the chunk's time index are returned.
+    ///
     /// Returns an error if coordinate transformation fails.
     pub fn tiles_for_chunk(&self, chunk: &OutputChunk) -> Result<Vec<Arc<CogTile>>> {
         let bounds_crs = self.output_grid.chunk_bounds(chunk);
         let bounds_wgs84 = self.transform_to_wgs84(&bounds_crs)?;
-        Ok(self.input_index.query_intersecting(&bounds_wgs84))
+
+        // Get the year for this chunk's time index
+        let chunk_year = self.output_grid.year_for_time_idx(chunk.time_idx);
+
+        // Query spatially intersecting tiles and filter by year
+        Ok(self.input_index
+            .query_intersecting(&bounds_wgs84)
+            .into_iter()
+            .filter(|tile| tile.year == chunk_year)
+            .collect())
     }
 
     /// Find all input COG tiles that intersect the given WGS84 bounds.
