@@ -152,11 +152,11 @@ impl ZarrWriter {
         attributes.insert("num_years".to_string(), serde_json::json!(output_grid.num_years()));
         attributes.insert("years".to_string(), serde_json::json!(output_grid.years));
 
-        // Add band names (AEF convention: A00, A01, ..., A63)
-        let band_names: Vec<String> = (0..output_grid.num_bands)
+        // Add embedding dimension names (AEF convention: A00, A01, ..., A63)
+        let dimensions: Vec<String> = (0..output_grid.num_bands)
             .map(|i| format!("A{:02}", i))
             .collect();
-        attributes.insert("band_names".to_string(), serde_json::json!(band_names));
+        attributes.insert("embedding_dimensions".to_string(), serde_json::json!(dimensions));
 
         // Add CF Conventions attribute for compatibility
         attributes.insert("Conventions".to_string(), serde_json::json!("CF-1.8"));
