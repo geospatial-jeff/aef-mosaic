@@ -108,7 +108,7 @@ impl ZarrWriter {
         // Add dimension names
         builder.dimension_names(Some(vec![
             Some("time".to_string()),
-            Some("band".to_string()),
+            Some("embedding".to_string()),
             Some("y".to_string()),
             Some("x".to_string()),
         ]));
