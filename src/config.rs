@@ -67,14 +67,6 @@ pub struct OutputConfig {
     #[serde(default = "default_resolution")]
     pub resolution: f64,
 
-    /// Number of years/time steps in output
-    #[serde(default = "default_num_years")]
-    pub num_years: usize,
-
-    /// Starting year for the time dimension
-    #[serde(default = "default_start_year")]
-    pub start_year: i32,
-
     /// Number of bands/embedding dimensions
     #[serde(default = "default_num_bands")]
     pub num_bands: usize,
@@ -82,14 +74,6 @@ pub struct OutputConfig {
     /// Zarr chunk dimensions
     #[serde(default)]
     pub chunk_shape: ChunkShape,
-
-    /// Use Zarr V3 sharding
-    #[serde(default)]
-    pub use_sharding: bool,
-
-    /// Shards per dimension (if sharding enabled)
-    #[serde(default = "default_shard_shape")]
-    pub shard_shape: [usize; 2],
 
     /// Compression level (0-22 for zstd)
     #[serde(default = "default_compression_level")]
@@ -184,10 +168,6 @@ pub struct ProcessingConfig {
     #[serde(default = "default_metrics_interval")]
     pub metrics_interval_secs: u64,
 
-    /// Retry configuration for failed operations
-    #[serde(default)]
-    pub retry: RetryConfig,
-
     /// Maximum memory for tile cache in GB
     #[serde(default = "default_tile_cache_gb")]
     pub tile_cache_gb: f64,
@@ -199,32 +179,6 @@ pub struct ProcessingConfig {
     /// Optional path to save metrics JSON after run completes
     #[serde(default)]
     pub metrics_output_path: Option<String>,
-}
-
-/// Retry configuration for transient failures.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RetryConfig {
-    /// Maximum retry attempts
-    #[serde(default = "default_max_retries")]
-    pub max_retries: usize,
-
-    /// Initial backoff in milliseconds
-    #[serde(default = "default_initial_backoff_ms")]
-    pub initial_backoff_ms: u64,
-
-    /// Maximum backoff in milliseconds
-    #[serde(default = "default_max_backoff_ms")]
-    pub max_backoff_ms: u64,
-}
-
-impl Default for RetryConfig {
-    fn default() -> Self {
-        Self {
-            max_retries: 3,
-            initial_backoff_ms: 100,
-            max_backoff_ms: 10000,
-        }
-    }
 }
 
 /// Filter configuration to limit processing area and time range.
@@ -251,7 +205,6 @@ impl Default for ProcessingConfig {
             write_concurrency: 8,
             enable_metrics: true,
             metrics_interval_secs: 10,
-            retry: RetryConfig::default(),
             tile_cache_gb: 32.0,
             metadata_cache_entries: 10_000,
             metrics_output_path: None,
@@ -308,6 +261,9 @@ impl Config {
             _ => {}
         }
 
+        if self.output.chunk_shape.time != 1 {
+            anyhow::bail!("chunk_shape.time must be 1 (multi-year chunks not supported)");
+        }
         if self.output.chunk_shape.embedding == 0 {
             anyhow::bail!("Embedding chunk size must be > 0");
         }
@@ -337,12 +293,6 @@ fn default_mosaic_concurrency() -> usize { 8 }
 fn default_write_concurrency() -> usize { 8 }
 fn default_true() -> bool { true }
 fn default_metrics_interval() -> u64 { 10 }
-fn default_max_retries() -> usize { 3 }
-fn default_initial_backoff_ms() -> u64 { 100 }
-fn default_max_backoff_ms() -> u64 { 10000 }
-fn default_shard_shape() -> [usize; 2] { [8, 8] }
-fn default_num_years() -> usize { 1 }
-fn default_start_year() -> i32 { 2024 }
 fn default_num_bands() -> usize { 64 }
 fn default_compression_level() -> i32 { 3 }
 fn default_tile_cache_gb() -> f64 { 32.0 }
@@ -374,12 +324,8 @@ mod tests {
                 prefix: Some("zarr/".to_string()),
                 crs: "EPSG:6933".to_string(),
                 resolution: 10.0,
-                num_years: 1,
-                start_year: 2024_i32,
                 num_bands: 64,
                 chunk_shape: ChunkShape::default(),
-                use_sharding: false,
-                shard_shape: [8, 8],
                 compression_level: 3,
             },
             processing: ProcessingConfig::default(),
@@ -402,12 +348,8 @@ mod tests {
                 prefix: None,
                 crs: "EPSG:6933".to_string(),
                 resolution: 10.0,
-                num_years: 1,
-                start_year: 2024_i32,
                 num_bands: 64,
                 chunk_shape: ChunkShape::default(),
-                use_sharding: false,
-                shard_shape: [8, 8],
                 compression_level: 3,
             },
             processing: ProcessingConfig::default(),
@@ -431,12 +373,8 @@ mod tests {
                 prefix: None,
                 crs: "EPSG:6933".to_string(),
                 resolution: 10.0,
-                num_years: 1,
-                start_year: 2024_i32,
                 num_bands: 64,
                 chunk_shape: ChunkShape::default(),
-                use_sharding: false,
-                shard_shape: [8, 8],
                 compression_level: 3,
             },
             processing: ProcessingConfig::default(),

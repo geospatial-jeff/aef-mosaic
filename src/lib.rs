@@ -150,8 +150,15 @@ pub async fn run_pipeline(config: Config) -> Result<PipelineStats> {
     // Create metrics
     let metrics = Metrics::new();
 
-    // Create COG reader with metrics for cache tracking
-    let cog_reader = Arc::new(CogReader::with_metrics(cog_store, metrics.clone()));
+    // Create COG reader with cache sizes from config
+    let tile_cache_bytes = (config.processing.tile_cache_gb * 1024.0 * 1024.0 * 1024.0) as u64;
+
+    let cog_reader = Arc::new(CogReader::with_cache_size(
+        cog_store,
+        config.processing.metadata_cache_entries,
+        tile_cache_bytes,
+        Some(metrics.clone()),
+    ));
 
     // Collect chunks to process (pre-filter empty chunks)
     let mut chunks: Vec<_> = output_grid

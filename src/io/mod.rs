@@ -2,7 +2,6 @@
 
 mod cog_reader;
 mod store;
-pub mod tile_cache;
 mod zarr_writer;
 
 #[cfg(test)]

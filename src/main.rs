@@ -279,12 +279,6 @@ output:
   # Zstd compression level (0-22, higher = smaller but slower)
   compression_level: 3
 
-  # Enable Zarr V3 sharding (reduces S3 object count)
-  use_sharding: false
-
-  # Chunks per shard [height, width] if sharding enabled
-  shard_shape: [8, 8]
-
 # === PROCESSING: Performance tuning ===
 processing:
   # Number of chunks to fetch concurrently (network I/O bound)
@@ -307,12 +301,6 @@ processing:
 
   # Metrics reporting interval in seconds
   metrics_interval_secs: 10
-
-  # Retry configuration for transient S3 failures
-  retry:
-    max_retries: 3
-    initial_backoff_ms: 100
-    max_backoff_ms: 10000
 
 # === FILTER: Limit processing to a subset (optional) ===
 # Uncomment to process only a specific area or time range.

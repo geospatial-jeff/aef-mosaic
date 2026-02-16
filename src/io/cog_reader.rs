@@ -341,25 +341,64 @@ impl TiffMetadataCache {
 /// Key for tile cache: (cog_path, tile_x, tile_y)
 type TileCacheKey = (String, usize, usize);
 
-/// Cached decoded tile with single-flight support.
+/// Cached decoded tile with single-flight support and memory-based eviction.
 struct TileDataCache {
     /// LRU cache for decoded tiles
-    pub cache: RwLock<LruCache<TileCacheKey, Arc<TileArray>>>,
+    cache: RwLock<LruCache<TileCacheKey, Arc<TileArray>>>,
     /// In-flight requests (single-flight pattern) - uses DashMap for lock-free access
-    pub in_flight: DashMap<TileCacheKey, broadcast::Sender<Result<Arc<TileArray>, String>>>,
+    in_flight: DashMap<TileCacheKey, broadcast::Sender<Result<Arc<TileArray>, String>>>,
+    /// Maximum cache size in bytes
+    max_bytes: u64,
+    /// Current cache size in bytes
+    current_bytes: std::sync::atomic::AtomicU64,
     /// Optional metrics
-    pub metrics: Option<Arc<Metrics>>,
+    metrics: Option<Arc<Metrics>>,
 }
 
 impl TileDataCache {
-    fn new(max_entries: usize, metrics: Option<Arc<Metrics>>) -> Self {
+    /// Create a new tile cache with the specified maximum size in bytes.
+    fn new(max_bytes: u64, metrics: Option<Arc<Metrics>>) -> Self {
+        // Estimate initial capacity based on typical tile size (~16 MB for 512x512 tiles with 64 bands)
+        let estimated_tile_size: u64 = 16 * 1024 * 1024;
+        let initial_capacity = (max_bytes / estimated_tile_size) as usize;
+        let capacity = initial_capacity.max(1000);
+
         Self {
             cache: RwLock::new(LruCache::new(
-                NonZeroUsize::new(max_entries).unwrap_or(NonZeroUsize::new(50_000).unwrap()),
+                NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::new(1000).unwrap()),
             )),
             in_flight: DashMap::new(),
+            max_bytes,
+            current_bytes: std::sync::atomic::AtomicU64::new(0),
             metrics,
         }
+    }
+
+    /// Evict old entries if needed to make room for a new tile.
+    async fn evict_if_needed(&self, new_tile_size: u64) {
+        use std::sync::atomic::Ordering;
+
+        let current = self.current_bytes.load(Ordering::Relaxed);
+        if current + new_tile_size <= self.max_bytes {
+            return;
+        }
+
+        // Need to evict - remove LRU entries until we have enough space
+        let mut cache = self.cache.write().await;
+        while self.current_bytes.load(Ordering::Relaxed) + new_tile_size > self.max_bytes {
+            if let Some((_, evicted)) = cache.pop_lru() {
+                let evicted_size = evicted.size_bytes() as u64;
+                self.current_bytes.fetch_sub(evicted_size, Ordering::Relaxed);
+            } else {
+                break; // Cache is empty
+            }
+        }
+    }
+
+    /// Add bytes to the current size tracking.
+    fn add_bytes(&self, bytes: u64) {
+        use std::sync::atomic::Ordering;
+        self.current_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 }
 
@@ -381,6 +420,9 @@ pub struct CogReader {
     metrics: Option<Arc<Metrics>>,
 }
 
+/// Default tile cache size: 32 GB
+const DEFAULT_TILE_CACHE_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+
 impl CogReader {
     /// Create a new COG reader.
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {
@@ -388,7 +430,7 @@ impl CogReader {
             store,
             decoder_registry: Arc::new(DecoderRegistry::default()),
             metadata_cache: Arc::new(TiffMetadataCache::new(10_000, None)),
-            tile_cache: Arc::new(TileDataCache::new(50_000, None)),
+            tile_cache: Arc::new(TileDataCache::new(DEFAULT_TILE_CACHE_BYTES, None)),
             metrics: None,
         }
     }
@@ -399,23 +441,29 @@ impl CogReader {
             store,
             decoder_registry: Arc::new(DecoderRegistry::default()),
             metadata_cache: Arc::new(TiffMetadataCache::new(10_000, Some(metrics.clone()))),
-            tile_cache: Arc::new(TileDataCache::new(50_000, Some(metrics.clone()))),
+            tile_cache: Arc::new(TileDataCache::new(DEFAULT_TILE_CACHE_BYTES, Some(metrics.clone()))),
             metrics: Some(metrics),
         }
     }
 
     /// Create a new COG reader with custom cache size and metrics.
+    ///
+    /// # Arguments
+    /// * `store` - Object store for S3 access
+    /// * `metadata_cache_entries` - Maximum entries in TIFF metadata cache
+    /// * `tile_cache_bytes` - Maximum tile cache size in bytes
+    /// * `metrics` - Optional metrics collector
     pub fn with_cache_size(
         store: Arc<dyn ObjectStore>,
-        metadata_cache_size: usize,
-        tile_cache_size: usize,
+        metadata_cache_entries: usize,
+        tile_cache_bytes: u64,
         metrics: Option<Arc<Metrics>>,
     ) -> Self {
         Self {
             store,
             decoder_registry: Arc::new(DecoderRegistry::default()),
-            metadata_cache: Arc::new(TiffMetadataCache::new(metadata_cache_size, metrics.clone())),
-            tile_cache: Arc::new(TileDataCache::new(tile_cache_size, metrics.clone())),
+            metadata_cache: Arc::new(TiffMetadataCache::new(metadata_cache_entries, metrics.clone())),
+            tile_cache: Arc::new(TileDataCache::new(tile_cache_bytes, metrics.clone())),
             metrics,
         }
     }
@@ -614,14 +662,18 @@ impl CogReader {
         match result {
             Ok(tile) => {
                 let tile_arc = Arc::new(tile);
+                let tile_size = tile_arc.size_bytes() as u64;
 
-                // Cache it and track bytes
+                // Evict old entries if needed, then cache it
+                self.tile_cache.evict_if_needed(tile_size).await;
                 {
                     let mut cache = self.tile_cache.cache.write().await;
                     cache.put(key.clone(), tile_arc.clone());
                 }
+                self.tile_cache.add_bytes(tile_size);
+
                 if let Some(ref m) = self.metrics {
-                    m.add_tile_cache_bytes(tile_arc.data.data().as_ref().len() as u64);
+                    m.add_tile_cache_bytes(tile_size);
                 }
 
                 // Notify waiters and remove from in-flight
@@ -821,6 +873,13 @@ struct TileArray {
     data: async_tiff::Array,
     actual_width: usize,
     actual_height: usize,
+}
+
+impl TileArray {
+    /// Estimate memory size of this tile in bytes.
+    fn size_bytes(&self) -> usize {
+        self.data.data().as_ref().len() + std::mem::size_of::<Self>()
+    }
 }
 
 #[cfg(test)]
