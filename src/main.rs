@@ -279,12 +279,6 @@ output:
   # Zstd compression level (0-22, higher = smaller but slower)
   compression_level: 3
 
-  # Enable Zarr V3 sharding (reduces S3 object count)
-  use_sharding: false
-
-  # Chunks per shard [height, width] if sharding enabled
-  shard_shape: [8, 8]
-
 # === PROCESSING: Performance tuning ===
 processing:
   # Number of chunks to fetch concurrently (network I/O bound)

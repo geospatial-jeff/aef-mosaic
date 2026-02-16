@@ -32,8 +32,6 @@ fn create_test_config(chunk_shape: ChunkShape) -> Config {
             start_year: 2024,
             num_bands: 64,
             compression_level: 3,
-            use_sharding: false,
-            shard_shape: [1, 1],
         },
         processing: ProcessingConfig::default(),
         filter: None,

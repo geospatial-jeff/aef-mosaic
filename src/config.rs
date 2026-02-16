@@ -83,14 +83,6 @@ pub struct OutputConfig {
     #[serde(default)]
     pub chunk_shape: ChunkShape,
 
-    /// Use Zarr V3 sharding
-    #[serde(default)]
-    pub use_sharding: bool,
-
-    /// Shards per dimension (if sharding enabled)
-    #[serde(default = "default_shard_shape")]
-    pub shard_shape: [usize; 2],
-
     /// Compression level (0-22 for zstd)
     #[serde(default = "default_compression_level")]
     pub compression_level: i32,
@@ -308,6 +300,9 @@ impl Config {
             _ => {}
         }
 
+        if self.output.chunk_shape.time != 1 {
+            anyhow::bail!("chunk_shape.time must be 1 (multi-year chunks not supported)");
+        }
         if self.output.chunk_shape.embedding == 0 {
             anyhow::bail!("Embedding chunk size must be > 0");
         }
@@ -340,7 +335,6 @@ fn default_metrics_interval() -> u64 { 10 }
 fn default_max_retries() -> usize { 3 }
 fn default_initial_backoff_ms() -> u64 { 100 }
 fn default_max_backoff_ms() -> u64 { 10000 }
-fn default_shard_shape() -> [usize; 2] { [8, 8] }
 fn default_num_years() -> usize { 1 }
 fn default_start_year() -> i32 { 2024 }
 fn default_num_bands() -> usize { 64 }
@@ -378,8 +372,6 @@ mod tests {
                 start_year: 2024_i32,
                 num_bands: 64,
                 chunk_shape: ChunkShape::default(),
-                use_sharding: false,
-                shard_shape: [8, 8],
                 compression_level: 3,
             },
             processing: ProcessingConfig::default(),
@@ -406,8 +398,6 @@ mod tests {
                 start_year: 2024_i32,
                 num_bands: 64,
                 chunk_shape: ChunkShape::default(),
-                use_sharding: false,
-                shard_shape: [8, 8],
                 compression_level: 3,
             },
             processing: ProcessingConfig::default(),
@@ -435,8 +425,6 @@ mod tests {
                 start_year: 2024_i32,
                 num_bands: 64,
                 chunk_shape: ChunkShape::default(),
-                use_sharding: false,
-                shard_shape: [8, 8],
                 compression_level: 3,
             },
             processing: ProcessingConfig::default(),
