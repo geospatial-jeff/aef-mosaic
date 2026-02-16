@@ -15,6 +15,9 @@ use proj::Proj;
 /// At 32-pixel spacing on a 2048x2048 tile, we transform ~4K points instead of 4M.
 const GRID_SPACING: usize = 32;
 
+/// Nodata value for AEF embeddings (int8).
+const NODATA: i8 = -128;
+
 /// Configuration for reprojection.
 #[derive(Debug, Clone)]
 pub struct ReprojectConfig {
@@ -101,8 +104,8 @@ impl Reprojector {
             }
         }
 
-        // Create output array
-        let mut output = Array3::<i8>::zeros((bands, dst_height, dst_width));
+        // Create output array initialized with NODATA
+        let mut output = Array3::<i8>::from_elem((bands, dst_height, dst_width), NODATA);
 
         // For each output pixel, interpolate source coordinates and sample
         for dst_row in 0..dst_height {
@@ -175,10 +178,10 @@ impl Reprojector {
             }
         }
 
-        let non_zero = output.iter().filter(|&&v| v != 0).count();
+        let valid_pixels = output.iter().filter(|&&v| v != NODATA).count();
         tracing::debug!(
-            "Sparse grid reproject: {}x{} -> {}x{}, {} non-zero pixels",
-            src_width, src_height, dst_width, dst_height, non_zero
+            "Sparse grid reproject: {}x{} -> {}x{}, {} valid pixels",
+            src_width, src_height, dst_width, dst_height, valid_pixels
         );
 
         Ok(output)

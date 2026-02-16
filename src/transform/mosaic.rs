@@ -5,6 +5,9 @@ use crate::transform::{ReprojectConfig, Reprojector};
 use anyhow::Result;
 use ndarray::{s, Array2, Array3, Array4, Axis, Zip};
 
+/// Nodata value for AEF embeddings (int8).
+const NODATA: i8 = -128;
+
 /// Accumulator for mosaicing multiple tiles using mean aggregation.
 ///
 /// Uses i16 accumulators which can handle up to ~250 overlapping tiles without overflow.
@@ -45,7 +48,7 @@ impl MosaicAccumulator {
     /// Add a tile's reprojected data to the accumulator.
     ///
     /// The input data should be in shape (bands, height, width) and already
-    /// reprojected to the output grid. Values of 0 are treated as nodata.
+    /// reprojected to the output grid. Values of -128 are treated as nodata.
     ///
     /// Uses ndarray operations for better performance and readability.
     pub fn add(&mut self, data: &Array3<i8>) {
@@ -54,10 +57,10 @@ impl MosaicAccumulator {
         assert_eq!(height, self.height, "Height mismatch");
         assert_eq!(width, self.width, "Width mismatch");
 
-        // Create a mask: true where ANY band has non-zero data
+        // Create a mask: true where ANY band has non-nodata value
         // Use fold_axis to check across all bands for each pixel
         let has_data: Array2<bool> = data
-            .map(|&v| v != 0)
+            .map(|&v| v != NODATA)
             .fold_axis(Axis(0), false, |acc, &val| *acc || val);
 
         // Update count where we have data using Zip
@@ -89,10 +92,12 @@ impl MosaicAccumulator {
     /// Finalize the mosaic by computing the mean.
     ///
     /// Returns an int8 array: (1, bands, height, width)
+    /// Pixels with no data are set to NODATA (-128).
     ///
     /// Uses ndarray operations for element-wise division with rounding.
     pub fn finalize(self) -> Array4<i8> {
-        let mut result = Array4::<i8>::zeros((1, self.bands, self.height, self.width));
+        // Initialize with NODATA
+        let mut result = Array4::<i8>::from_elem((1, self.bands, self.height, self.width), NODATA);
 
         // Process each band using Zip
         for b in 0..self.bands {
@@ -183,10 +188,10 @@ pub fn mosaic_tiles(
             reproject_config,
         )?;
 
-        let non_zero = reprojected.iter().filter(|&&v| v != 0).count();
+        let valid_pixels = reprojected.iter().filter(|&&v| v != -128).count();
         tracing::debug!(
-            "Window {} reprojected: shape={:?}, non_zero={}",
-            i, reprojected.dim(), non_zero
+            "Window {} reprojected: shape={:?}, valid_pixels={}",
+            i, reprojected.dim(), valid_pixels
         );
 
         // Add to accumulator
@@ -246,17 +251,21 @@ mod tests {
     fn test_accumulator_nodata() {
         let mut acc = MosaicAccumulator::new(2, 2, 2);
 
-        // First tile: some values
+        // First tile: some values, -128 is nodata
+        // Pixel (0,0): both bands have data (10, 50)
+        // Pixel (0,1): both bands are nodata (-128, -128)
+        // Pixel (1,0): both bands are nodata (-128, -128)
+        // Pixel (1,1): both bands have data (40, 80)
         let data1 = Array3::from_shape_vec(
             (2, 2, 2),
-            vec![10i8, 0, 0, 40, 50, 0, 0, 80],
+            vec![10i8, -128, -128, 40, 50, -128, -128, 80],
         )
         .unwrap();
         acc.add(&data1);
 
         // Check coverage (using 2D count array)
         assert_eq!(acc.count[[0, 0]], 1); // (0,0) has data
-        assert_eq!(acc.count[[0, 1]], 0); // (0,1) is nodata (all zeros)
+        assert_eq!(acc.count[[0, 1]], 0); // (0,1) is nodata
         assert_eq!(acc.count[[1, 0]], 0); // (1,0) is nodata
         assert_eq!(acc.count[[1, 1]], 1); // (1,1) has data
     }

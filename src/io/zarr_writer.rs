@@ -413,6 +413,51 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn test_zarr_writer_attributes() {
+        let temp_dir = TempDir::new().unwrap();
+        let zarr_path = temp_dir.path().join("test.zarr");
+        std::fs::create_dir_all(&zarr_path).unwrap();
+
+        let store = Arc::new(LocalFileSystem::new_with_prefix(&zarr_path).unwrap());
+        let chunk_shape = ChunkShape {
+            time: 1,
+            embedding: 4,
+            height: 4,
+            width: 4,
+        };
+        let config = create_test_config(chunk_shape.clone());
+        let grid = Arc::new(create_test_grid(8, 8, &chunk_shape));
+
+        let _writer = ZarrWriter::create(store, "", grid, &config).await.unwrap();
+
+        // Read and parse the array metadata
+        let array_json = zarr_path.join("embeddings").join("zarr.json");
+        let metadata_str = std::fs::read_to_string(&array_json).unwrap();
+        let metadata: serde_json::Value = serde_json::from_str(&metadata_str).unwrap();
+
+        // Verify attributes exist and have correct values
+        let attrs = metadata.get("attributes").expect("attributes should exist");
+
+        // CF-style CRS attribute
+        assert_eq!(attrs.get("crs").and_then(|v| v.as_str()), Some("EPSG:4326"));
+
+        // GeoZarr proj: namespace attribute
+        assert_eq!(attrs.get("proj:code").and_then(|v| v.as_str()), Some("EPSG:4326"));
+
+        // CF Conventions marker
+        assert_eq!(attrs.get("Conventions").and_then(|v| v.as_str()), Some("CF-1.8"));
+
+        // Geospatial metadata
+        assert!(attrs.get("transform").is_some(), "transform should exist");
+        assert!(attrs.get("bounds").is_some(), "bounds should exist");
+        assert_eq!(attrs.get("resolution").and_then(|v| v.as_f64()), Some(10.0));
+
+        // Time metadata
+        assert_eq!(attrs.get("start_year").and_then(|v| v.as_i64()), Some(2024));
+        assert_eq!(attrs.get("num_years").and_then(|v| v.as_i64()), Some(1));
+    }
+
+    #[tokio::test]
     async fn test_zarr_writer_writes_chunk() {
         let temp_dir = TempDir::new().unwrap();
         let zarr_path = temp_dir.path().join("test.zarr");

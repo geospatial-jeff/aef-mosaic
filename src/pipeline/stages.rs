@@ -567,5 +567,28 @@ mod tests {
         assert_eq!(config.fetch_concurrency, 8);
         assert_eq!(config.mosaic_concurrency, 8);
         assert_eq!(config.write_concurrency, 8);
+        assert_eq!(config.fetch_buffer, 16);
+        assert_eq!(config.mosaic_buffer, 8);
+    }
+
+    #[test]
+    fn test_pipeline_stats_default() {
+        let stats = PipelineStats::default();
+        assert_eq!(stats.total_chunks, 0);
+        assert_eq!(stats.chunks_processed, 0);
+        assert_eq!(stats.chunks_skipped, 0);
+    }
+
+    #[test]
+    fn test_pipeline_stats_display() {
+        let stats = PipelineStats {
+            total_chunks: 100,
+            chunks_processed: 90,
+            chunks_skipped: 10,
+        };
+        let display = format!("{}", stats);
+        assert!(display.contains("90"));
+        assert!(display.contains("10"));
+        assert!(display.contains("100"));
     }
 }
