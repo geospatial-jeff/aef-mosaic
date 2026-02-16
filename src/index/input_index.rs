@@ -5,10 +5,13 @@ use arrow::array::{Array, Float64Array, StringArray};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
+use geo::{Coord, Intersects, LineString, Polygon, Rect};
 use object_store::{ObjectStore, ObjectStoreExt};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use rstar::{RTree, RTreeObject, AABB};
 use std::sync::Arc;
+
+use crate::crs::ProjCache;
 
 /// A single COG tile from the AEF index.
 #[derive(Debug, Clone)]
@@ -28,11 +31,60 @@ pub struct CogTile {
     /// Bounding box in WGS84 [min_lon, min_lat, max_lon, max_lat]
     pub bounds_wgs84: [f64; 4],
 
+    /// Exact footprint polygon in WGS84 (4 corners transformed from native CRS).
+    /// Used for precise intersection tests after R-tree AABB filtering.
+    pub footprint_wgs84: Polygon<f64>,
+
     /// Resolution in source CRS units (meters for UTM)
     pub resolution: f64,
 
     /// Year of the tile data
     pub year: i32,
+}
+
+impl CogTile {
+    /// Compute WGS84 footprint by transforming 4 native CRS corners.
+    ///
+    /// This creates an exact polygon representation of the tile in WGS84,
+    /// which handles the distortion that occurs when transforming from
+    /// projected CRS (like UTM) to geographic coordinates.
+    pub fn compute_footprint(
+        bounds_native: &[f64; 4],
+        crs: &str,
+        proj_cache: &ProjCache,
+    ) -> Result<Polygon<f64>> {
+        let corners = [
+            (bounds_native[0], bounds_native[1]), // SW
+            (bounds_native[2], bounds_native[1]), // SE
+            (bounds_native[2], bounds_native[3]), // NE
+            (bounds_native[0], bounds_native[3]), // NW
+        ];
+
+        let mut coords: Vec<Coord<f64>> = Vec::with_capacity(5);
+        for (x, y) in corners {
+            let (lon, lat) = crate::crs::transform_point(x, y, crs, "EPSG:4326", proj_cache)?;
+            coords.push(Coord { x: lon, y: lat });
+        }
+        coords.push(coords[0]); // Close ring
+
+        Ok(Polygon::new(LineString::new(coords), vec![]))
+    }
+
+    /// Create a simple rectangular footprint from WGS84 bounds.
+    /// Used when the tile is already in WGS84 or for test data.
+    pub fn footprint_from_wgs84_bounds(bounds: &[f64; 4]) -> Polygon<f64> {
+        Rect::new(
+            Coord {
+                x: bounds[0],
+                y: bounds[1],
+            },
+            Coord {
+                x: bounds[2],
+                y: bounds[3],
+            },
+        )
+        .to_polygon()
+    }
 }
 
 impl RTreeObject for CogTile {
@@ -88,10 +140,11 @@ impl InputIndex {
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
         let reader = builder.build()?;
 
+        let proj_cache = ProjCache::new();
         let mut tiles = Vec::new();
         for batch_result in reader {
             let batch = batch_result?;
-            Self::extract_tiles_from_batch(&batch, &mut tiles)?;
+            Self::extract_tiles_from_batch(&batch, &mut tiles, &proj_cache)?;
         }
 
         // Wrap tiles in Arc for cheap cloning
@@ -121,10 +174,11 @@ impl InputIndex {
         let builder = ParquetRecordBatchReaderBuilder::try_new(bytes)?;
         let reader = builder.build()?;
 
+        let proj_cache = ProjCache::new();
         let mut tiles = Vec::new();
         for batch_result in reader {
             let batch = batch_result?;
-            Self::extract_tiles_from_batch(&batch, &mut tiles)?;
+            Self::extract_tiles_from_batch(&batch, &mut tiles, &proj_cache)?;
         }
 
         // Wrap tiles in Arc for cheap cloning
@@ -139,7 +193,11 @@ impl InputIndex {
     }
 
     /// Extract tiles from a record batch.
-    fn extract_tiles_from_batch(batch: &RecordBatch, tiles: &mut Vec<CogTile>) -> Result<()> {
+    fn extract_tiles_from_batch(
+        batch: &RecordBatch,
+        tiles: &mut Vec<CogTile>,
+        proj_cache: &ProjCache,
+    ) -> Result<()> {
         let schema = batch.schema();
 
         // Get column indices - flexible to handle different column naming conventions
@@ -208,12 +266,24 @@ impl InputIndex {
         }).unwrap_or_else(|| vec![2024; batch.num_rows()]);
 
         for i in 0..batch.num_rows() {
+            let bounds_native = [min_x[i], min_y[i], max_x[i], max_y[i]];
+            let bounds_wgs84 = [min_lon[i], min_lat[i], max_lon[i], max_lat[i]];
+            let crs = crs_values.value(i).to_string();
+
+            // Compute exact footprint by transforming 4 corners from native CRS to WGS84
+            let footprint_wgs84 = CogTile::compute_footprint(&bounds_native, &crs, proj_cache)
+                .unwrap_or_else(|_| {
+                    // Fall back to rectangular footprint from WGS84 bounds if transform fails
+                    CogTile::footprint_from_wgs84_bounds(&bounds_wgs84)
+                });
+
             let tile = CogTile {
                 tile_id: tile_ids[i].clone(),
                 s3_path: s3_paths.value(i).to_string(),
-                crs: crs_values.value(i).to_string(),
-                bounds_native: [min_x[i], min_y[i], max_x[i], max_y[i]],
-                bounds_wgs84: [min_lon[i], min_lat[i], max_lon[i], max_lat[i]],
+                crs,
+                bounds_native,
+                bounds_wgs84,
+                footprint_wgs84,
                 resolution: resolution[i],
                 year: years[i],
             };
@@ -248,14 +318,32 @@ impl InputIndex {
     }
 
     /// Query tiles that intersect the given WGS84 bounding box.
+    ///
+    /// Uses a two-stage approach:
+    /// 1. R-tree query with axis-aligned bounding boxes (fast candidate filter)
+    /// 2. Exact polygon intersection test (eliminates false positives from AABB)
+    ///
     /// Returns Arc clones (cheap reference count increment).
     pub fn query_intersecting(&self, bounds: &[f64; 4]) -> Vec<Arc<CogTile>> {
-        let envelope = AABB::from_corners(
-            [bounds[0], bounds[1]],
-            [bounds[2], bounds[3]],
+        let envelope = AABB::from_corners([bounds[0], bounds[1]], [bounds[2], bounds[3]]);
+
+        // Create query rectangle as polygon for exact intersection test
+        let query_rect = Rect::new(
+            Coord {
+                x: bounds[0],
+                y: bounds[1],
+            },
+            Coord {
+                x: bounds[2],
+                y: bounds[3],
+            },
         );
+        let query_poly = query_rect.to_polygon();
+
+        // R-tree candidate query + polygon refinement
         self.rtree
             .locate_in_envelope_intersecting(&envelope)
+            .filter(|arc_tile| arc_tile.footprint_wgs84.intersects(&query_poly))
             .map(|arc_tile| Arc::clone(&arc_tile.0))
             .collect()
     }
@@ -366,6 +454,7 @@ mod tests {
             crs: "EPSG:32610".to_string(),
             bounds_native: [0.0, 0.0, 10000.0, 10000.0],
             bounds_wgs84: bounds,
+            footprint_wgs84: CogTile::footprint_from_wgs84_bounds(&bounds),
             resolution: 10.0,
             year,
         }

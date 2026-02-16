@@ -170,6 +170,7 @@ mod tests {
             crs: "EPSG:32610".to_string(),
             bounds_native: [0.0, 0.0, 10000.0, 10000.0],
             bounds_wgs84: bounds,
+            footprint_wgs84: CogTile::footprint_from_wgs84_bounds(&bounds),
             resolution: 10.0,
             year: 2024,
         }

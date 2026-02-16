@@ -828,12 +828,14 @@ mod tests {
     use super::*;
 
     fn make_test_tile(s3_path: &str) -> CogTile {
+        let bounds_wgs84 = [-122.0, 37.0, -121.0, 38.0];
         CogTile {
             tile_id: "test".to_string(),
             s3_path: s3_path.to_string(),
             crs: "EPSG:32610".to_string(),
             bounds_native: [0.0, 0.0, 81920.0, 81920.0],
-            bounds_wgs84: [-122.0, 37.0, -121.0, 38.0],
+            bounds_wgs84,
+            footprint_wgs84: CogTile::footprint_from_wgs84_bounds(&bounds_wgs84),
             resolution: 10.0,
             year: 2024,
         }
@@ -1152,12 +1154,14 @@ mod integration_tests {
     }
 
     fn get_aef_test_tile() -> CogTile {
+        let bounds_wgs84 = [-123.0, 37.006, -122.07, 37.748];
         CogTile {
             tile_id: "test_sf_2024".to_string(),
             s3_path: "s3://us-west-2.opendata.source.coop/tge-labs/aef/v1/annual/2024/10N/xcyo46pot2fg6a61t-0000000000-0000000000.tiff".to_string(),
             crs: "EPSG:32610".to_string(),
             bounds_native: [500000.0, 4096000.0, 581920.0, 4177920.0],
-            bounds_wgs84: [-123.0, 37.006, -122.07, 37.748],
+            bounds_wgs84,
+            footprint_wgs84: CogTile::footprint_from_wgs84_bounds(&bounds_wgs84),
             resolution: 10.0,
             year: 2024,
         }

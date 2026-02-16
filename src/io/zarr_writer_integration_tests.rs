@@ -331,12 +331,14 @@ async fn test_mosaic_to_write_flow() {
     let writer = ZarrWriter::create(store, "", grid, &config).await.unwrap();
 
     // Create mock WindowData like production COG reads would produce
+    let bounds_wgs84 = [-122.5, 36.5, -122.0, 37.0];
     let tile = CogTile {
         tile_id: "test-tile".to_string(),
         s3_path: "s3://test/tile.tif".to_string(),
         crs: "EPSG:32610".to_string(),
         bounds_native: [500000.0, 4000000.0, 502560.0, 4002560.0],
-        bounds_wgs84: [-122.5, 36.5, -122.0, 37.0],
+        bounds_wgs84,
+        footprint_wgs84: CogTile::footprint_from_wgs84_bounds(&bounds_wgs84),
         resolution: 10.0,
         year: 2024,
     };
@@ -417,12 +419,14 @@ async fn test_concurrent_mosaic_writes() {
             let w = writer.clone();
             async move {
                 // Create mock window data
+                let bounds_wgs84 = [-122.5, 36.5, -122.0, 37.0];
                 let tile = CogTile {
                     tile_id: format!("tile-{}-{}", chunk.row_idx, chunk.col_idx),
                     s3_path: "s3://test/tile.tif".to_string(),
                     crs: "EPSG:32610".to_string(),
                     bounds_native: [500000.0, 4000000.0, 501280.0, 4001280.0],
-                    bounds_wgs84: [-122.5, 36.5, -122.0, 37.0],
+                    bounds_wgs84,
+                    footprint_wgs84: CogTile::footprint_from_wgs84_bounds(&bounds_wgs84),
                     resolution: 10.0,
                     year: 2024,
                 };
