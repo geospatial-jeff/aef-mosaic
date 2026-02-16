@@ -1,0 +1,30 @@
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["osx-arm64", "linux-64"]
+
+[tool.pixi.tasks]
+check = { cmd = "cargo check", env = { PKG_CONFIG_PATH = "$PIXI_PROJECT_ROOT/.pixi/envs/default/lib/pkgconfig", RUSTFLAGS = "-C link-arg=-Wl,-rpath,$PIXI_PROJECT_ROOT/.pixi/envs/default/lib" } }
+clippy = { cmd = "cargo clippy --all-targets", env = { PKG_CONFIG_PATH = "$PIXI_PROJECT_ROOT/.pixi/envs/default/lib/pkgconfig", RUSTFLAGS = "-C link-arg=-Wl,-rpath,$PIXI_PROJECT_ROOT/.pixi/envs/default/lib" } }
+build = { cmd = "cargo build --release", env = { PKG_CONFIG_PATH = "$PIXI_PROJECT_ROOT/.pixi/envs/default/lib/pkgconfig", RUSTFLAGS = "-C link-arg=-Wl,-rpath,$PIXI_PROJECT_ROOT/.pixi/envs/default/lib" } }
+test = { cmd = "cargo test", env = { PKG_CONFIG_PATH = "$PIXI_PROJECT_ROOT/.pixi/envs/default/lib/pkgconfig", RUSTFLAGS = "-C link-arg=-Wl,-rpath,$PIXI_PROJECT_ROOT/.pixi/envs/default/lib", PROJ_DATA = "$PIXI_PROJECT_ROOT/.pixi/envs/default/share/proj", GDAL_DATA = "$PIXI_PROJECT_ROOT/.pixi/envs/default/share/gdal" } }
+test-integration = { cmd = "cargo test -- --ignored", env = { PKG_CONFIG_PATH = "$PIXI_PROJECT_ROOT/.pixi/envs/default/lib/pkgconfig", RUSTFLAGS = "-C link-arg=-Wl,-rpath,$PIXI_PROJECT_ROOT/.pixi/envs/default/lib", PROJ_DATA = "$PIXI_PROJECT_ROOT/.pixi/envs/default/share/proj", GDAL_DATA = "$PIXI_PROJECT_ROOT/.pixi/envs/default/share/gdal" } }
+mosaic = { cmd = "./target/release/aef-mosaic", env = { PROJ_DATA = "$PIXI_PROJECT_ROOT/.pixi/envs/default/share/proj", GDAL_DATA = "$PIXI_PROJECT_ROOT/.pixi/envs/default/share/gdal" }, depends-on = ["build"] }
+analyze = { cmd = "./target/release/aef-mosaic analyze", env = { PROJ_DATA = "$PIXI_PROJECT_ROOT/.pixi/envs/default/share/proj", GDAL_DATA = "$PIXI_PROJECT_ROOT/.pixi/envs/default/share/gdal" }, depends-on = ["build"] }
+validate = { cmd = "./target/release/aef-mosaic validate", env = { PROJ_DATA = "$PIXI_PROJECT_ROOT/.pixi/envs/default/share/proj", GDAL_DATA = "$PIXI_PROJECT_ROOT/.pixi/envs/default/share/gdal" }, depends-on = ["build"] }
+validate-output = { cmd = "python scripts/validate_output.py", env = { PROJ_DATA = "$PIXI_PROJECT_ROOT/.pixi/envs/default/share/proj", GDAL_DATA = "$PIXI_PROJECT_ROOT/.pixi/envs/default/share/gdal" } }
+e2e-test = { cmd = "python scripts/validate_output.py", env = { PROJ_DATA = "$PIXI_PROJECT_ROOT/.pixi/envs/default/share/proj", GDAL_DATA = "$PIXI_PROJECT_ROOT/.pixi/envs/default/share/gdal" }, depends-on = ["mosaic"] }
+
+[tool.pixi.dependencies]
+rust = ">=1.93.0,<1.94"
+proj = ">=9.7.1,<10"
+libgdal = ">=3.10.0,<4"
+libclang = ">=19.1.0"
+rasterio = ">=1.5.0,<2"
+tifffile = ">=2026.1.28,<2027"
+s3fs = ">=2026.2.0,<2027"
+pyarrow = ">=23.0.0,<24"
+pandas = ">=3.0.0,<4"
+xarray = ">=2026.1.0"
+zarr = ">=3.0.0"
+numpy = ">=2.0.0"
+pyproj = ">=3.7.0"
