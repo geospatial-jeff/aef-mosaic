@@ -151,7 +151,7 @@ mod tests {
         assert!(result.is_err());
 
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("Missing required AWS credentials"));
+        assert!(err.contains("Missing AWS credentials"));
     }
 
     #[test]
