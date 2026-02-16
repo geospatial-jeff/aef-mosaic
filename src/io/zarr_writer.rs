@@ -148,8 +148,9 @@ impl ZarrWriter {
         );
 
         // Add time dimension metadata
-        attributes.insert("start_year".to_string(), serde_json::json!(output_grid.start_year));
-        attributes.insert("num_years".to_string(), serde_json::json!(output_grid.num_years));
+        attributes.insert("start_year".to_string(), serde_json::json!(output_grid.start_year()));
+        attributes.insert("num_years".to_string(), serde_json::json!(output_grid.num_years()));
+        attributes.insert("years".to_string(), serde_json::json!(output_grid.years));
 
         // Add band names (AEF convention: A00, A01, ..., A63)
         let band_names: Vec<String> = (0..output_grid.num_bands)
@@ -266,9 +267,7 @@ impl ZarrWriter {
             .map(|i| output_grid.bounds[3] - (i as f64 + 0.5) * output_grid.resolution)
             .collect();
 
-        let time_coords: Vec<i32> = (0..output_grid.num_years)
-            .map(|i| output_grid.start_year + i as i32)
-            .collect();
+        let time_coords: Vec<i32> = output_grid.years.clone();
 
         // Create x coordinate array
         let x_path = if path.is_empty() { "/x".to_string() } else { format!("/{}/x", path) };
@@ -298,9 +297,10 @@ impl ZarrWriter {
 
         // Create time coordinate array
         let time_path = if path.is_empty() { "/time".to_string() } else { format!("/{}/time", path) };
+        let num_years = output_grid.num_years();
         let time_array = ArrayBuilder::new(
-            vec![output_grid.num_years as u64],
-            vec![output_grid.num_years as u64], // Single chunk
+            vec![num_years as u64],
+            vec![num_years as u64], // Single chunk
             "int32",
             0i32,
         )
@@ -375,8 +375,7 @@ mod integration_tests {
             bounds: [0.0, 0.0, width as f64 * 10.0, height as f64 * 10.0],
             crs: "EPSG:4326".to_string(),
             resolution: 10.0,
-            num_years: 1,
-            start_year: 2024,
+            years: vec![2024],
             num_bands: 4,
             height,
             width,
@@ -573,8 +572,7 @@ mod production_test {
             bounds: [0.0, 0.0, 80.0, 80.0],
             crs: "EPSG:4326".to_string(),
             resolution: 10.0,
-            num_years: 1,
-            start_year: 2024,
+            years: vec![2024],
             num_bands: 4,
             height: 8,
             width: 8,
@@ -602,7 +600,7 @@ mod production_test {
         let chunk_path = test_dir.join("embeddings").join("c").join("0").join("0").join("0").join("0");
         println!("Looking for chunk at: {:?}", chunk_path);
         println!("Directory contents:");
-        
+
         fn list_recursive(path: &std::path::PathBuf, depth: usize) {
             if let Ok(entries) = std::fs::read_dir(path) {
                 for entry in entries.flatten() {
@@ -618,7 +616,7 @@ mod production_test {
         list_recursive(&test_dir, 0);
 
         assert!(chunk_path.exists(), "Chunk should exist at {:?}", chunk_path);
-        
+
         // Cleanup
         std::fs::remove_dir_all(&test_dir).ok();
     }
@@ -669,8 +667,7 @@ mod production_test {
             bounds: [0.0, 0.0, 80.0, 80.0],
             crs: "EPSG:4326".to_string(),
             resolution: 10.0,
-            num_years: 1,
-            start_year: 2024,
+            years: vec![2024],
             num_bands: 4,
             height: 8,
             width: 8,
@@ -771,8 +768,7 @@ mod concurrent_test {
             bounds: [0.0, 0.0, 80.0, 80.0],
             crs: "EPSG:4326".to_string(),
             resolution: 10.0,
-            num_years: 1,
-            start_year: 2024,
+            years: vec![2024],
             num_bands: 4,
             height: 8,
             width: 8,
