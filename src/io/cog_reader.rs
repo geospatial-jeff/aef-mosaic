@@ -358,15 +358,10 @@ struct TileDataCache {
 impl TileDataCache {
     /// Create a new tile cache with the specified maximum size in bytes.
     fn new(max_bytes: u64, metrics: Option<Arc<Metrics>>) -> Self {
-        // Estimate initial capacity based on typical tile size (~16 MB for 512x512 tiles with 64 bands)
-        let estimated_tile_size: u64 = 16 * 1024 * 1024;
-        let initial_capacity = (max_bytes / estimated_tile_size) as usize;
-        let capacity = initial_capacity.max(1000);
-
+        // Use unbounded LruCache - we manage eviction by bytes, not entry count
+        // NonZeroUsize::MAX effectively makes it unbounded
         Self {
-            cache: RwLock::new(LruCache::new(
-                NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::new(1000).unwrap()),
-            )),
+            cache: RwLock::new(LruCache::unbounded()),
             in_flight: DashMap::new(),
             max_bytes,
             current_bytes: std::sync::atomic::AtomicU64::new(0),
@@ -374,18 +369,16 @@ impl TileDataCache {
         }
     }
 
-    /// Evict old entries if needed to make room for a new tile.
-    async fn evict_if_needed(&self, new_tile_size: u64) {
+    /// Insert a tile into the cache, evicting old entries if needed.
+    /// This holds the lock for the entire operation to prevent races.
+    async fn insert(&self, key: TileCacheKey, tile: Arc<TileArray>) {
         use std::sync::atomic::Ordering;
 
-        let current = self.current_bytes.load(Ordering::Relaxed);
-        if current + new_tile_size <= self.max_bytes {
-            return;
-        }
-
-        // Need to evict - remove LRU entries until we have enough space
+        let tile_size = tile.size_bytes() as u64;
         let mut cache = self.cache.write().await;
-        while self.current_bytes.load(Ordering::Relaxed) + new_tile_size > self.max_bytes {
+
+        // Evict LRU entries until we have room
+        while self.current_bytes.load(Ordering::Relaxed) + tile_size > self.max_bytes {
             if let Some((_, evicted)) = cache.pop_lru() {
                 let evicted_size = evicted.size_bytes() as u64;
                 self.current_bytes.fetch_sub(evicted_size, Ordering::Relaxed);
@@ -393,12 +386,17 @@ impl TileDataCache {
                 break; // Cache is empty
             }
         }
+
+        // Insert the new tile
+        cache.put(key, tile);
+        self.current_bytes.fetch_add(tile_size, Ordering::Relaxed);
     }
 
-    /// Add bytes to the current size tracking.
-    fn add_bytes(&self, bytes: u64) {
+    /// Get current cache size in bytes.
+    #[allow(dead_code)]
+    fn current_bytes(&self) -> u64 {
         use std::sync::atomic::Ordering;
-        self.current_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.current_bytes.load(Ordering::Relaxed)
     }
 }
 
@@ -664,13 +662,8 @@ impl CogReader {
                 let tile_arc = Arc::new(tile);
                 let tile_size = tile_arc.size_bytes() as u64;
 
-                // Evict old entries if needed, then cache it
-                self.tile_cache.evict_if_needed(tile_size).await;
-                {
-                    let mut cache = self.tile_cache.cache.write().await;
-                    cache.put(key.clone(), tile_arc.clone());
-                }
-                self.tile_cache.add_bytes(tile_size);
+                // Insert into cache (handles eviction atomically)
+                self.tile_cache.insert(key.clone(), tile_arc.clone()).await;
 
                 if let Some(ref m) = self.metrics {
                     m.add_tile_cache_bytes(tile_size);
