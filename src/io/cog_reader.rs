@@ -868,10 +868,26 @@ struct TileArray {
     actual_height: usize,
 }
 
+/// Expected tile size for AEF COGs: 512 × 512 × 64 bands × 1 byte = 16 MB
+const EXPECTED_TILE_SIZE_BYTES: usize = 512 * 512 * 64;
+
 impl TileArray {
-    /// Estimate memory size of this tile in bytes.
+    /// Memory size of this tile in bytes.
     fn size_bytes(&self) -> usize {
-        self.data.data().as_ref().len() + std::mem::size_of::<Self>()
+        let data_len = self.data.data().as_ref().len();
+
+        // Log warning if tile size is unexpectedly large (>2x expected)
+        if data_len > EXPECTED_TILE_SIZE_BYTES * 2 {
+            tracing::warn!(
+                "Tile size {} MB exceeds expected {} MB ({}x{} pixels)",
+                data_len / (1024 * 1024),
+                EXPECTED_TILE_SIZE_BYTES / (1024 * 1024),
+                self.actual_width,
+                self.actual_height
+            );
+        }
+
+        data_len + std::mem::size_of::<Self>()
     }
 }
 
