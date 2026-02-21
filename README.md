@@ -64,8 +64,8 @@ output:
   # bucket: "output-bucket"
   # prefix: "zarr/aef-mosaic"
 
-  crs: "EPSG:6933"           # EASE-Grid 2.0 (equal-area)
-  resolution: 10.0           # meters
+  crs: "EPSG:4326"           # WGS84 geographic (pixels shrink E-W toward poles)
+  resolution: 0.00009        # degrees (~10m at equator)
   num_years: 1               # time dimension size
   start_year: 2024           # first year
   num_bands: 64              # embedding dimensions
@@ -155,6 +155,6 @@ Geospatial attributes follow both CF Conventions and GeoZarr `proj:` namespace:
 import xarray as xr
 
 ds = xr.open_zarr("/tmp/aef-mosaic.zarr")
-print(ds.embeddings.attrs['crs'])        # "EPSG:6933"
-print(ds.embeddings.attrs['proj:code'])  # "EPSG:6933" (GeoZarr)
+print(ds.embeddings.attrs['crs'])        # "EPSG:4326"
+print(ds.embeddings.attrs['proj:code'])  # "EPSG:4326" (GeoZarr)
 ```

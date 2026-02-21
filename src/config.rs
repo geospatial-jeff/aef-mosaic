@@ -59,7 +59,7 @@ pub struct OutputConfig {
     #[serde(default)]
     pub prefix: Option<String>,
 
-    /// Output CRS (default: EPSG:6933 - EASE-Grid 2.0 Global, equal-area)
+    /// Output CRS (default: EPSG:4326 - WGS84 geographic)
     #[serde(default = "default_output_crs")]
     pub crs: String,
 
@@ -339,7 +339,7 @@ impl Config {
 }
 
 // Default value functions for serde
-fn default_output_crs() -> String { "EPSG:6933".to_string() }
+fn default_output_crs() -> String { "EPSG:4326".to_string() }
 fn default_resolution() -> f64 { 10.0 }
 fn default_time_chunks() -> usize { 1 }
 fn default_embedding_chunks() -> usize { 64 }
@@ -385,7 +385,7 @@ mod tests {
                 local_path: None,
                 bucket: Some("output-bucket".to_string()),
                 prefix: Some("zarr/".to_string()),
-                crs: "EPSG:6933".to_string(),
+                crs: "EPSG:4326".to_string(),
                 resolution: 10.0,
                 num_bands: 64,
                 chunk_shape: ChunkShape::default(),
@@ -410,7 +410,7 @@ mod tests {
                 local_path: Some("/tmp/output.zarr".to_string()),
                 bucket: None,
                 prefix: None,
-                crs: "EPSG:6933".to_string(),
+                crs: "EPSG:4326".to_string(),
                 resolution: 10.0,
                 num_bands: 64,
                 chunk_shape: ChunkShape::default(),
@@ -436,7 +436,7 @@ mod tests {
                 local_path: Some("/tmp/output.zarr".to_string()),
                 bucket: Some("bucket".to_string()),
                 prefix: None,
-                crs: "EPSG:6933".to_string(),
+                crs: "EPSG:4326".to_string(),
                 resolution: 10.0,
                 num_bands: 64,
                 chunk_shape: ChunkShape::default(),
@@ -462,7 +462,7 @@ mod tests {
                 local_path: Some("/tmp/output.zarr".to_string()),
                 bucket: None,
                 prefix: None,
-                crs: "EPSG:6933".to_string(),
+                crs: "EPSG:4326".to_string(),
                 resolution: 10.0,
                 num_bands: 64,
                 chunk_shape: ChunkShape::default(),
@@ -493,7 +493,7 @@ mod tests {
                 local_path: Some("/tmp/output.zarr".to_string()),
                 bucket: None,
                 prefix: None,
-                crs: "EPSG:6933".to_string(),
+                crs: "EPSG:4326".to_string(),
                 resolution: 10.0,
                 num_bands: 64,
                 chunk_shape: ChunkShape {

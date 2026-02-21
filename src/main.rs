@@ -263,12 +263,13 @@ output:
   # bucket: "output-bucket"
   # prefix: "zarr/aef-mosaic"
 
-  # Output CRS - EPSG:6933 is EASE-Grid 2.0 (equal-area, global)
-  # Every pixel represents the same area regardless of latitude
-  crs: "EPSG:6933"
+  # Output CRS - EPSG:4326 is WGS84 geographic coordinates
+  # Note: pixel size in degrees means pixels shrink in the east-west direction
+  # toward the poles. Use EPSG:6933 for equal-area pixels.
+  crs: "EPSG:4326"
 
-  # Pixel size in CRS units (meters for EPSG:6933)
-  resolution: 10.0
+  # Pixel size in degrees (0.00009° ≈ 10m at equator, but smaller E-W at higher latitudes)
+  resolution: 0.00009
 
   # Zarr chunk dimensions: (time, embedding, height, width)
   chunk_shape:
