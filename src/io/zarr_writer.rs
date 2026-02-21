@@ -88,22 +88,56 @@ impl ZarrWriter {
         // Build the array - zarrs requires paths to start with /
         let array_path = if path.is_empty() { "/embeddings".to_string() } else { format!("/{}/embeddings", path) };
 
-        let chunk_grid = vec![
-            chunk_shape.time as u64,
-            chunk_shape.embedding as u64,
-            chunk_shape.height as u64,
-            chunk_shape.width as u64,
-        ];
-
         // Use -128 as fill value to match AEF COG nodata convention
         const NODATA: i8 = -128;
 
+        // When sharding is enabled:
+        // - chunk_grid = shard size (chunk_shape * shard_shape)
+        // - subchunk_shape = chunk size (chunk_shape)
+        // When sharding is disabled:
+        // - chunk_grid = chunk size (chunk_shape)
+        let sharding = &config.output.sharding;
+        let chunk_grid = if sharding.enabled {
+            // Shard size = chunk size * number of chunks per shard
+            vec![
+                chunk_shape.time as u64,
+                chunk_shape.embedding as u64,
+                (chunk_shape.height * sharding.shard_shape[0]) as u64,
+                (chunk_shape.width * sharding.shard_shape[1]) as u64,
+            ]
+        } else {
+            vec![
+                chunk_shape.time as u64,
+                chunk_shape.embedding as u64,
+                chunk_shape.height as u64,
+                chunk_shape.width as u64,
+            ]
+        };
+
         let mut builder = ArrayBuilder::new(
             vec![shape[0] as u64, shape[1] as u64, shape[2] as u64, shape[3] as u64],
-            chunk_grid,
+            chunk_grid.clone(),
             "int8",  // Data type as string
             NODATA,  // Fill value matches AEF COG nodata
         );
+
+        // Configure sharding if enabled
+        if sharding.enabled {
+            // subchunk_shape = chunk size (the inner chunk within the shard)
+            builder.subchunk_shape(vec![
+                chunk_shape.time as u64,
+                chunk_shape.embedding as u64,
+                chunk_shape.height as u64,
+                chunk_shape.width as u64,
+            ]);
+            tracing::info!(
+                "Sharding enabled: shard shape [{}, {}, {}, {}], chunk shape [{}, {}, {}, {}]",
+                chunk_shape.time, chunk_shape.embedding,
+                chunk_shape.height * sharding.shard_shape[0],
+                chunk_shape.width * sharding.shard_shape[1],
+                chunk_shape.time, chunk_shape.embedding, chunk_shape.height, chunk_shape.width
+            );
+        }
 
         // Add dimension names
         builder.dimension_names(Some(vec![
@@ -361,6 +395,10 @@ mod integration_tests {
                 crs: "EPSG:4326".to_string(),
                 resolution: 10.0,
                 chunk_shape,
+                sharding: crate::config::ShardingConfig {
+                    enabled: false, // Disable sharding for existing tests
+                    shard_shape: [16, 16],
+                },
                 num_bands: 4,
                 compression_level: 3,
             },
@@ -556,6 +594,10 @@ mod production_test {
                 crs: "EPSG:4326".to_string(),
                 resolution: 10.0,
                 chunk_shape: chunk_shape.clone(),
+                sharding: crate::config::ShardingConfig {
+                    enabled: false,
+                    shard_shape: [16, 16],
+                },
                 num_bands: 4,
                 compression_level: 3,
             },
@@ -647,6 +689,10 @@ mod production_test {
                 crs: "EPSG:4326".to_string(),
                 resolution: 10.0,
                 chunk_shape: chunk_shape.clone(),
+                sharding: crate::config::ShardingConfig {
+                    enabled: false,
+                    shard_shape: [16, 16],
+                },
                 num_bands: 4,
                 compression_level: 3,
             },
@@ -744,6 +790,10 @@ mod concurrent_test {
                 crs: "EPSG:4326".to_string(),
                 resolution: 10.0,
                 chunk_shape: chunk_shape.clone(),
+                sharding: crate::config::ShardingConfig {
+                    enabled: false,
+                    shard_shape: [16, 16],
+                },
                 num_bands: 4,
                 compression_level: 3,
             },

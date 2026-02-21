@@ -281,12 +281,13 @@ mod tests {
         let grid = create_test_grid();
 
         // 10 degrees at 0.0001 resolution = 100,000 raw pixels
-        // Rounded up to chunk boundary: ceil(100,000/1024) = 98 chunks
-        // 98 * 1024 = 100,352 pixels (chunk-aligned)
-        assert_eq!(grid.chunk_counts[2], 98);
-        assert_eq!(grid.chunk_counts[3], 98);
-        assert_eq!(grid.width, 98 * 1024);  // 100,352
-        assert_eq!(grid.height, 98 * 1024); // 100,352
+        // Default chunk size is 256
+        // Rounded up to chunk boundary: ceil(100,000/256) = 391 chunks
+        // 391 * 256 = 100,096 pixels (chunk-aligned)
+        assert_eq!(grid.chunk_counts[2], 391);
+        assert_eq!(grid.chunk_counts[3], 391);
+        assert_eq!(grid.width, 391 * 256);  // 100,096
+        assert_eq!(grid.height, 391 * 256); // 100,096
     }
 
     #[test]
@@ -351,17 +352,23 @@ mod tests {
         let grid = OutputGrid::new(
             [0.0, 0.0, 10.0, 10.0],
             crs::codes::WGS84.to_string(),
-            0.01, // 1000x1000 grid
+            0.01, // 1000x1000 raw grid, rounded to 1024x1024
             vec![2024],
             64,
-            ChunkShape::default(),
+            ChunkShape {
+                time: 1,
+                embedding: 64,
+                height: 1024,
+                width: 1024,
+            },
         ).unwrap();
 
         // Test a point in the middle
         let (x, y) = (5.0, 5.0);
         let (row, col) = grid.crs_to_pixel(x, y);
 
-        // Should be roughly in the middle
+        // Should be roughly in the middle of aligned grid (1024x1024)
+        // Middle of 1024 is around 512, but coords (5,5) in [0,10] is at 50%
         assert!(row > 400 && row < 600, "row {} not in expected range", row);
         assert!(col > 400 && col < 600, "col {} not in expected range", col);
 
@@ -381,7 +388,12 @@ mod tests {
             0.01,
             vec![2024],
             64,
-            ChunkShape::default(),
+            ChunkShape {
+                time: 1,
+                embedding: 64,
+                height: 1024,
+                width: 1024,
+            },
         ).unwrap();
 
         // Test coordinates outside bounds are clamped
