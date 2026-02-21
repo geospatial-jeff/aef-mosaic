@@ -4,6 +4,49 @@ use crate::config::ChunkShape;
 use crate::crs;
 use anyhow::Result;
 
+/// Convert (x, y) coordinates to a Hilbert curve index.
+///
+/// This implementation works for any grid size by using the smallest power of 2
+/// that contains both dimensions. The Hilbert curve keeps spatially adjacent
+/// points close in the 1D index, which improves cache locality when processing
+/// chunks that share underlying data.
+///
+/// Algorithm based on the standard Hilbert curve construction.
+fn hilbert_index(x: usize, y: usize, order: u32) -> u64 {
+    let mut x = x as i64;
+    let mut y = y as i64;
+    let mut d: u64 = 0;
+
+    let mut s: i64 = (1i64 << order) / 2;
+    while s > 0 {
+        let rx = if (x & s) > 0 { 1i64 } else { 0 };
+        let ry = if (y & s) > 0 { 1i64 } else { 0 };
+        d += (s * s) as u64 * ((3 * rx) ^ ry) as u64;
+
+        // Rotate quadrant
+        if ry == 0 {
+            if rx == 1 {
+                x = s - 1 - x;
+                y = s - 1 - y;
+            }
+            std::mem::swap(&mut x, &mut y);
+        }
+        s /= 2;
+    }
+    d
+}
+
+/// Calculate the Hilbert curve order needed to cover a grid of given dimensions.
+fn hilbert_order_for_grid(rows: usize, cols: usize) -> u32 {
+    let max_dim = rows.max(cols);
+    if max_dim <= 1 {
+        return 1;
+    }
+    // Find smallest power of 2 >= max_dim
+    let bits_needed = 64 - (max_dim - 1).leading_zeros();
+    bits_needed.max(1)
+}
+
 /// A single output chunk in the Zarr array.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OutputChunk {
@@ -169,8 +212,40 @@ impl OutputGrid {
         self.years.first().copied().unwrap_or(2024)
     }
 
-    /// Enumerate all output chunks.
+    /// Enumerate all output chunks in Hilbert curve order.
+    ///
+    /// Hilbert curve ordering keeps spatially adjacent chunks close in the
+    /// iteration sequence, which improves cache locality when chunks share
+    /// underlying COG tiles. This can significantly improve cache hit rates
+    /// compared to row-major ordering.
     pub fn enumerate_chunks(&self) -> impl Iterator<Item = OutputChunk> + '_ {
+        let num_rows = self.chunk_counts[2];
+        let num_cols = self.chunk_counts[3];
+        let order = hilbert_order_for_grid(num_rows, num_cols);
+
+        // Generate all chunks for each time index, sorted by Hilbert index
+        (0..self.chunk_counts[0]).flat_map(move |time_idx| {
+            // Collect all spatial chunks with their Hilbert indices
+            let mut chunks: Vec<(u64, OutputChunk)> = (0..num_rows)
+                .flat_map(|row_idx| {
+                    (0..num_cols).map(move |col_idx| {
+                        let h_idx = hilbert_index(col_idx, row_idx, order);
+                        (h_idx, OutputChunk { time_idx, row_idx, col_idx })
+                    })
+                })
+                .collect();
+
+            // Sort by Hilbert index
+            chunks.sort_by_key(|(h_idx, _)| *h_idx);
+
+            // Return just the chunks
+            chunks.into_iter().map(|(_, chunk)| chunk)
+        })
+    }
+
+    /// Enumerate all output chunks in row-major order (legacy ordering).
+    #[allow(dead_code)]
+    pub fn enumerate_chunks_row_major(&self) -> impl Iterator<Item = OutputChunk> + '_ {
         (0..self.chunk_counts[0]).flat_map(move |time_idx| {
             (0..self.chunk_counts[2]).flat_map(move |row_idx| {
                 (0..self.chunk_counts[3]).map(move |col_idx| OutputChunk {
