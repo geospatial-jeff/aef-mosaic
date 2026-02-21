@@ -116,13 +116,14 @@ pub async fn run_pipeline(config: Config) -> Result<PipelineStats> {
     );
 
     // Create output grid
+    // Use effective_chunk_shape which returns shard size when sharding is enabled
     let output_grid = Arc::new(OutputGrid::new(
         bounds,
         config.output.crs.clone(),
         config.output.resolution,
         years,
         config.output.num_bands,
-        config.output.chunk_shape.clone(),
+        config.output.effective_chunk_shape(),
     )?);
 
     tracing::info!(

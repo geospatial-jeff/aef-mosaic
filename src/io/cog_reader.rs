@@ -341,7 +341,7 @@ impl TiffMetadataCache {
 /// Key for tile cache: (cog_path, tile_x, tile_y)
 type TileCacheKey = (String, usize, usize);
 
-/// Cached decoded tile with single-flight support and memory-based eviction.
+/// Cached decoded tile with memory-based eviction and single-flight deduplication.
 struct TileDataCache {
     /// LRU cache for decoded tiles
     cache: RwLock<LruCache<TileCacheKey, Arc<TileArray>>>,
@@ -539,24 +539,24 @@ impl CogReader {
             num_tiles_x, num_tiles_y
         );
 
-        // Step 3: Fetch all needed tiles in parallel (with caching and single-flight)
-        let mut tile_futures = Vec::with_capacity(num_tiles_x * num_tiles_y);
-        for ty in start_tile_y..=end_tile_y {
-            for tx in start_tile_x..=end_tile_x {
-                tile_futures.push(self.get_tile(
+        // Step 3: Fetch all rows in parallel (each row is one coalesced HTTP request)
+        let row_futures: Vec<_> = (start_tile_y..=end_tile_y)
+            .map(|ty| {
+                self.fetch_tiles_for_row(
                     &tile.s3_path,
                     &cached,
-                    tx,
                     ty,
+                    start_tile_x..=end_tile_x,
                     tile_width,
                     tile_height,
                     image_width,
                     image_height,
-                ));
-            }
-        }
+                )
+            })
+            .collect();
 
-        let fetched_tiles = try_join_all(tile_futures).await?;
+        let row_results = try_join_all(row_futures).await?;
+        let fetched_tiles: Vec<_> = row_results.into_iter().flatten().collect();
 
         // Step 4: Assemble tiles into a single array
         let assembled_x = start_tile_x * tile_width;
@@ -603,151 +603,215 @@ impl CogReader {
         })
     }
 
-    /// Get a single tile with caching and single-flight deduplication.
+    /// Fetch all tiles in a single row with request coalescing and single-flight deduplication.
+    ///
+    /// This method:
+    /// 1. Returns cached tiles immediately
+    /// 2. Waits for in-flight tiles (single-flight pattern)
+    /// 3. Fetches remaining tiles with a single coalesced HTTP request
     #[allow(clippy::too_many_arguments)]
-    async fn get_tile(
+    async fn fetch_tiles_for_row(
         &self,
         cog_path: &str,
         cached: &Arc<CachedTiff>,
-        tx: usize,
         ty: usize,
+        tx_range: std::ops::RangeInclusive<usize>,
         tile_width: usize,
         tile_height: usize,
         image_width: usize,
         image_height: usize,
-    ) -> Result<Arc<TileArray>> {
-        let key = (cog_path.to_string(), tx, ty);
+    ) -> Result<Vec<Arc<TileArray>>> {
+        let tx_vec: Vec<usize> = tx_range.collect();
+        let mut results: Vec<Option<Arc<TileArray>>> = vec![None; tx_vec.len()];
 
-        // 1. Check cache (fast path)
+        // Track tiles we need to wait for (in-flight) vs fetch ourselves
+        let mut wait_futures: Vec<(usize, broadcast::Receiver<Result<Arc<TileArray>, String>>)> = Vec::new();
+        let mut to_fetch_indices: Vec<usize> = Vec::new();
+        let mut to_fetch_tx: Vec<usize> = Vec::new();
+        let mut senders: Vec<(usize, usize, broadcast::Sender<Result<Arc<TileArray>, String>>)> = Vec::new();
+
+        // 1. Check cache and in-flight status for each tile
         {
             let mut cache = self.tile_cache.cache.write().await;
-            if let Some(tile) = cache.get(&key) {
+            for (i, &tx) in tx_vec.iter().enumerate() {
+                let key = (cog_path.to_string(), tx, ty);
+
+                // Check cache first
+                if let Some(tile) = cache.get(&key) {
+                    if let Some(ref m) = self.tile_cache.metrics {
+                        m.add_tile_cache_hit();
+                    }
+                    results[i] = Some(tile.clone());
+                    continue;
+                }
+
+                // Check if in-flight (someone else is fetching)
+                if let Some(sender_ref) = self.tile_cache.in_flight.get(&key) {
+                    let rx = sender_ref.subscribe();
+                    drop(sender_ref);
+                    if let Some(ref m) = self.tile_cache.metrics {
+                        m.add_tile_cache_coalesced();
+                    }
+                    wait_futures.push((i, rx));
+                    continue;
+                }
+
+                // Not cached, not in-flight - we'll fetch it
+                // Register as in-flight before releasing any locks
+                let (tx_sender, _) = broadcast::channel(16);
+                self.tile_cache.in_flight.insert(key, tx_sender.clone());
+                senders.push((i, tx, tx_sender));
+                to_fetch_indices.push(i);
+                to_fetch_tx.push(tx);
+
                 if let Some(ref m) = self.tile_cache.metrics {
-                    m.add_tile_cache_hit();
+                    m.add_tile_cache_miss();
                 }
-                return Ok(tile.clone());
             }
         }
 
-        // 2. Check if already in-flight (single-flight pattern)
-        if let Some(sender_ref) = self.tile_cache.in_flight.get(&key) {
-            let mut rx = sender_ref.subscribe();
-            drop(sender_ref);
+        // 2. Fetch tiles we're responsible for (if any)
+        if !to_fetch_tx.is_empty() {
+            let fetch_result = self.fetch_and_decode_tiles(
+                cog_path,
+                cached,
+                ty,
+                &to_fetch_tx,
+                tile_width,
+                tile_height,
+                image_width,
+                image_height,
+            ).await;
 
-            if let Some(ref m) = self.tile_cache.metrics {
-                m.add_tile_cache_coalesced();
-            }
+            match fetch_result {
+                Ok(decoded_tiles) => {
+                    // Cache and notify waiters
+                    for (i, tile) in decoded_tiles.into_iter().enumerate() {
+                        let (result_idx, tx, sender) = &senders[i];
+                        let tile_arc = Arc::new(tile);
+                        let tile_size = tile_arc.size_bytes() as u64;
 
-            return match rx.recv().await {
-                Ok(Ok(tile)) => Ok(tile),
-                Ok(Err(e)) => Err(anyhow::anyhow!("Coalesced fetch failed: {}", e)),
-                Err(e) => Err(anyhow::anyhow!("Broadcast channel error: {}", e)),
-            };
-        }
+                        // Insert into cache
+                        let key = (cog_path.to_string(), *tx, ty);
+                        self.tile_cache.insert(key.clone(), tile_arc.clone()).await;
 
-        // 3. Register in-flight and fetch
-        let (tx_sender, _) = broadcast::channel(16);
-        self.tile_cache.in_flight.insert(key.clone(), tx_sender.clone());
+                        if let Some(ref m) = self.metrics {
+                            m.add_tile_cache_bytes(tile_size);
+                        }
 
-        if let Some(ref m) = self.tile_cache.metrics {
-            m.add_tile_cache_miss();
-        }
+                        // Remove from in-flight and notify waiters
+                        self.tile_cache.in_flight.remove(&key);
+                        let _ = sender.send(Ok(tile_arc.clone()));
 
-        // 4. Fetch the tile
-        let result = self.fetch_single_tile(cached, tx, ty, tile_width, tile_height, image_width, image_height).await;
-
-        // 5. Handle result
-        match result {
-            Ok(tile) => {
-                let tile_arc = Arc::new(tile);
-                let tile_size = tile_arc.size_bytes() as u64;
-
-                // Insert into cache (handles eviction atomically)
-                self.tile_cache.insert(key.clone(), tile_arc.clone()).await;
-
-                if let Some(ref m) = self.metrics {
-                    m.add_tile_cache_bytes(tile_size);
+                        results[*result_idx] = Some(tile_arc);
+                    }
                 }
-
-                // Notify waiters and remove from in-flight
-                self.tile_cache.in_flight.remove(&key);
-                let _ = tx_sender.send(Ok(tile_arc.clone()));
-
-                Ok(tile_arc)
-            }
-            Err(e) => {
-                // Notify waiters and remove from in-flight
-                self.tile_cache.in_flight.remove(&key);
-                let _ = tx_sender.send(Err(e.to_string()));
-
-                Err(e)
+                Err(e) => {
+                    // Notify waiters of failure and clean up
+                    for (_, tx, sender) in &senders {
+                        let key = (cog_path.to_string(), *tx, ty);
+                        self.tile_cache.in_flight.remove(&key);
+                        let _ = sender.send(Err(e.to_string()));
+                    }
+                    return Err(e);
+                }
             }
         }
+
+        // 3. Wait for in-flight tiles from other fetchers
+        for (result_idx, mut rx) in wait_futures {
+            match rx.recv().await {
+                Ok(Ok(tile)) => {
+                    results[result_idx] = Some(tile);
+                }
+                Ok(Err(e)) => {
+                    return Err(anyhow::anyhow!("Coalesced fetch failed: {}", e));
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!("Broadcast channel error: {}", e));
+                }
+            }
+        }
+
+        // 4. Return tiles in correct order
+        Ok(results.into_iter().map(|t| t.unwrap()).collect())
     }
 
-    /// Fetch a single tile from the TIFF.
-    async fn fetch_single_tile(
+    /// Fetch and decode a batch of tiles with coalesced HTTP request.
+    #[allow(clippy::too_many_arguments)]
+    async fn fetch_and_decode_tiles(
         &self,
+        _cog_path: &str,  // Used by caller for cache keys
         cached: &Arc<CachedTiff>,
-        tx: usize,
         ty: usize,
+        tx_vec: &[usize],
         tile_width: usize,
         tile_height: usize,
         image_width: usize,
         image_height: usize,
-    ) -> Result<TileArray> {
+    ) -> Result<Vec<TileArray>> {
         let ifd = cached.tiff.ifds().first()
             .ok_or_else(|| anyhow::anyhow!("No IFDs in TIFF"))?;
 
-        // Fetch single tile using async-tiff (this is the HTTP request)
+        let xy_coords: Vec<(usize, usize)> = tx_vec.iter().map(|&tx| (tx, ty)).collect();
+
         let fetch_start = std::time::Instant::now();
-        let tile = ifd
-            .fetch_tile(tx, ty, cached.reader.as_ref())
+        let tiles = ifd
+            .fetch_tiles(&xy_coords, cached.reader.as_ref())
             .await
-            .with_context(|| format!("Failed to fetch tile ({}, {})", tx, ty))?;
+            .with_context(|| format!("Failed to fetch tiles for row {} (x={:?})", ty, tx_vec))?;
         let fetch_elapsed = fetch_start.elapsed();
 
-        // Track bytes read
-        let raw_bytes: u64 = match tile.compressed_bytes() {
-            async_tiff::CompressedBytes::Chunky(bytes) => bytes.len() as u64,
-            async_tiff::CompressedBytes::Planar(vec) => vec.iter().map(|b| b.len() as u64).sum(),
-        };
+        // Track bytes and metrics for the row request
+        let total_raw_bytes: u64 = tiles.iter().map(|t| {
+            match t.compressed_bytes() {
+                async_tiff::CompressedBytes::Chunky(bytes) => bytes.len() as u64,
+                async_tiff::CompressedBytes::Planar(vec) => vec.iter().map(|b| b.len() as u64).sum(),
+            }
+        }).sum();
 
-        // Log HTTP request timing
         let fetch_ms = fetch_elapsed.as_secs_f64() * 1000.0;
         let throughput_mbps = if fetch_elapsed.as_secs_f64() > 0.0 {
-            (raw_bytes as f64 / 1024.0 / 1024.0) / fetch_elapsed.as_secs_f64()
+            (total_raw_bytes as f64 / 1024.0 / 1024.0) / fetch_elapsed.as_secs_f64()
         } else {
             0.0
         };
         tracing::debug!(
-            "HTTP fetch tile ({},{}) {}KB in {:.1}ms ({:.1} MB/s)",
-            tx, ty, raw_bytes / 1024, fetch_ms, throughput_mbps
+            "HTTP fetch row {} ({} tiles, x={:?}) {}KB in {:.1}ms ({:.1} MB/s)",
+            ty, tiles.len(), tx_vec, total_raw_bytes / 1024, fetch_ms, throughput_mbps
         );
 
         if let Some(ref m) = self.metrics {
-            m.add_bytes_read(raw_bytes);
+            m.add_bytes_read(total_raw_bytes);
             m.add_http_request(fetch_elapsed);
         }
 
-        // Decode the tile in a blocking thread (decompression is CPU-bound)
+        // Decode all tiles in parallel using Rayon (CPU-bound work)
         let decoder_registry = self.decoder_registry.clone();
-        let array = tokio::task::spawn_blocking(move || {
-            tile.decode(&decoder_registry)
+        let tx_vec_owned: Vec<usize> = tx_vec.to_vec();
+        let decoded_tiles: Vec<TileArray> = tokio::task::spawn_blocking(move || {
+            tiles
+                .into_par_iter()
+                .zip(tx_vec_owned.par_iter())
+                .map(|(tile, &tx)| {
+                    let array = tile.decode(&decoder_registry)
+                        .map_err(|e| anyhow::anyhow!("Failed to decode tile ({}, {}): {:?}", tx, ty, e))?;
+
+                    let actual_width = tile_width.min(image_width - tx * tile_width);
+                    let actual_height = tile_height.min(image_height - ty * tile_height);
+
+                    Ok::<TileArray, anyhow::Error>(TileArray {
+                        data: array,
+                        actual_width,
+                        actual_height,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()
         })
         .await
-        .map_err(|e| anyhow::anyhow!("Decode task panicked: {}", e))?
-        .map_err(|e| anyhow::anyhow!("Failed to decode tile ({}, {}): {:?}", tx, ty, e))?;
+        .map_err(|e| anyhow::anyhow!("Decode task panicked: {}", e))??;
 
-        // Calculate actual tile dimensions (may be smaller at image edges)
-        let actual_width = tile_width.min(image_width - tx * tile_width);
-        let actual_height = tile_height.min(image_height - ty * tile_height);
-
-        Ok(TileArray {
-            data: array,
-            actual_width,
-            actual_height,
-        })
+        Ok(decoded_tiles)
     }
 
     /// Copy a decoded tile into the assembled array.

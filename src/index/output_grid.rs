@@ -4,6 +4,49 @@ use crate::config::ChunkShape;
 use crate::crs;
 use anyhow::Result;
 
+/// Convert (x, y) coordinates to a Hilbert curve index.
+///
+/// This implementation works for any grid size by using the smallest power of 2
+/// that contains both dimensions. The Hilbert curve keeps spatially adjacent
+/// points close in the 1D index, which improves cache locality when processing
+/// chunks that share underlying data.
+///
+/// Algorithm based on the standard Hilbert curve construction.
+fn hilbert_index(x: usize, y: usize, order: u32) -> u64 {
+    let mut x = x as i64;
+    let mut y = y as i64;
+    let mut d: u64 = 0;
+
+    let mut s: i64 = (1i64 << order) / 2;
+    while s > 0 {
+        let rx = if (x & s) > 0 { 1i64 } else { 0 };
+        let ry = if (y & s) > 0 { 1i64 } else { 0 };
+        d += (s * s) as u64 * ((3 * rx) ^ ry) as u64;
+
+        // Rotate quadrant
+        if ry == 0 {
+            if rx == 1 {
+                x = s - 1 - x;
+                y = s - 1 - y;
+            }
+            std::mem::swap(&mut x, &mut y);
+        }
+        s /= 2;
+    }
+    d
+}
+
+/// Calculate the Hilbert curve order needed to cover a grid of given dimensions.
+fn hilbert_order_for_grid(rows: usize, cols: usize) -> u32 {
+    let max_dim = rows.max(cols);
+    if max_dim <= 1 {
+        return 1;
+    }
+    // Find smallest power of 2 >= max_dim
+    let bits_needed = 64 - (max_dim - 1).leading_zeros();
+    bits_needed.max(1)
+}
+
 /// A single output chunk in the Zarr array.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OutputChunk {
@@ -169,8 +212,40 @@ impl OutputGrid {
         self.years.first().copied().unwrap_or(2024)
     }
 
-    /// Enumerate all output chunks.
+    /// Enumerate all output chunks in Hilbert curve order.
+    ///
+    /// Hilbert curve ordering keeps spatially adjacent chunks close in the
+    /// iteration sequence, which improves cache locality when chunks share
+    /// underlying COG tiles. This can significantly improve cache hit rates
+    /// compared to row-major ordering.
     pub fn enumerate_chunks(&self) -> impl Iterator<Item = OutputChunk> + '_ {
+        let num_rows = self.chunk_counts[2];
+        let num_cols = self.chunk_counts[3];
+        let order = hilbert_order_for_grid(num_rows, num_cols);
+
+        // Generate all chunks for each time index, sorted by Hilbert index
+        (0..self.chunk_counts[0]).flat_map(move |time_idx| {
+            // Collect all spatial chunks with their Hilbert indices
+            let mut chunks: Vec<(u64, OutputChunk)> = (0..num_rows)
+                .flat_map(|row_idx| {
+                    (0..num_cols).map(move |col_idx| {
+                        let h_idx = hilbert_index(col_idx, row_idx, order);
+                        (h_idx, OutputChunk { time_idx, row_idx, col_idx })
+                    })
+                })
+                .collect();
+
+            // Sort by Hilbert index
+            chunks.sort_by_key(|(h_idx, _)| *h_idx);
+
+            // Return just the chunks
+            chunks.into_iter().map(|(_, chunk)| chunk)
+        })
+    }
+
+    /// Enumerate all output chunks in row-major order (legacy ordering).
+    #[allow(dead_code)]
+    pub fn enumerate_chunks_row_major(&self) -> impl Iterator<Item = OutputChunk> + '_ {
         (0..self.chunk_counts[0]).flat_map(move |time_idx| {
             (0..self.chunk_counts[2]).flat_map(move |row_idx| {
                 (0..self.chunk_counts[3]).map(move |col_idx| OutputChunk {
@@ -281,12 +356,13 @@ mod tests {
         let grid = create_test_grid();
 
         // 10 degrees at 0.0001 resolution = 100,000 raw pixels
-        // Rounded up to chunk boundary: ceil(100,000/1024) = 98 chunks
-        // 98 * 1024 = 100,352 pixels (chunk-aligned)
-        assert_eq!(grid.chunk_counts[2], 98);
-        assert_eq!(grid.chunk_counts[3], 98);
-        assert_eq!(grid.width, 98 * 1024);  // 100,352
-        assert_eq!(grid.height, 98 * 1024); // 100,352
+        // Default chunk size is 256
+        // Rounded up to chunk boundary: ceil(100,000/256) = 391 chunks
+        // 391 * 256 = 100,096 pixels (chunk-aligned)
+        assert_eq!(grid.chunk_counts[2], 391);
+        assert_eq!(grid.chunk_counts[3], 391);
+        assert_eq!(grid.width, 391 * 256);  // 100,096
+        assert_eq!(grid.height, 391 * 256); // 100,096
     }
 
     #[test]
@@ -351,17 +427,23 @@ mod tests {
         let grid = OutputGrid::new(
             [0.0, 0.0, 10.0, 10.0],
             crs::codes::WGS84.to_string(),
-            0.01, // 1000x1000 grid
+            0.01, // 1000x1000 raw grid, rounded to 1024x1024
             vec![2024],
             64,
-            ChunkShape::default(),
+            ChunkShape {
+                time: 1,
+                embedding: 64,
+                height: 1024,
+                width: 1024,
+            },
         ).unwrap();
 
         // Test a point in the middle
         let (x, y) = (5.0, 5.0);
         let (row, col) = grid.crs_to_pixel(x, y);
 
-        // Should be roughly in the middle
+        // Should be roughly in the middle of aligned grid (1024x1024)
+        // Middle of 1024 is around 512, but coords (5,5) in [0,10] is at 50%
         assert!(row > 400 && row < 600, "row {} not in expected range", row);
         assert!(col > 400 && col < 600, "col {} not in expected range", col);
 
@@ -381,7 +463,12 @@ mod tests {
             0.01,
             vec![2024],
             64,
-            ChunkShape::default(),
+            ChunkShape {
+                time: 1,
+                embedding: 64,
+                height: 1024,
+                width: 1024,
+            },
         ).unwrap();
 
         // Test coordinates outside bounds are clamped

@@ -70,15 +70,19 @@ output:
   start_year: 2024           # first year
   num_bands: 64              # embedding dimensions
 
+  # chunk_shape defines the SHARD size when sharding is enabled (default)
   chunk_shape:
     time: 1         # One year per chunk
     embedding: 64   # Full embedding dimension
-    height: 1024    # ~10km at 10m resolution
-    width: 1024
+    height: 4096    # Shard size (~40km at 10m resolution)
+    width: 4096
+
+  # Sharding is enabled by default for better I/O performance
+  sharding:
+    enabled: true              # Default: true
+    subchunk_shape: [256, 256] # Inner chunk dimensions
 
   compression_level: 3       # zstd 0-22
-  use_sharding: false
-  shard_shape: [8, 8]
 
 # === PROCESSING: Performance tuning ===
 processing:
@@ -124,12 +128,25 @@ aws:
   region: "us-west-2"
 ```
 
+To disable sharding (legacy mode with smaller chunks):
+
+```yaml
+output:
+  local_path: "/tmp/aef-mosaic.zarr"
+  chunk_shape:
+    height: 1024
+    width: 1024
+  sharding:
+    enabled: false
+```
+
 ## Output Format
 
 The pipeline produces a Zarr V3 array with shape `(time, band, y, x)`:
 
 - **Data type**: Int8 embeddings (-128 = NoData)
 - **Compression**: Zstd
+- **Sharding**: Enabled by default (4096x4096 shards with 256x256 inner chunks)
 - **Coordinate arrays**: `/x`, `/y`, `/time` for xarray compatibility
 
 Geospatial attributes follow both CF Conventions and GeoZarr `proj:` namespace:

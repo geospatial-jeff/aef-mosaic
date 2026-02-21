@@ -15,6 +15,11 @@
 //! - Network stays busy while CPU does mosaicing
 //! - CPU stays busy while I/O writes to Zarr
 //! - Backpressure via bounded channels prevents memory explosion
+//!
+//! Chunk ordering uses a two-level Hilbert curve sort:
+//! 1. Group chunks by their primary COG tile (Hilbert order of COG centroids)
+//! 2. Within each COG group, order chunks by their own Hilbert index
+//! This maximizes cache locality by processing all chunks needing a COG together.
 
 use crate::crs::{self, ProjCache};
 use crate::index::{CogTile, OutputChunk, OutputGrid, SpatialLookup};
@@ -27,6 +32,49 @@ use ndarray::Array4;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
+
+/// Compute Hilbert curve index for WGS84 coordinates.
+///
+/// Maps longitude [-180, 180] and latitude [-90, 90] to a 16-bit grid,
+/// then computes the Hilbert index. This keeps spatially adjacent
+/// locations close in the 1D index.
+fn wgs84_hilbert_index(lon: f64, lat: f64) -> u64 {
+    // Map to [0, 65535] grid (16-bit resolution)
+    let x = (((lon + 180.0) / 360.0) * 65536.0).clamp(0.0, 65535.0) as usize;
+    let y = (((lat + 90.0) / 180.0) * 65536.0).clamp(0.0, 65535.0) as usize;
+    hilbert_index(x, y, 16)
+}
+
+/// Compute Hilbert curve index for (x, y) coordinates.
+fn hilbert_index(x: usize, y: usize, order: u32) -> u64 {
+    let mut x = x as i64;
+    let mut y = y as i64;
+    let mut d: u64 = 0;
+
+    let mut s: i64 = (1i64 << order) / 2;
+    while s > 0 {
+        let rx = if (x & s) > 0 { 1i64 } else { 0 };
+        let ry = if (y & s) > 0 { 1i64 } else { 0 };
+        d += (s * s) as u64 * ((3 * rx) ^ ry) as u64;
+
+        if ry == 0 {
+            if rx == 1 {
+                x = s - 1 - x;
+                y = s - 1 - y;
+            }
+            std::mem::swap(&mut x, &mut y);
+        }
+        s /= 2;
+    }
+    d
+}
+
+/// Compute the centroid of WGS84 bounds.
+fn bounds_centroid(bounds: &[f64; 4]) -> (f64, f64) {
+    let lon = (bounds[0] + bounds[2]) / 2.0;
+    let lat = (bounds[1] + bounds[3]) / 2.0;
+    (lon, lat)
+}
 
 /// A pre-computed fetch request (pixel window already calculated).
 struct FetchRequest {
@@ -41,6 +89,9 @@ struct ChunkWorkItem {
     tiles: Vec<Arc<CogTile>>,
     chunk_bounds: [f64; 4],
     chunk_bounds_wgs84: [f64; 4],
+    /// Two-level sort key: (primary_cog_hilbert, chunk_hilbert)
+    /// Groups chunks by their primary COG, then by spatial locality within.
+    sort_key: (u64, u64),
 }
 
 /// Data passed from COG fetcher to mosaic worker.
@@ -176,6 +227,16 @@ impl Pipeline {
                 }
             };
 
+            // Compute two-level sort key for cache-optimal ordering:
+            // 1. Primary COG tile's Hilbert index (groups chunks by COG)
+            // 2. Chunk's own Hilbert index (orders within COG group)
+            let primary_cog = &tiles[0]; // Use first (often largest overlap) COG
+            let (cog_lon, cog_lat) = bounds_centroid(&primary_cog.bounds_wgs84);
+            let cog_hilbert = wgs84_hilbert_index(cog_lon, cog_lat);
+
+            let (chunk_lon, chunk_lat) = bounds_centroid(&chunk_bounds_wgs84);
+            let chunk_hilbert = wgs84_hilbert_index(chunk_lon, chunk_lat);
+
             let tile_refs: Vec<_> = tiles.iter().map(|t| Arc::clone(t)).collect();
 
             work_items.push(ChunkWorkItem {
@@ -183,13 +244,30 @@ impl Pipeline {
                 tiles: tile_refs,
                 chunk_bounds,
                 chunk_bounds_wgs84,
+                sort_key: (cog_hilbert, chunk_hilbert),
             });
         }
+
+        // Sort work items by two-level Hilbert key for optimal cache locality:
+        // - Chunks sharing the same COG are processed together
+        // - Within each COG group, spatially adjacent chunks are processed together
+        work_items.sort_by_key(|item| item.sort_key);
+
+        // Count unique COG groups for logging
+        let unique_cogs: std::collections::HashSet<u64> = work_items.iter()
+            .map(|item| item.sort_key.0)
+            .collect();
+
+        tracing::info!(
+            "Sorted {} chunks into {} COG groups (two-level Hilbert ordering)",
+            work_items.len(),
+            unique_cogs.len()
+        );
 
         // Create a shared work queue
         let (work_tx, work_rx) = async_channel::bounded::<ChunkWorkItem>(work_items.len().max(1));
 
-        // Send all work items to the queue
+        // Send all work items to the queue (in sorted order)
         for item in work_items {
             let _ = work_tx.send(item).await;
         }

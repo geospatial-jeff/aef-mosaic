@@ -71,9 +71,13 @@ pub struct OutputConfig {
     #[serde(default = "default_num_bands")]
     pub num_bands: usize,
 
-    /// Zarr chunk dimensions
+    /// Zarr chunk dimensions (shard dimensions when sharding is enabled)
     #[serde(default)]
     pub chunk_shape: ChunkShape,
+
+    /// Sharding configuration (enabled by default)
+    #[serde(default)]
+    pub sharding: ShardingConfig,
 
     /// Compression level (0-22 for zstd)
     #[serde(default = "default_compression_level")]
@@ -112,6 +116,49 @@ impl OutputConfig {
     pub fn prefix(&self) -> Option<&str> {
         self.prefix.as_deref()
     }
+
+    /// Get the effective processing chunk shape.
+    /// When sharding is enabled, returns the shard size (chunk_shape * shard_shape).
+    /// When sharding is disabled, returns chunk_shape as-is.
+    pub fn effective_chunk_shape(&self) -> ChunkShape {
+        if self.sharding.enabled {
+            ChunkShape {
+                time: self.chunk_shape.time,
+                embedding: self.chunk_shape.embedding,
+                height: self.chunk_shape.height * self.sharding.shard_shape[0],
+                width: self.chunk_shape.width * self.sharding.shard_shape[1],
+            }
+        } else {
+            self.chunk_shape.clone()
+        }
+    }
+}
+
+/// Sharding configuration for Zarr V3 sharding codec.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardingConfig {
+    /// Enable sharding (default: true)
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Number of chunks per shard [rows, cols].
+    /// Default: [16, 16] = 16x16 chunks per shard.
+    /// With default 256x256 chunks, this gives 4096x4096 shard size.
+    #[serde(default = "default_shard_shape")]
+    pub shard_shape: [usize; 2],
+}
+
+impl Default for ShardingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            shard_shape: [16, 16],
+        }
+    }
+}
+
+fn default_shard_shape() -> [usize; 2] {
+    [16, 16]
 }
 
 /// Zarr chunk shape configuration.
@@ -139,8 +186,8 @@ impl Default for ChunkShape {
         Self {
             time: 1,
             embedding: 64,
-            height: 1024,
-            width: 1024,
+            height: 256,
+            width: 256,
         }
     }
 }
@@ -278,6 +325,15 @@ impl Config {
         if self.output.compression_level < 0 || self.output.compression_level > 22 {
             anyhow::bail!("Compression level must be 0-22 for zstd");
         }
+
+        // Validate sharding configuration
+        let sharding = &self.output.sharding;
+        if sharding.enabled {
+            if sharding.shard_shape[0] == 0 || sharding.shard_shape[1] == 0 {
+                anyhow::bail!("Sharding shard_shape dimensions must be > 0");
+            }
+        }
+
         Ok(())
     }
 }
@@ -287,7 +343,7 @@ fn default_output_crs() -> String { "EPSG:6933".to_string() }
 fn default_resolution() -> f64 { 10.0 }
 fn default_time_chunks() -> usize { 1 }
 fn default_embedding_chunks() -> usize { 64 }
-fn default_spatial_chunks() -> usize { 1024 }
+fn default_spatial_chunks() -> usize { 256 }
 fn default_fetch_concurrency() -> usize { 8 }
 fn default_mosaic_concurrency() -> usize { 8 }
 fn default_write_concurrency() -> usize { 8 }
@@ -307,8 +363,15 @@ mod tests {
         let shape = ChunkShape::default();
         assert_eq!(shape.time, 1);
         assert_eq!(shape.embedding, 64);
-        assert_eq!(shape.height, 1024);
-        assert_eq!(shape.width, 1024);
+        assert_eq!(shape.height, 256);
+        assert_eq!(shape.width, 256);
+    }
+
+    #[test]
+    fn test_default_sharding_config() {
+        let sharding = ShardingConfig::default();
+        assert!(sharding.enabled);
+        assert_eq!(sharding.shard_shape, [16, 16]); // 16x16 chunks per shard
     }
 
     #[test]
@@ -326,6 +389,7 @@ mod tests {
                 resolution: 10.0,
                 num_bands: 64,
                 chunk_shape: ChunkShape::default(),
+                sharding: ShardingConfig::default(),
                 compression_level: 3,
             },
             processing: ProcessingConfig::default(),
@@ -350,6 +414,7 @@ mod tests {
                 resolution: 10.0,
                 num_bands: 64,
                 chunk_shape: ChunkShape::default(),
+                sharding: ShardingConfig::default(),
                 compression_level: 3,
             },
             processing: ProcessingConfig::default(),
@@ -375,6 +440,7 @@ mod tests {
                 resolution: 10.0,
                 num_bands: 64,
                 chunk_shape: ChunkShape::default(),
+                sharding: ShardingConfig::default(),
                 compression_level: 3,
             },
             processing: ProcessingConfig::default(),
@@ -382,5 +448,70 @@ mod tests {
         };
 
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_sharding_validation_zero_shard_shape() {
+        // Zero shard_shape when sharding enabled - should fail
+        let config = Config {
+            input: InputConfig {
+                index_path: "s3://bucket/index.parquet".to_string(),
+                cog_bucket: "cog-bucket".to_string(),
+            },
+            output: OutputConfig {
+                local_path: Some("/tmp/output.zarr".to_string()),
+                bucket: None,
+                prefix: None,
+                crs: "EPSG:6933".to_string(),
+                resolution: 10.0,
+                num_bands: 64,
+                chunk_shape: ChunkShape::default(),
+                sharding: ShardingConfig {
+                    enabled: true,
+                    shard_shape: [0, 16], // Invalid: zero rows
+                },
+                compression_level: 3,
+            },
+            processing: ProcessingConfig::default(),
+            filter: None,
+        };
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("shard_shape"));
+    }
+
+    #[test]
+    fn test_sharding_disabled_allows_any_chunk_shape() {
+        // Sharding disabled - any chunk shape is valid
+        let config = Config {
+            input: InputConfig {
+                index_path: "s3://bucket/index.parquet".to_string(),
+                cog_bucket: "cog-bucket".to_string(),
+            },
+            output: OutputConfig {
+                local_path: Some("/tmp/output.zarr".to_string()),
+                bucket: None,
+                prefix: None,
+                crs: "EPSG:6933".to_string(),
+                resolution: 10.0,
+                num_bands: 64,
+                chunk_shape: ChunkShape {
+                    time: 1,
+                    embedding: 64,
+                    height: 1000,
+                    width: 1000,
+                },
+                sharding: ShardingConfig {
+                    enabled: false,
+                    shard_shape: [16, 16],
+                },
+                compression_level: 3,
+            },
+            processing: ProcessingConfig::default(),
+            filter: None,
+        };
+
+        assert!(config.validate().is_ok());
     }
 }

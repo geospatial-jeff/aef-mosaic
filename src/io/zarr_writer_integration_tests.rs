@@ -6,7 +6,7 @@
 //! 3. Arc<ZarrWriter> with concurrent writes
 //! 4. Data flow from mosaic → write
 
-use crate::config::{ChunkShape, Config, OutputConfig, InputConfig, ProcessingConfig};
+use crate::config::{ChunkShape, Config, OutputConfig, InputConfig, ProcessingConfig, ShardingConfig};
 use crate::index::{OutputChunk, OutputGrid};
 use crate::io::ZarrWriter;
 use futures::stream::{self, StreamExt};
@@ -28,6 +28,10 @@ fn create_test_config(chunk_shape: ChunkShape) -> Config {
             crs: "EPSG:4326".to_string(),
             resolution: 10.0,
             chunk_shape,
+            sharding: ShardingConfig {
+                enabled: false, // Disable sharding for existing tests
+                shard_shape: [16, 16],
+            },
             num_bands: 64,
             compression_level: 3,
         },
@@ -948,6 +952,109 @@ async fn test_oversized_chunk_error() {
     println!("Oversized write result: {:?}", result);
     assert!(result.is_err(), "Oversized chunk should panic (caught as Err)");
     println!("Correctly panicked on oversized chunk - this is expected behavior");
+
+    std::fs::remove_dir_all(test_path).ok();
+}
+
+/// Test 15: Verify sharding produces a single shard file with multiple chunks
+#[tokio::test]
+async fn test_sharding_enabled() {
+    use crate::io::create_output_store;
+
+    let test_path = "target/test-zarr-sharding";
+    if std::path::Path::new(test_path).exists() {
+        std::fs::remove_dir_all(test_path).unwrap();
+    }
+
+    // Use 256x256 chunks with 2x2 chunks per shard = 512x512 shard
+    let chunk_shape = ChunkShape {
+        time: 1,
+        embedding: 64,
+        height: 256,
+        width: 256,
+    };
+
+    let sharding_config = ShardingConfig {
+        enabled: true,
+        shard_shape: [2, 2], // 2x2 chunks per shard = 512x512 shard
+    };
+
+    // Shard size = chunk_shape * shard_shape = 256 * 2 = 512
+    let shard_height = chunk_shape.height * sharding_config.shard_shape[0];
+    let shard_width = chunk_shape.width * sharding_config.shard_shape[1];
+
+    // OutputGrid uses the effective (shard) size for chunk_shape
+    let effective_chunk_shape = ChunkShape {
+        time: chunk_shape.time,
+        embedding: chunk_shape.embedding,
+        height: shard_height,
+        width: shard_width,
+    };
+
+    let grid = Arc::new(OutputGrid {
+        bounds: [0.0, 0.0, 5120.0, 5120.0],
+        crs: "EPSG:6933".to_string(),
+        resolution: 10.0,
+        years: vec![2024],
+        num_bands: 64,
+        height: shard_height,
+        width: shard_width,
+        chunk_shape: effective_chunk_shape, // Grid uses shard size
+        chunk_counts: [1, 1, 1, 1],
+    });
+
+    let config = Config {
+        input: InputConfig {
+            index_path: "test".to_string(),
+            cog_bucket: "test".to_string(),
+        },
+        output: OutputConfig {
+            bucket: None,
+            prefix: None,
+            local_path: Some(test_path.to_string()),
+            crs: "EPSG:6933".to_string(),
+            resolution: 10.0,
+            chunk_shape: chunk_shape.clone(), // Config uses inner chunk size
+            sharding: sharding_config,
+            num_bands: 64,
+            compression_level: 3,
+        },
+        processing: ProcessingConfig::default(),
+        filter: None,
+    };
+
+    let store = create_output_store(&config).unwrap();
+    let prefix = crate::io::get_output_prefix(&config);
+    let writer = ZarrWriter::create(store, prefix, grid, &config).await.unwrap();
+
+    // Write the shard (contains 2x2 = 4 chunks internally)
+    let data = Array4::from_elem((1, 64, shard_height, shard_width), 42i8);
+    let chunk = OutputChunk { time_idx: 0, row_idx: 0, col_idx: 0 };
+
+    let result = writer.write_chunk_async(&chunk, data).await;
+    println!("Sharded write result: {:?}", result);
+    result.unwrap();
+
+    writer.finalize().unwrap();
+
+    // Verify shard file exists (single file contains all subchunks)
+    let shard_path = std::path::Path::new(test_path)
+        .join("embeddings").join("c").join("0").join("0").join("0").join("0");
+
+    assert!(shard_path.exists(), "Shard file should exist at {:?}", shard_path);
+
+    // Verify there's only one chunk file (sharding combines subchunks)
+    let chunk_dir = std::path::Path::new(test_path)
+        .join("embeddings").join("c").join("0").join("0").join("0");
+    let chunk_files: Vec<_> = std::fs::read_dir(&chunk_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .collect();
+
+    // With sharding, there should be just one shard file
+    assert_eq!(chunk_files.len(), 1, "Should have exactly one shard file, got {:?}", chunk_files);
+
+    println!("Sharding test passed - single shard file created");
 
     std::fs::remove_dir_all(test_path).ok();
 }
