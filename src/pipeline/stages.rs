@@ -321,6 +321,23 @@ impl Pipeline {
         let (mosaic_tx, mosaic_rx) = mpsc::channel::<FetchedChunk>(self.config.fetch_buffer);
         let (write_tx, write_rx) = mpsc::channel::<MosaicedChunk>(self.config.mosaic_buffer);
 
+        // Spawn queue monitor for debugging backpressure
+        let mosaic_tx_monitor = mosaic_tx.clone();
+        let write_tx_monitor = write_tx.clone();
+        let queue_monitor = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                let fetch_queue = mosaic_tx_monitor.max_capacity() - mosaic_tx_monitor.capacity();
+                let mosaic_queue = write_tx_monitor.max_capacity() - write_tx_monitor.capacity();
+                tracing::debug!(
+                    "Queue backlog: fetch→mosaic {}/{}, mosaic→write {}/{}",
+                    fetch_queue, mosaic_tx_monitor.max_capacity(),
+                    mosaic_queue, write_tx_monitor.max_capacity()
+                );
+            }
+        });
+
         // Spawn mosaic stage
         let mosaic_handle = self.spawn_mosaic_stage(mosaic_rx, write_tx);
 
@@ -333,6 +350,9 @@ impl Pipeline {
         // Wait for downstream stages to complete
         mosaic_handle.await?;
         write_handle.await?;
+
+        // Stop queue monitor
+        queue_monitor.abort();
 
         Ok(PipelineStats {
             total_chunks,
@@ -537,59 +557,35 @@ impl Pipeline {
     ) -> tokio::task::JoinHandle<()> {
         let writer = self.zarr_writer.clone();
         let metrics = self.metrics.clone();
-        let write_concurrency = self.config.write_concurrency;
 
         tokio::spawn(async move {
-            // Use FuturesUnordered for O(1) polling instead of O(n) select_all
-            let mut pending_futures: FuturesUnordered<tokio::task::JoinHandle<()>> =
-                FuturesUnordered::new();
+            while let Some(mosaiced) = write_rx.recv().await {
+                // Use block_in_place for sync zarrs API (enables parallel compression)
+                // Note: Must use block_in_place (not spawn_blocking) because the zarrs
+                // AsyncToSyncStorageAdapter uses handle.block_on() internally, which
+                // requires running on a tokio runtime thread.
+                //
+                // Parallelism is still achieved via rayon within zarrs for sub-chunk
+                // compression within shards.
+                let bytes_written = mosaiced.data.len() as u64;
+                let chunk = mosaiced.chunk.clone();
 
-            loop {
-                tokio::select! {
-                    mosaiced = write_rx.recv() => {
-                        match mosaiced {
-                            Some(mosaiced) => {
-                                let writer = writer.clone();
-                                let metrics = metrics.clone();
-                                let checkpoint = checkpoint_manager.clone();
+                let start = Instant::now();
+                let write_result = tokio::task::block_in_place(|| {
+                    writer.write_chunk_sync(&mosaiced.chunk, mosaiced.data)
+                });
 
-                                // Use spawn_blocking for sync zarrs API (enables parallel compression)
-                                let future = tokio::task::spawn_blocking(move || {
-                                    let bytes_written = mosaiced.data.len() as u64;
-                                    let chunk = mosaiced.chunk.clone();
+                if let Err(e) = write_result {
+                    tracing::warn!("Zarr write failed: {}", e);
+                    metrics.add_failure();
+                } else {
+                    metrics.add_zarr_write_time(start.elapsed());
+                    metrics.add_bytes_written(bytes_written);
+                    metrics.add_chunk_processed();
 
-                                    let start = Instant::now();
-                                    if let Err(e) = writer.write_chunk_sync(&mosaiced.chunk, mosaiced.data) {
-                                        tracing::warn!("Zarr write failed: {}", e);
-                                        metrics.add_failure();
-                                        return;
-                                    }
-                                    metrics.add_zarr_write_time(start.elapsed());
-                                    metrics.add_bytes_written(bytes_written);
-                                    metrics.add_chunk_processed();
-
-                                    // Mark chunk as completed in checkpoint
-                                    if let Some(ref checkpoint) = checkpoint {
-                                        checkpoint.mark_completed(&chunk);
-                                    }
-                                });
-
-                                pending_futures.push(future);
-
-                                // Limit concurrency - drain completed futures until below limit
-                                while pending_futures.len() >= write_concurrency {
-                                    // Wait for at least one to complete (O(1) with FuturesUnordered)
-                                    if pending_futures.next().await.is_none() {
-                                        break;
-                                    }
-                                }
-                            }
-                            None => {
-                                // Input channel closed, wait for remaining work
-                                while pending_futures.next().await.is_some() {}
-                                return;
-                            }
-                        }
+                    // Mark chunk as completed in checkpoint
+                    if let Some(ref checkpoint) = checkpoint_manager {
+                        checkpoint.mark_completed(&chunk);
                     }
                 }
             }

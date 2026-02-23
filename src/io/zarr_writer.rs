@@ -278,7 +278,9 @@ impl ZarrWriter {
     /// This method uses the sync zarrs API which enables parallel compression
     /// of chunks within shards via rayon.
     ///
-    /// MUST be called from within `spawn_blocking` to avoid blocking the tokio runtime.
+    /// MUST be called from within `block_in_place` (not `spawn_blocking`) because the zarrs
+    /// AsyncToSyncStorageAdapter uses `handle.block_on()` internally, which requires running
+    /// on a tokio runtime thread.
     ///
     /// Chunks are always full-sized because OutputGrid rounds dimensions up to chunk boundaries.
     pub fn write_chunk_sync(&self, chunk: &OutputChunk, data: Array4<i8>) -> Result<()> {
