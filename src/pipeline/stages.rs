@@ -405,7 +405,8 @@ impl Pipeline {
             handles.push(handle);
         }
 
-        // Create and run the streaming publisher
+        // Create and run the streaming publisher in the current task
+        // (SpatialLookup contains ProjCache which isn't Send-safe)
         let publisher = StreamingWorkPublisher::new(
             self.spatial_lookup.input_index(),
             self.output_grid.clone(),
@@ -415,15 +416,10 @@ impl Pipeline {
             self.metrics.clone(),
         );
 
-        // Spawn publisher task
-        let publisher_handle = tokio::spawn(async move {
-            if let Err(e) = publisher.publish_all().await {
-                tracing::warn!("Publisher error: {}", e);
-            }
-        });
-
-        // Wait for publisher to complete
-        let _ = publisher_handle.await;
+        // Run publisher in current task (not spawned)
+        if let Err(e) = publisher.publish_all().await {
+            tracing::warn!("Publisher error: {}", e);
+        }
         work_tx.close();
 
         // Wait for all workers to complete
