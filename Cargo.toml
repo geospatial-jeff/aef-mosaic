@@ -31,6 +31,9 @@ proj = "0.27"
 # Array operations
 ndarray = "0.16"
 
+# SIMD vectorization
+wide = "0.7"
+
 # CPU parallelism
 rayon = "1.10"
 
