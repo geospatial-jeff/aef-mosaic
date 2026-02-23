@@ -29,12 +29,11 @@ use crate::pipeline::Metrics;
 use crate::transform::{mosaic_tiles, ReprojectConfig, Reprojector};
 use anyhow::Result;
 use dashmap::DashSet;
-use futures::stream::{self, FuturesUnordered, StreamExt};
+use futures::stream::{self, StreamExt};
 use ndarray::Array4;
 use std::cell::RefCell;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::mpsc;
 
 // Thread-local ProjCache to cache Proj objects per-thread.
 // Note: Proj objects contain raw pointers and are not Send/Sync, so we cannot
@@ -315,7 +314,7 @@ impl Pipeline {
         // Buffer = downstream worker count (1:1 to limit memory usage)
         let fetch_buffer = self.config.mosaic_concurrency;
         let write_buffer = self.config.write_concurrency;
-        let (mosaic_tx, mosaic_rx) = mpsc::channel::<FetchedChunk>(fetch_buffer);
+        let (mosaic_tx, mosaic_rx) = async_channel::bounded::<FetchedChunk>(fetch_buffer);
         let (write_tx, write_rx) = async_channel::bounded::<MosaicedChunk>(write_buffer);
 
         // Spawn queue monitor for debugging backpressure
@@ -325,19 +324,20 @@ impl Pipeline {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
             loop {
                 interval.tick().await;
-                let fetch_queue = mosaic_tx_monitor.max_capacity() - mosaic_tx_monitor.capacity();
+                let fetch_queue = mosaic_tx_monitor.len();
+                let fetch_capacity = mosaic_tx_monitor.capacity().unwrap_or(0);
                 let mosaic_queue = write_tx_monitor.len();
                 let mosaic_capacity = write_tx_monitor.capacity().unwrap_or(0);
                 tracing::info!(
                     "Queue backlog: fetch→mosaic {}/{}, mosaic→write {}/{}",
-                    fetch_queue, mosaic_tx_monitor.max_capacity(),
+                    fetch_queue, fetch_capacity,
                     mosaic_queue, mosaic_capacity
                 );
             }
         });
 
-        // Spawn mosaic stage
-        let mosaic_handle = self.spawn_mosaic_stage(mosaic_rx, write_tx);
+        // Spawn mosaic stage (multiple workers for concurrent mosaicing)
+        let mosaic_handles = self.spawn_mosaic_stage(mosaic_rx, write_tx);
 
         // Spawn write stage (multiple workers for concurrent shard writes)
         let write_handles = self.spawn_write_stage(write_rx, self.checkpoint_manager.clone());
@@ -346,7 +346,9 @@ impl Pipeline {
         self.run_fetch_stage(chunks, mosaic_tx).await;
 
         // Wait for downstream stages to complete
-        mosaic_handle.await?;
+        for handle in mosaic_handles {
+            handle.await?;
+        }
         for handle in write_handles {
             handle.await?;
         }
@@ -369,7 +371,7 @@ impl Pipeline {
     async fn run_fetch_stage(
         &self,
         chunks: Vec<OutputChunk>,
-        mosaic_tx: mpsc::Sender<FetchedChunk>,
+        mosaic_tx: async_channel::Sender<FetchedChunk>,
     ) {
         let fetch_concurrency = self.config.fetch_concurrency;
         let total_pending = chunks.len();
@@ -462,99 +464,81 @@ impl Pipeline {
         }
     }
 
-    /// Spawn the mosaic stage - receives fetched data, mosaics, sends to write stage.
+    /// Spawn the mosaic stage - multiple workers receive fetched data, mosaic, send to write stage.
+    ///
+    /// Each worker independently pulls from the shared channel and processes work.
+    /// This avoids serialization issues where a single task's control flow blocks reception.
     fn spawn_mosaic_stage(
         &self,
-        mut mosaic_rx: mpsc::Receiver<FetchedChunk>,
+        mosaic_rx: async_channel::Receiver<FetchedChunk>,
         write_tx: async_channel::Sender<MosaicedChunk>,
-    ) -> tokio::task::JoinHandle<()> {
-        let output_grid = self.output_grid.clone();
-        let metrics = self.metrics.clone();
+    ) -> Vec<tokio::task::JoinHandle<()>> {
         let mosaic_concurrency = self.config.mosaic_concurrency;
+        let mut handles = Vec::with_capacity(mosaic_concurrency);
 
-        tokio::spawn(async move {
-            // Use FuturesUnordered for O(1) polling instead of O(n) select_all
-            let mut pending_futures: FuturesUnordered<tokio::task::JoinHandle<()>> =
-                FuturesUnordered::new();
+        for _ in 0..mosaic_concurrency {
+            let output_grid = self.output_grid.clone();
+            let metrics = self.metrics.clone();
+            let mosaic_rx = mosaic_rx.clone();
+            let write_tx = write_tx.clone();
 
-            loop {
-                tokio::select! {
-                    // Check for new work
-                    fetched = mosaic_rx.recv() => {
-                        match fetched {
-                            Some(fetched) => {
-                                tracing::info!(chunk = ?fetched.chunk, "mosaic worker starting");
+            let handle = tokio::spawn(async move {
+                while let Ok(fetched) = mosaic_rx.recv().await {
+                    tracing::info!(chunk = ?fetched.chunk, "mosaic worker starting");
 
-                                let output_grid = output_grid.clone();
-                                let metrics = metrics.clone();
-                                let write_tx = write_tx.clone();
+                    let pixel_bounds = output_grid.chunk_pixel_bounds(&fetched.chunk);
+                    let height = pixel_bounds[2] - pixel_bounds[0];
+                    let width = pixel_bounds[3] - pixel_bounds[1];
 
-                                // Spawn mosaic task
-                                let future = async move {
-                                    let pixel_bounds = output_grid.chunk_pixel_bounds(&fetched.chunk);
-                                    let height = pixel_bounds[2] - pixel_bounds[0];
-                                    let width = pixel_bounds[3] - pixel_bounds[1];
+                    let reproject_config = ReprojectConfig {
+                        target_crs: output_grid.crs.clone(),
+                        target_resolution: output_grid.resolution,
+                        target_bounds: fetched.chunk_bounds,
+                        target_shape: (height, width),
+                        num_bands: output_grid.num_bands,
+                    };
 
-                                    let reproject_config = ReprojectConfig {
-                                        target_crs: output_grid.crs.clone(),
-                                        target_resolution: output_grid.resolution,
-                                        target_bounds: fetched.chunk_bounds,
-                                        target_shape: (height, width),
-                                        num_bands: output_grid.num_bands,
-                                    };
+                    let target_crs = reproject_config.target_crs.clone();
+                    let window_data = fetched.window_data;
+                    let metrics_clone = metrics.clone();
 
-                                    let target_crs = reproject_config.target_crs.clone();
-                                    let window_data = fetched.window_data;
-                                    let metrics_clone = metrics.clone();
+                    // CPU-bound work in spawn_blocking
+                    let mosaic_result = tokio::task::spawn_blocking(move || {
+                        let start = Instant::now();
+                        let reprojector = Reprojector::new(&target_crs);
+                        let result = mosaic_tiles(&window_data, &reprojector, &reproject_config);
+                        metrics_clone.add_reproject_time(start.elapsed());
+                        result
+                    })
+                    .await;
 
-                                    // CPU-bound work in spawn_blocking
-                                    let mosaic_result = tokio::task::spawn_blocking(move || {
-                                        let start = Instant::now();
-                                        let reprojector = Reprojector::new(&target_crs);
-                                        let result = mosaic_tiles(&window_data, &reprojector, &reproject_config);
-                                        metrics_clone.add_reproject_time(start.elapsed());
-                                        result
-                                    }).await;
-
-                                    match mosaic_result {
-                                        Ok(Ok(mosaic)) => {
-                                            let mosaiced = MosaicedChunk {
-                                                chunk: fetched.chunk,
-                                                data: mosaic,
-                                            };
-                                            let _ = write_tx.send(mosaiced).await;
-                                        }
-                                        Ok(Err(e)) => {
-                                            tracing::warn!("Mosaic failed: {}", e);
-                                            metrics.add_failure();
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!("Mosaic task panicked: {}", e);
-                                            metrics.add_failure();
-                                        }
-                                    }
-                                };
-
-                                pending_futures.push(tokio::spawn(future));
-
-                                // Limit concurrency - drain completed futures until below limit
-                                while pending_futures.len() >= mosaic_concurrency {
-                                    // Wait for at least one to complete (O(1) with FuturesUnordered)
-                                    if pending_futures.next().await.is_none() {
-                                        break;
-                                    }
-                                }
+                    match mosaic_result {
+                        Ok(Ok(mosaic)) => {
+                            let mosaiced = MosaicedChunk {
+                                chunk: fetched.chunk,
+                                data: mosaic,
+                            };
+                            if write_tx.send(mosaiced).await.is_err() {
+                                tracing::debug!("Write receiver dropped, stopping mosaic worker");
+                                break;
                             }
-                            None => {
-                                // Input channel closed, wait for remaining work
-                                while pending_futures.next().await.is_some() {}
-                                return;
-                            }
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!("Mosaic failed: {}", e);
+                            metrics.add_failure();
+                        }
+                        Err(e) => {
+                            tracing::warn!("Mosaic task panicked: {}", e);
+                            metrics.add_failure();
                         }
                     }
                 }
-            }
-        })
+            });
+
+            handles.push(handle);
+        }
+
+        handles
     }
 
     /// Spawn the write stage - multiple workers receive mosaiced data, write to Zarr.

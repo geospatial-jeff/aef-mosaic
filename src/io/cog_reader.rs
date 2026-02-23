@@ -600,22 +600,18 @@ impl CogReader {
     ///
     /// Returns None if the TIFF doesn't have a geotransform tag.
     ///
-    /// Note: Acquires HTTP semaphore for cache misses to prevent connection exhaustion.
+    /// Note: Does not use HTTP semaphore because:
+    /// 1. Metadata is small (few KB of TIFF headers)
+    /// 2. Single-flight deduplication prevents duplicate fetches
+    /// 3. Semaphore should be reserved for high-bandwidth tile data transfers
     pub async fn get_geo_transform(&self, tile: &CogTile) -> Result<Option<GeoTransform>> {
         let object_path = self.tile_path(tile)?;
         let path_str = object_path.to_string();
-
-        // Acquire semaphore before potential HTTP request (cache miss)
-        // Released immediately after metadata is loaded
-        let permit = self.http_semaphore.acquire().await
-            .map_err(|_| anyhow::anyhow!("HTTP semaphore closed"))?;
 
         let cached = self
             .metadata_cache
             .get_or_load(&path_str, self.store.clone(), object_path)
             .await?;
-
-        drop(permit);
 
         Ok(cached.geo_transform)
     }
@@ -890,12 +886,9 @@ impl CogReader {
     /// Fetch and decode a batch of tiles with coalesced HTTP request.
     ///
     /// Acquires a permit from the global HTTP semaphore before making requests
-    /// to prevent connection exhaustion under high concurrency.
-    ///
-    /// The permit is held through decode to:
-    /// 1. Prevent memory spikes from HTTP queue refilling while decodes are pending
-    /// 2. Limit concurrent decode tasks, preventing blocking pool saturation
-    /// 3. Create natural backpressure between fetch and decode stages
+    /// to prevent connection exhaustion under high concurrency. The permit is
+    /// released immediately after HTTP fetch completes, allowing maximum network
+    /// utilization while decode happens in parallel.
     #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(skip(self, cached), fields(cog = %cog_path, row = ty, cols = ?tx_vec))]
     async fn fetch_and_decode_tiles(
@@ -915,7 +908,6 @@ impl CogReader {
         let xy_coords: Vec<(usize, usize)> = tx_vec.iter().map(|&tx| (tx, ty)).collect();
 
         // Acquire semaphore permit before HTTP request to limit global concurrency.
-        // Permit is held through decode to prevent blocking pool saturation.
         let permit = self.http_semaphore.acquire().await
             .map_err(|_| anyhow::anyhow!("HTTP semaphore closed"))?;
 
@@ -925,6 +917,10 @@ impl CogReader {
             .await
             .with_context(|| format!("Failed to fetch tiles for row {} (x={:?})", ty, tx_vec))?;
         let fetch_elapsed = fetch_start.elapsed();
+
+        // Release permit immediately after HTTP fetch - allows next request to start
+        // while we decode. This maximizes network utilization on high-bandwidth links.
+        drop(permit);
 
         // Track bytes and metrics for the row request
         let total_raw_bytes: u64 = tiles.iter().map(|t| {
@@ -951,7 +947,6 @@ impl CogReader {
         }
 
         // Decode all tiles in parallel using Rayon (CPU-bound work)
-        // Permit is held to prevent blocking pool saturation
         let decoder_registry = self.decoder_registry.clone();
         let tx_vec_owned: Vec<usize> = tx_vec.to_vec();
         let decoded_tiles: Vec<TileArray> = tokio::task::spawn_blocking(move || {
@@ -975,9 +970,6 @@ impl CogReader {
         })
         .await
         .map_err(|e| anyhow::anyhow!("Decode task panicked: {}", e))??;
-
-        // Release permit after decode completes - creates backpressure on fetch
-        drop(permit);
 
         Ok(decoded_tiles)
     }
