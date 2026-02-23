@@ -32,17 +32,17 @@ use std::time::Duration;
 /// Create client options for S3 access optimized for high-throughput.
 ///
 /// Key settings:
-/// - Connection pool sized to match global HTTP semaphore limit (64 idle per host)
+/// - Connection pool sized to match global HTTP semaphore limit (128 idle per host)
 /// - Keep-alive to reuse TCP connections
 /// - Fast connect timeout (5s) to fail fast and let retries work
 /// - Note: HTTP/2 is NOT enabled as S3 path-style URLs don't support it reliably
 fn create_client_options() -> ClientOptions {
     ClientOptions::new()
-        // Request timeout (per request, not connection)
-        .with_timeout(Duration::from_secs(60))
-        // Connection pool sized for typical max_concurrent_http of 128
-        // Using half (64) for idle allows some natural eviction while maintaining reuse
-        .with_pool_max_idle_per_host(64)
+        // Request timeout - 120s to handle large shard fetches under load
+        .with_timeout(Duration::from_secs(120))
+        // Connection pool sized to match max_concurrent_http (128)
+        // Prevents connection churn when all slots are active
+        .with_pool_max_idle_per_host(128)
         // Keep connections alive longer for reuse
         .with_pool_idle_timeout(Duration::from_secs(90))
         // Fast connect timeout - fail quickly, let higher-level retries work
@@ -57,7 +57,7 @@ fn create_client_options() -> ClientOptions {
 /// Connection pool is configured for high throughput (256 connections, HTTP/2).
 pub fn create_anonymous_store(bucket: &str) -> Result<Arc<dyn ObjectStore>> {
     tracing::info!(
-        "Creating anonymous S3 client for bucket: {} (pool_size=64, idle_timeout=90s, connect_timeout=5s)",
+        "Creating anonymous S3 client for bucket: {} (pool_size=128, idle_timeout=90s, connect_timeout=5s)",
         bucket
     );
 
