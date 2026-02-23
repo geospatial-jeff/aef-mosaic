@@ -28,8 +28,8 @@ zarrs_object_store = "0.6"
 # Coordinate reprojection
 proj = "0.27"
 
-# Array operations
-ndarray = "0.16"
+# Array operations (rayon feature enables parallel Zip)
+ndarray = { version = "0.16", features = ["rayon"] }
 
 # SIMD vectorization
 wide = "0.7"

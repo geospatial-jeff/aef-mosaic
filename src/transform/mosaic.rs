@@ -11,9 +11,9 @@
 use crate::io::WindowData;
 use crate::transform::ReprojectConfig;
 use anyhow::{Context, Result};
-use ndarray::Array4;
+use ndarray::{Array2, Array3, Array4, Axis, Zip, s};
+use ndarray::parallel::prelude::*;
 use proj::Proj;
-use rayon::prelude::*;
 use std::sync::atomic::{AtomicI32, AtomicU16, Ordering};
 use std::time::Instant;
 
@@ -99,39 +99,49 @@ impl AtomicAccumulator {
     ///
     /// Returns an int8 array: (1, bands, height, width)
     /// Pixels with no data are set to NODATA (-128).
+    ///
+    /// Uses ndarray's parallel Zip for efficient array operations.
     pub fn finalize(self) -> Array4<i8> {
-        let mut result = Array4::<i8>::from_elem((1, self.bands, self.height, self.width), NODATA);
-
         let width = self.width;
         let height = self.height;
         let bands = self.bands;
 
-        // Build result by iterating over pixels
-        // We process sequentially since the computation is simple and memory-bound
-        for row in 0..height {
-            for col in 0..width {
-                let pixel_idx = row * width + col;
-                let count = self.count[pixel_idx].load(Ordering::Relaxed);
+        // Convert atomics to regular values (just reads inner values, no sync overhead)
+        let sum_data: Vec<i32> = self.sum.into_iter()
+            .map(|a| a.into_inner())
+            .collect();
+        let count_data: Vec<u16> = self.count.into_iter()
+            .map(|a| a.into_inner())
+            .collect();
 
-                if count > 0 {
-                    let c = count as i32;
-                    let half_c = c / 2;
+        // Create ndarray views - sum is [bands, height, width], count is [height, width]
+        let sum_arr = Array3::<i32>::from_shape_vec((bands, height, width), sum_data)
+            .expect("sum shape mismatch");
+        let count_arr = Array2::<u16>::from_shape_vec((height, width), count_data)
+            .expect("count shape mismatch");
 
-                    for b in 0..bands {
-                        let band_idx = b * height * width + pixel_idx;
-                        let sum = self.sum[band_idx].load(Ordering::Relaxed);
+        // Create result array initialized to NODATA
+        let mut result = Array4::<i8>::from_elem((1, bands, height, width), NODATA);
 
-                        // Rounded integer division
-                        let mean = if sum >= 0 {
-                            ((sum + half_c) / c) as i8
+        // Process each band using parallel Zip (broadcasts count across pixels)
+        for b in 0..bands {
+            let sum_band = sum_arr.index_axis(Axis(0), b);
+            let mut result_band = result.slice_mut(s![0, b, .., ..]);
+
+            Zip::from(&mut result_band)
+                .and(&sum_band)
+                .and(&count_arr)
+                .par_for_each(|r, &s, &c| {
+                    if c > 0 {
+                        let c = c as i32;
+                        let half_c = c / 2;
+                        *r = if s >= 0 {
+                            ((s + half_c) / c) as i8
                         } else {
-                            ((sum - half_c) / c) as i8
+                            ((s - half_c) / c) as i8
                         };
-
-                        result[[0, b, row, col]] = mean;
                     }
-                }
-            }
+                });
         }
 
         result
