@@ -192,6 +192,27 @@ impl Default for ChunkShape {
     }
 }
 
+/// Checkpoint configuration for resumable processing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckpointConfig {
+    /// Enable checkpointing (default: true)
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Checkpoint flush interval in seconds (default: 60)
+    #[serde(default = "default_checkpoint_interval")]
+    pub interval_secs: u64,
+}
+
+impl Default for CheckpointConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_secs: 60,
+        }
+    }
+}
+
 /// Processing configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessingConfig {
@@ -226,6 +247,10 @@ pub struct ProcessingConfig {
     /// Optional path to save metrics JSON after run completes
     #[serde(default)]
     pub metrics_output_path: Option<String>,
+
+    /// Checkpoint configuration for resumable processing
+    #[serde(default)]
+    pub checkpoint: CheckpointConfig,
 }
 
 /// Filter configuration to limit processing area and time range.
@@ -255,6 +280,7 @@ impl Default for ProcessingConfig {
             tile_cache_gb: 32.0,
             metadata_cache_entries: 10_000,
             metrics_output_path: None,
+            checkpoint: CheckpointConfig::default(),
         }
     }
 }
@@ -349,6 +375,7 @@ fn default_mosaic_concurrency() -> usize { 8 }
 fn default_write_concurrency() -> usize { 8 }
 fn default_true() -> bool { true }
 fn default_metrics_interval() -> u64 { 10 }
+fn default_checkpoint_interval() -> u64 { 60 }
 fn default_num_bands() -> usize { 64 }
 fn default_compression_level() -> i32 { 3 }
 fn default_tile_cache_gb() -> f64 { 32.0 }

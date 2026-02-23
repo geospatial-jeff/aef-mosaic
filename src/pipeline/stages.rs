@@ -21,6 +21,7 @@
 //! 2. Within each COG group, order chunks by their own Hilbert index
 //! This maximizes cache locality by processing all chunks needing a COG together.
 
+use crate::checkpoint::CheckpointManager;
 use crate::crs::{self, ProjCache};
 use crate::index::{CogTile, OutputChunk, OutputGrid, SpatialLookup};
 use crate::io::{CogReader, GeoTransform, PixelWindow, WindowData, ZarrWriter};
@@ -142,6 +143,7 @@ pub struct Pipeline {
     output_grid: Arc<OutputGrid>,
     metrics: Arc<Metrics>,
     config: PipelineConfig,
+    checkpoint_manager: Option<Arc<CheckpointManager>>,
 }
 
 impl Pipeline {
@@ -153,6 +155,7 @@ impl Pipeline {
         output_grid: Arc<OutputGrid>,
         metrics: Arc<Metrics>,
         config: PipelineConfig,
+        checkpoint_manager: Option<Arc<CheckpointManager>>,
     ) -> Self {
         Self {
             cog_reader,
@@ -161,6 +164,7 @@ impl Pipeline {
             output_grid,
             metrics,
             config,
+            checkpoint_manager,
         }
     }
 
@@ -176,7 +180,7 @@ impl Pipeline {
         let mosaic_handle = self.spawn_mosaic_stage(mosaic_rx, write_tx);
 
         // Spawn write stage
-        let write_handle = self.spawn_write_stage(write_rx);
+        let write_handle = self.spawn_write_stage(write_rx, self.checkpoint_manager.clone());
 
         // Run fetch stage (this is the main work - processes all chunks)
         self.run_fetch_stage(chunks, mosaic_tx).await;
@@ -422,6 +426,7 @@ impl Pipeline {
     fn spawn_write_stage(
         &self,
         mut write_rx: mpsc::Receiver<MosaicedChunk>,
+        checkpoint_manager: Option<Arc<CheckpointManager>>,
     ) -> tokio::task::JoinHandle<()> {
         let writer = self.zarr_writer.clone();
         let metrics = self.metrics.clone();
@@ -437,9 +442,11 @@ impl Pipeline {
                             Some(mosaiced) => {
                                 let writer = writer.clone();
                                 let metrics = metrics.clone();
+                                let checkpoint = checkpoint_manager.clone();
 
                                 let future = async move {
                                     let bytes_written = mosaiced.data.len() as u64;
+                                    let chunk = mosaiced.chunk.clone();
 
                                     let start = Instant::now();
                                     if let Err(e) = writer.write_chunk_async(&mosaiced.chunk, mosaiced.data).await {
@@ -450,6 +457,11 @@ impl Pipeline {
                                     metrics.add_zarr_write_time(start.elapsed());
                                     metrics.add_bytes_written(bytes_written);
                                     metrics.add_chunk_processed();
+
+                                    // Mark chunk as completed in checkpoint
+                                    if let Some(ref checkpoint) = checkpoint {
+                                        checkpoint.mark_completed(&chunk);
+                                    }
                                 };
 
                                 pending_futures.push(tokio::spawn(future));
