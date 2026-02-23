@@ -406,6 +406,9 @@ impl Pipeline {
 
                 // Process chunks sequentially from the shared queue
                 while let Ok(work) = work_rx.recv().await {
+                    let worker_start = Instant::now();
+                    let chunk_id = work.chunk.chunk_indices();
+
                     // Fetch all tile windows for this chunk
                     let cog_start = Instant::now();
                     let window_data = fetch_tile_windows(
@@ -419,6 +422,11 @@ impl Pipeline {
 
                     if window_data.is_empty() {
                         metrics.add_chunk_skipped();
+                        tracing::info!(
+                            chunk = ?chunk_id,
+                            duration_ms = worker_start.elapsed().as_millis(),
+                            "fetch worker completed (skipped)"
+                        );
                         continue;
                     }
 
@@ -435,6 +443,12 @@ impl Pipeline {
                         tracing::debug!("Mosaic receiver dropped, stopping fetch worker");
                         break;
                     }
+
+                    tracing::info!(
+                        chunk = ?chunk_id,
+                        duration_ms = worker_start.elapsed().as_millis(),
+                        "fetch worker completed"
+                    );
                 }
             });
 
@@ -484,7 +498,8 @@ impl Pipeline {
 
             let handle = tokio::spawn(async move {
                 while let Ok(fetched) = mosaic_rx.recv().await {
-                    tracing::info!(chunk = ?fetched.chunk, "mosaic worker starting");
+                    let worker_start = Instant::now();
+                    let chunk_id = fetched.chunk.chunk_indices();
 
                     let pixel_bounds = output_grid.chunk_pixel_bounds(&fetched.chunk);
                     let height = pixel_bounds[2] - pixel_bounds[0];
@@ -522,6 +537,11 @@ impl Pipeline {
                                 tracing::debug!("Write receiver dropped, stopping mosaic worker");
                                 break;
                             }
+                            tracing::info!(
+                                chunk = ?chunk_id,
+                                duration_ms = worker_start.elapsed().as_millis(),
+                                "mosaic worker completed"
+                            );
                         }
                         Ok(Err(e)) => {
                             tracing::warn!("Mosaic failed: {}", e);
@@ -565,10 +585,11 @@ impl Pipeline {
                     //
                     // Each worker can write to a different shard concurrently, and rayon
                     // handles parallel compression within each shard.
+                    let worker_start = Instant::now();
                     let bytes_written = mosaiced.data.len() as u64;
                     let chunk = mosaiced.chunk.clone();
+                    let chunk_id = chunk.chunk_indices();
 
-                    let start = Instant::now();
                     let write_result = tokio::task::block_in_place(|| {
                         writer.write_chunk_sync(&mosaiced.chunk, mosaiced.data)
                     });
@@ -577,7 +598,7 @@ impl Pipeline {
                         tracing::warn!("Zarr write failed: {}", e);
                         metrics.add_failure();
                     } else {
-                        metrics.add_zarr_write_time(start.elapsed());
+                        metrics.add_zarr_write_time(worker_start.elapsed());
                         metrics.add_bytes_written(bytes_written);
                         metrics.add_chunk_processed();
 
@@ -585,6 +606,12 @@ impl Pipeline {
                         if let Some(ref checkpoint) = checkpoint {
                             checkpoint.mark_completed(&chunk);
                         }
+
+                        tracing::info!(
+                            chunk = ?chunk_id,
+                            duration_ms = worker_start.elapsed().as_millis(),
+                            "write worker completed"
+                        );
                     }
                 }
             });
