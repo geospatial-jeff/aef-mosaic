@@ -137,6 +137,11 @@ impl AdaptiveGrid {
         Self { cells }
     }
 
+    /// Get the cells for iteration.
+    fn iter(&self) -> impl Iterator<Item = &GridCell> {
+        self.cells.iter()
+    }
+
     /// Transform a destination pixel coordinate to source CRS coordinates.
     fn transform_point(
         dst_x: usize,
@@ -234,16 +239,6 @@ impl AdaptiveGrid {
         });
     }
 
-    /// Find the cell containing a given destination pixel.
-    fn find_cell(&self, dst_x: usize, dst_y: usize) -> Option<&GridCell> {
-        // Linear search for now - could use spatial index for very large grids
-        self.cells.iter().find(|cell| {
-            dst_x >= cell.dst_x0
-                && dst_x < cell.dst_x1
-                && dst_y >= cell.dst_y0
-                && dst_y < cell.dst_y1
-        })
-    }
 }
 
 /// Reprojector using adaptive grid refinement.
@@ -308,44 +303,44 @@ impl Reprojector {
         // Create output array initialized with NODATA
         let mut output = Array3::<i8>::from_elem((bands, dst_height, dst_width), NODATA);
 
-        // For each output pixel, find cell, interpolate source coordinates, and sample
-        for dst_row in 0..dst_height {
-            for dst_col in 0..dst_width {
-                let Some(cell) = grid.find_cell(dst_col, dst_row) else {
-                    continue;
-                };
+        // Iterate by CELL instead of by pixel - avoids O(pixels × cells) linear search
+        // Each cell knows its pixel bounds, so we just iterate within those bounds
+        for cell in grid.iter() {
+            if !cell.is_valid() {
+                continue;
+            }
 
-                if !cell.is_valid() {
-                    continue;
-                }
+            // Iterate over all pixels within this cell's bounds
+            for dst_row in cell.dst_y0..cell.dst_y1 {
+                for dst_col in cell.dst_x0..cell.dst_x1 {
+                    // Interpolate source coordinates
+                    let (src_x, src_y) = cell.interpolate(dst_col, dst_row);
 
-                // Interpolate source coordinates
-                let (src_x, src_y) = cell.interpolate(dst_col, dst_row);
+                    // Convert source CRS coordinates to pixel coordinates
+                    // Source is bottom-up: row 0 is at min_y
+                    let src_px = (src_x - source_bounds[0]) / src_pixel_x - 0.5;
+                    let src_py = (src_y - source_bounds[1]) / src_pixel_y - 0.5;
 
-                // Convert source CRS coordinates to pixel coordinates
-                // Source is bottom-up: row 0 is at min_y
-                let src_px = (src_x - source_bounds[0]) / src_pixel_x - 0.5;
-                let src_py = (src_y - source_bounds[1]) / src_pixel_y - 0.5;
+                    // Nearest neighbor sampling (for i8 embeddings, interpolation doesn't make sense)
+                    let src_col_i = src_px.round() as isize;
+                    let src_row_i = src_py.round() as isize;
 
-                // Nearest neighbor sampling (for i8 embeddings, interpolation doesn't make sense)
-                let src_col = src_px.round() as isize;
-                let src_row = src_py.round() as isize;
+                    // Bounds check
+                    if src_col_i < 0
+                        || src_col_i >= src_width as isize
+                        || src_row_i < 0
+                        || src_row_i >= src_height as isize
+                    {
+                        continue; // Outside source bounds
+                    }
 
-                // Bounds check
-                if src_col < 0
-                    || src_col >= src_width as isize
-                    || src_row < 0
-                    || src_row >= src_height as isize
-                {
-                    continue; // Outside source bounds
-                }
+                    let src_col = src_col_i as usize;
+                    let src_row = src_row_i as usize;
 
-                let src_col = src_col as usize;
-                let src_row = src_row as usize;
-
-                // Copy all bands
-                for band in 0..bands {
-                    output[[band, dst_row, dst_col]] = data[[band, src_row, src_col]];
+                    // Copy all bands
+                    for band in 0..bands {
+                        output[[band, dst_row, dst_col]] = data[[band, src_row, src_col]];
+                    }
                 }
             }
         }
