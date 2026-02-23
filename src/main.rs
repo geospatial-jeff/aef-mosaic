@@ -89,8 +89,15 @@ fn run_command(config_path: PathBuf, concurrency: Option<usize>, dry_run: bool) 
         return analyze_work(&config);
     }
 
-    // Build and run Tokio runtime (uses default thread counts)
-    let runtime = tokio::runtime::Runtime::new()?;
+    // Build Tokio runtime with explicit thread configuration.
+    // - max_blocking_threads(64): Limits blocking threads from 512 default.
+    //   Each spawn_blocking task runs Rayon par_iter(), so we only need ~64 max.
+    //   This also reduces memory from thread-local ProjCache instances.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4))
+        .max_blocking_threads(64)
+        .enable_all()
+        .build()?;
     runtime.block_on(async { run_pipeline(config).await })?;
 
     Ok(())
@@ -103,7 +110,11 @@ fn analyze_command(config_path: PathBuf) -> Result<()> {
 }
 
 fn analyze_work(config: &Config) -> Result<()> {
-    let runtime = tokio::runtime::Runtime::new()?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4))
+        .max_blocking_threads(64)
+        .enable_all()
+        .build()?;
 
     runtime.block_on(async {
         use aef_mosaic::{io, InputIndex, OutputGrid, SpatialLookup};

@@ -263,6 +263,8 @@ pub struct PipelineConfig {
     pub fetch_buffer: usize,
     /// Channel buffer size between mosaic and write stages
     pub mosaic_buffer: usize,
+    /// HTTP concurrency per chunk (for tile fetches within a single chunk)
+    pub http_concurrency_per_chunk: usize,
 }
 
 impl Default for PipelineConfig {
@@ -273,6 +275,7 @@ impl Default for PipelineConfig {
             write_concurrency: 8,
             fetch_buffer: 16,
             mosaic_buffer: 8,
+            http_concurrency_per_chunk: 32,
         }
     }
 }
@@ -365,6 +368,7 @@ impl Pipeline {
         // Spawn fetch workers FIRST (before starting publisher)
         // This allows backpressure to work - publisher blocks when channel is full
         let mut handles = Vec::with_capacity(fetch_concurrency);
+        let http_concurrency_per_chunk = self.config.http_concurrency_per_chunk;
         for _ in 0..fetch_concurrency {
             let reader = self.cog_reader.clone();
             let metrics = self.metrics.clone();
@@ -381,6 +385,7 @@ impl Pipeline {
                         &work.tiles,
                         work.chunk_bounds_wgs84,
                         &metrics,
+                        http_concurrency_per_chunk,
                     ).await;
                     metrics.add_cog_read_time(cog_start.elapsed());
 
@@ -592,15 +597,14 @@ impl Pipeline {
 }
 
 /// Fetch tile windows for a single chunk.
-/// HTTP requests within a chunk are concurrent (up to 32).
+/// HTTP requests within a chunk are concurrent (up to http_concurrency).
 async fn fetch_tile_windows(
     reader: &CogReader,
     tiles: &[Arc<CogTile>],
     chunk_bounds_wgs84: [f64; 4],
     metrics: &Metrics,
+    http_concurrency: usize,
 ) -> Vec<WindowData> {
-    // Fixed HTTP concurrency within a chunk
-    const HTTP_CONCURRENCY: usize = 32;
 
     // Step 1: Fetch geotransforms concurrently (async)
     // Clone Arc refs during iteration (cheap) instead of pre-cloning entire Vec
@@ -612,7 +616,7 @@ async fn fetch_tile_windows(
                 (tile, gt)
             }
         })
-        .buffer_unordered(HTTP_CONCURRENCY)
+        .buffer_unordered(http_concurrency)
         .collect()
         .await;
 
@@ -627,7 +631,7 @@ async fn fetch_tile_windows(
                 reader.read_window(&req.tile, req.window, req.intersection_bounds).await
             }
         })
-        .buffer_unordered(HTTP_CONCURRENCY)
+        .buffer_unordered(http_concurrency)
         .collect()
         .await;
 
@@ -762,6 +766,7 @@ mod tests {
         assert_eq!(config.write_concurrency, 8);
         assert_eq!(config.fetch_buffer, 16);
         assert_eq!(config.mosaic_buffer, 8);
+        assert_eq!(config.http_concurrency_per_chunk, 32);
     }
 
     #[test]

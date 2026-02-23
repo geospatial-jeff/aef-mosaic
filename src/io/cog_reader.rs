@@ -234,7 +234,8 @@ impl TiffMetadataCache {
         }
 
         // 3. We're the first - register in-flight and fetch (lock-free insert)
-        let (tx, _) = broadcast::channel(64); // Increased buffer for high concurrency
+        // Buffer sized to 2x max_concurrent_http (default 128) to prevent overflow
+        let (tx, _) = broadcast::channel(256);
         self.in_flight.insert(path.to_string(), tx.clone());
 
         // Cache miss - load metadata

@@ -45,6 +45,15 @@ use std::sync::Arc;
 
 /// Run the full mosaic pipeline with the given configuration.
 pub async fn run_pipeline(config: Config) -> Result<PipelineStats> {
+    // Configure Rayon thread pool BEFORE any parallel work.
+    // Each spawn_blocking task runs Rayon par_iter internally. Without explicit
+    // config, Rayon uses num_cpus threads per parallel region. We configure it
+    // once globally to prevent oversubscription with multiple spawn_blocking tasks.
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4))
+        .build_global()
+        .ok(); // Ignore if already initialized
+
     // Validate configuration
     config.validate()?;
 
@@ -237,12 +246,16 @@ pub async fn run_pipeline(config: Config) -> Result<PipelineStats> {
     );
 
     // Create pipeline config
+    // Scale HTTP concurrency per chunk based on global HTTP limit and fetch concurrency.
+    // This ensures we don't exceed max_concurrent_http when all fetch workers are active.
+    let http_concurrency_per_chunk = (config.processing.max_concurrent_http / config.processing.fetch_concurrency).max(8);
     let pipeline_config = PipelineConfig {
         fetch_concurrency: config.processing.fetch_concurrency,
         mosaic_concurrency: config.processing.mosaic_concurrency,
         write_concurrency: config.processing.write_concurrency,
         fetch_buffer: 16,
         mosaic_buffer: 8,
+        http_concurrency_per_chunk,
     };
 
     tracing::info!(
