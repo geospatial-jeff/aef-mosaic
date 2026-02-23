@@ -32,19 +32,20 @@ use std::time::Duration;
 /// Create client options for S3 access optimized for high-throughput.
 ///
 /// Key settings:
-/// - Connection pool sized to match global HTTP semaphore limit (128 idle per host)
+/// - Connection pool sized to match max_concurrent_http
 /// - Keep-alive to reuse TCP connections
 /// - Fast connect timeout (5s) to fail fast and let retries work
 /// - Note: HTTP/2 is NOT enabled as S3 path-style URLs don't support it reliably
-fn create_client_options() -> ClientOptions {
+fn create_client_options(pool_size: usize) -> ClientOptions {
     ClientOptions::new()
         // Request timeout - 120s to handle large shard fetches under load
         .with_timeout(Duration::from_secs(120))
-        // Connection pool sized to match max_concurrent_http (128)
+        // Connection pool sized to match max_concurrent_http
         // Prevents connection churn when all slots are active
-        .with_pool_max_idle_per_host(128)
-        // Keep connections alive longer for reuse
-        .with_pool_idle_timeout(Duration::from_secs(90))
+        .with_pool_max_idle_per_host(pool_size)
+        // S3 closes idle connections after ~20s, so evict before that
+        // to avoid "error sending request" on stale connections
+        .with_pool_idle_timeout(Duration::from_secs(15))
         // Fast connect timeout - fail quickly, let higher-level retries work
         .with_connect_timeout(Duration::from_secs(5))
 }
@@ -54,17 +55,18 @@ fn create_client_options() -> ClientOptions {
 /// Used for reading COG tiles and index. No credentials needed.
 /// Hardcoded to us-west-2 where source.coop is hosted.
 ///
-/// Connection pool is configured for high throughput (256 connections, HTTP/2).
-pub fn create_anonymous_store(bucket: &str) -> Result<Arc<dyn ObjectStore>> {
+/// Pool size should match max_concurrent_http for optimal connection reuse.
+pub fn create_anonymous_store(bucket: &str, pool_size: usize) -> Result<Arc<dyn ObjectStore>> {
     tracing::info!(
-        "Creating anonymous S3 client for bucket: {} (pool_size=128, idle_timeout=90s, connect_timeout=5s)",
-        bucket
+        "Creating anonymous S3 client for bucket: {} (pool_size={}, idle_timeout=15s, connect_timeout=5s)",
+        bucket,
+        pool_size
     );
 
     let builder = AmazonS3Builder::new()
         .with_bucket_name(bucket)
         .with_region("us-west-2")
-        .with_client_options(create_client_options())
+        .with_client_options(create_client_options(pool_size))
         .with_skip_signature(true)
         .with_virtual_hosted_style_request(false);
 
@@ -78,7 +80,7 @@ pub fn create_anonymous_store(bucket: &str) -> Result<Arc<dyn ObjectStore>> {
 /// - AWS_SECRET_ACCESS_KEY (required)
 /// - AWS_REGION or AWS_DEFAULT_REGION (required)
 /// - AWS_SESSION_TOKEN (optional, for temporary credentials)
-fn create_authenticated_store(bucket: &str) -> Result<Arc<dyn ObjectStore>> {
+fn create_authenticated_store(bucket: &str, pool_size: usize) -> Result<Arc<dyn ObjectStore>> {
     let mut missing: Vec<&str> = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
         .into_iter()
         .filter(|var| std::env::var(var).is_err())
@@ -92,7 +94,7 @@ fn create_authenticated_store(bucket: &str) -> Result<Arc<dyn ObjectStore>> {
         anyhow::bail!("Missing AWS credentials: {}", missing.join(", "));
     }
 
-    tracing::info!("Creating authenticated S3 client for bucket: {}", bucket);
+    tracing::info!("Creating authenticated S3 client for bucket: {} (pool_size={})", bucket, pool_size);
 
     // Buckets with dots in the name require path-style URLs
     // Virtual-hosted style creates invalid hostnames like "bucket.name.s3.region.amazonaws.com"
@@ -100,7 +102,7 @@ fn create_authenticated_store(bucket: &str) -> Result<Arc<dyn ObjectStore>> {
 
     let builder = AmazonS3Builder::from_env()
         .with_bucket_name(bucket)
-        .with_client_options(create_client_options())
+        .with_client_options(create_client_options(pool_size))
         .with_virtual_hosted_style_request(use_virtual_hosted);
 
     Ok(Arc::new(builder.build()?))
@@ -108,7 +110,7 @@ fn create_authenticated_store(bucket: &str) -> Result<Arc<dyn ObjectStore>> {
 
 /// Create a store for reading input COG tiles (anonymous, no credentials).
 pub fn create_cog_store(config: &crate::config::Config) -> Result<Arc<dyn ObjectStore>> {
-    create_anonymous_store(&config.input.cog_bucket)
+    create_anonymous_store(&config.input.cog_bucket, config.processing.max_concurrent_http)
 }
 
 /// Create a store for writing output Zarr (authenticated).
@@ -123,7 +125,7 @@ pub fn create_output_store(config: &crate::config::Config) -> Result<Arc<dyn Obj
             tracing::info!("Creating LocalFileSystem store at: {}", path.display());
             Ok(Arc::new(LocalFileSystem::new_with_prefix(path)?))
         }
-        (_, Some(bucket)) => create_authenticated_store(bucket),
+        (_, Some(bucket)) => create_authenticated_store(bucket, config.processing.write_concurrency),
         _ => anyhow::bail!("Invalid config: no output destination"),
     }
 }
@@ -149,7 +151,7 @@ mod tests {
         std::env::remove_var("AWS_ACCESS_KEY_ID");
         std::env::remove_var("AWS_SECRET_ACCESS_KEY");
 
-        let result = create_authenticated_store("test-bucket");
+        let result = create_authenticated_store("test-bucket", 128);
         assert!(result.is_err());
 
         let err = result.unwrap_err().to_string();
@@ -158,7 +160,7 @@ mod tests {
 
     #[test]
     fn test_create_anonymous_store() {
-        let result = create_anonymous_store("us-west-2.opendata.source.coop");
+        let result = create_anonymous_store("us-west-2.opendata.source.coop", 64);
         assert!(result.is_ok());
     }
 

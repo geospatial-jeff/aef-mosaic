@@ -176,6 +176,8 @@ pub struct TiffMetadataCache {
     in_flight: DashMap<String, broadcast::Sender<Result<Arc<CachedTiff>, String>>>,
     /// Optional metrics for tracking cache performance
     metrics: Option<Arc<Metrics>>,
+    /// Broadcast channel buffer size (scales with max_concurrent_http)
+    broadcast_buffer_size: usize,
 }
 
 impl TiffMetadataCache {
@@ -183,14 +185,18 @@ impl TiffMetadataCache {
     ///
     /// # Arguments
     /// * `max_entries` - Maximum number of TIFF metadata entries to cache (default: 10,000)
+    /// * `max_concurrent_http` - Maximum concurrent HTTP requests, used to size broadcast buffers
     /// * `metrics` - Optional metrics collector for cache hit/miss tracking
-    pub fn new(max_entries: usize, metrics: Option<Arc<Metrics>>) -> Self {
+    pub fn new(max_entries: usize, max_concurrent_http: usize, metrics: Option<Arc<Metrics>>) -> Self {
+        // Buffer size is 2x max_concurrent_http to prevent overflow during high concurrency
+        let broadcast_buffer_size = max_concurrent_http * 2;
         Self {
             cache: RwLock::new(LruCache::new(
                 NonZeroUsize::new(max_entries).unwrap_or(NonZeroUsize::new(10000).unwrap()),
             )),
             in_flight: DashMap::new(),
             metrics,
+            broadcast_buffer_size,
         }
     }
 
@@ -234,8 +240,8 @@ impl TiffMetadataCache {
         }
 
         // 3. We're the first - register in-flight and fetch (lock-free insert)
-        // Buffer sized to 2x max_concurrent_http (default 128) to prevent overflow
-        let (tx, _) = broadcast::channel(256);
+        // Buffer sized to 2x max_concurrent_http to prevent overflow
+        let (tx, _) = broadcast::channel(self.broadcast_buffer_size);
         self.in_flight.insert(path.to_string(), tx.clone());
 
         // Cache miss - load metadata
@@ -343,10 +349,6 @@ impl TiffMetadataCache {
 /// Key for tile cache: (cog_path, tile_x, tile_y)
 type TileCacheKey = (String, usize, usize);
 
-/// Number of shards for the tile cache (power of 2 for efficient modulo).
-/// With 128 max concurrent HTTP requests, 64 shards gives ~2 requests per shard.
-const TILE_CACHE_SHARDS: usize = 64;
-
 /// A single shard of the tile cache with its own LRU cache and byte tracking.
 struct TileCacheShard {
     /// LRU cache for this shard
@@ -396,11 +398,14 @@ impl TileCacheShard {
 
 /// Sharded tile cache to reduce lock contention.
 ///
-/// Distributes tiles across 64 shards based on hash of the COG path.
+/// Distributes tiles across shards based on hash of the COG path.
+/// Number of shards scales with max_concurrent_http (~2 requests per shard).
 /// This allows concurrent inserts to different shards without blocking.
 struct ShardedTileCache {
     /// Shards indexed by hash of COG path
     shards: Vec<TileCacheShard>,
+    /// Number of shards (scales with max_concurrent_http)
+    num_shards: usize,
     /// In-flight requests (single-flight pattern) - uses DashMap for lock-free access
     in_flight: DashMap<TileCacheKey, broadcast::Sender<Result<Arc<TileArray>, String>>>,
     /// Maximum bytes per shard (total / num_shards)
@@ -411,32 +416,39 @@ struct ShardedTileCache {
 
 impl ShardedTileCache {
     /// Create a new sharded tile cache with the specified total maximum size in bytes.
-    fn new(max_bytes: u64, metrics: Option<Arc<Metrics>>) -> Self {
-        let shards: Vec<_> = (0..TILE_CACHE_SHARDS)
+    ///
+    /// # Arguments
+    /// * `max_bytes` - Maximum total cache size in bytes
+    /// * `num_shards` - Number of shards (typically max_concurrent_http / 2 for ~2 requests per shard)
+    /// * `metrics` - Optional metrics collector
+    fn new(max_bytes: u64, num_shards: usize, metrics: Option<Arc<Metrics>>) -> Self {
+        let num_shards = num_shards.max(1); // At least 1 shard
+        let shards: Vec<_> = (0..num_shards)
             .map(|_| TileCacheShard::new())
             .collect();
 
         Self {
             shards,
+            num_shards,
             in_flight: DashMap::new(),
-            max_bytes_per_shard: max_bytes / TILE_CACHE_SHARDS as u64,
+            max_bytes_per_shard: max_bytes / num_shards as u64,
             metrics,
         }
     }
 
     /// Compute shard index from cache key (hash of COG path).
     #[inline]
-    fn shard_index(key: &TileCacheKey) -> usize {
+    fn shard_index(&self, key: &TileCacheKey) -> usize {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
         let mut hasher = DefaultHasher::new();
         key.0.hash(&mut hasher);
-        (hasher.finish() as usize) % TILE_CACHE_SHARDS
+        (hasher.finish() as usize) % self.num_shards
     }
 
     /// Insert a tile into the appropriate shard.
     async fn insert(&self, key: TileCacheKey, tile: Arc<TileArray>) {
-        let shard_idx = Self::shard_index(&key);
+        let shard_idx = self.shard_index(&key);
         self.shards[shard_idx]
             .insert(key, tile, self.max_bytes_per_shard)
             .await;
@@ -444,7 +456,7 @@ impl ShardedTileCache {
 
     /// Get a tile from the appropriate shard.
     async fn get(&self, key: &TileCacheKey) -> Option<Arc<TileArray>> {
-        let shard_idx = Self::shard_index(key);
+        let shard_idx = self.shard_index(key);
         self.shards[shard_idx].get(key).await
     }
 
@@ -492,11 +504,12 @@ const DEFAULT_TILE_CACHE_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 impl CogReader {
     /// Create a new COG reader.
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {
+        let num_shards = DEFAULT_MAX_CONCURRENT_HTTP / 2;
         Self {
             store,
             decoder_registry: Arc::new(DecoderRegistry::default()),
-            metadata_cache: Arc::new(TiffMetadataCache::new(10_000, None)),
-            tile_cache: Arc::new(ShardedTileCache::new(DEFAULT_TILE_CACHE_BYTES, None)),
+            metadata_cache: Arc::new(TiffMetadataCache::new(10_000, DEFAULT_MAX_CONCURRENT_HTTP, None)),
+            tile_cache: Arc::new(ShardedTileCache::new(DEFAULT_TILE_CACHE_BYTES, num_shards, None)),
             metrics: None,
             http_semaphore: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_HTTP)),
             tile_cache_enabled: true,
@@ -505,11 +518,12 @@ impl CogReader {
 
     /// Create a new COG reader with metrics tracking.
     pub fn with_metrics(store: Arc<dyn ObjectStore>, metrics: Arc<Metrics>) -> Self {
+        let num_shards = DEFAULT_MAX_CONCURRENT_HTTP / 2;
         Self {
             store,
             decoder_registry: Arc::new(DecoderRegistry::default()),
-            metadata_cache: Arc::new(TiffMetadataCache::new(10_000, Some(metrics.clone()))),
-            tile_cache: Arc::new(ShardedTileCache::new(DEFAULT_TILE_CACHE_BYTES, Some(metrics.clone()))),
+            metadata_cache: Arc::new(TiffMetadataCache::new(10_000, DEFAULT_MAX_CONCURRENT_HTTP, Some(metrics.clone()))),
+            tile_cache: Arc::new(ShardedTileCache::new(DEFAULT_TILE_CACHE_BYTES, num_shards, Some(metrics.clone()))),
             metrics: Some(metrics),
             http_semaphore: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_HTTP)),
             tile_cache_enabled: true,
@@ -529,11 +543,12 @@ impl CogReader {
         tile_cache_bytes: u64,
         metrics: Option<Arc<Metrics>>,
     ) -> Self {
+        let num_shards = DEFAULT_MAX_CONCURRENT_HTTP / 2;
         Self {
             store,
             decoder_registry: Arc::new(DecoderRegistry::default()),
-            metadata_cache: Arc::new(TiffMetadataCache::new(metadata_cache_entries, metrics.clone())),
-            tile_cache: Arc::new(ShardedTileCache::new(tile_cache_bytes, metrics.clone())),
+            metadata_cache: Arc::new(TiffMetadataCache::new(metadata_cache_entries, DEFAULT_MAX_CONCURRENT_HTTP, metrics.clone())),
+            tile_cache: Arc::new(ShardedTileCache::new(tile_cache_bytes, num_shards, metrics.clone())),
             metrics,
             http_semaphore: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_HTTP)),
             tile_cache_enabled: true,
@@ -557,19 +572,21 @@ impl CogReader {
         tile_cache_bytes: u64,
         metrics: Option<Arc<Metrics>>,
     ) -> Self {
+        // Scale cache shards with concurrency: ~2 requests per shard for low contention
+        let num_shards = (max_concurrent_http / 2).max(1);
         tracing::info!(
             "Creating CogReader with max_concurrent_http={}, tile_cache={}, metadata_cache={}, tile_cache_size={}GB, shards={}",
             max_concurrent_http,
             if tile_cache_enabled { "enabled" } else { "disabled" },
             metadata_cache_entries,
             tile_cache_bytes as f64 / 1024.0 / 1024.0 / 1024.0,
-            TILE_CACHE_SHARDS
+            num_shards
         );
         Self {
             store,
             decoder_registry: Arc::new(DecoderRegistry::default()),
-            metadata_cache: Arc::new(TiffMetadataCache::new(metadata_cache_entries, metrics.clone())),
-            tile_cache: Arc::new(ShardedTileCache::new(tile_cache_bytes, metrics.clone())),
+            metadata_cache: Arc::new(TiffMetadataCache::new(metadata_cache_entries, max_concurrent_http, metrics.clone())),
+            tile_cache: Arc::new(ShardedTileCache::new(tile_cache_bytes, num_shards, metrics.clone())),
             metrics,
             http_semaphore: Arc::new(Semaphore::new(max_concurrent_http)),
             tile_cache_enabled,

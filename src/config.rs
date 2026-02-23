@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use tracing;
 
 /// Main configuration for the mosaic pipeline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -370,6 +371,22 @@ impl Config {
             if sharding.shard_shape[0] == 0 || sharding.shard_shape[1] == 0 {
                 anyhow::bail!("Sharding shard_shape dimensions must be > 0");
             }
+        }
+
+        // Warn if fetch_concurrency may cause excessive queuing
+        // Each fetch worker can issue up to 8 HTTP requests concurrently (min per-chunk limit)
+        // If total potential requests significantly exceeds max_concurrent_http, warn user
+        let potential_requests = self.processing.fetch_concurrency * 8;
+        let threshold = (self.processing.max_concurrent_http as f64 * 1.5) as usize;
+        if potential_requests > threshold {
+            tracing::warn!(
+                "fetch_concurrency={} with min 8 HTTP requests per chunk could issue {} concurrent requests, \
+                 exceeding max_concurrent_http={} by >50%. This will cause request queuing. \
+                 Consider increasing max_concurrent_http or decreasing fetch_concurrency.",
+                self.processing.fetch_concurrency,
+                potential_requests,
+                self.processing.max_concurrent_http
+            );
         }
 
         Ok(())
