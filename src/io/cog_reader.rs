@@ -422,6 +422,9 @@ pub struct CogReader {
 
     /// Global semaphore to limit concurrent HTTP requests across all workers
     http_semaphore: Arc<Semaphore>,
+
+    /// Whether tile caching and single-flight deduplication is enabled
+    tile_cache_enabled: bool,
 }
 
 /// Default tile cache size: 32 GB
@@ -437,6 +440,7 @@ impl CogReader {
             tile_cache: Arc::new(TileDataCache::new(DEFAULT_TILE_CACHE_BYTES, None)),
             metrics: None,
             http_semaphore: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_HTTP)),
+            tile_cache_enabled: true,
         }
     }
 
@@ -449,6 +453,7 @@ impl CogReader {
             tile_cache: Arc::new(TileDataCache::new(DEFAULT_TILE_CACHE_BYTES, Some(metrics.clone()))),
             metrics: Some(metrics),
             http_semaphore: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_HTTP)),
+            tile_cache_enabled: true,
         }
     }
 
@@ -472,27 +477,31 @@ impl CogReader {
             tile_cache: Arc::new(TileDataCache::new(tile_cache_bytes, metrics.clone())),
             metrics,
             http_semaphore: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_HTTP)),
+            tile_cache_enabled: true,
         }
     }
 
-    /// Create a new COG reader with HTTP concurrency limit.
+    /// Create a new COG reader with full configuration.
     ///
     /// # Arguments
     /// * `store` - Object store for S3 access
     /// * `max_concurrent_http` - Maximum concurrent HTTP requests (default: 128)
+    /// * `tile_cache_enabled` - Whether to enable tile caching and single-flight
     /// * `metadata_cache_entries` - Maximum entries in TIFF metadata cache
-    /// * `tile_cache_bytes` - Maximum tile cache size in bytes
+    /// * `tile_cache_bytes` - Maximum tile cache size in bytes (ignored if cache disabled)
     /// * `metrics` - Optional metrics collector
     pub fn with_http_limit(
         store: Arc<dyn ObjectStore>,
         max_concurrent_http: usize,
+        tile_cache_enabled: bool,
         metadata_cache_entries: usize,
         tile_cache_bytes: u64,
         metrics: Option<Arc<Metrics>>,
     ) -> Self {
         tracing::info!(
-            "Creating CogReader with max_concurrent_http={}, metadata_cache={}, tile_cache={}GB",
+            "Creating CogReader with max_concurrent_http={}, tile_cache={}, metadata_cache={}, tile_cache_size={}GB",
             max_concurrent_http,
+            if tile_cache_enabled { "enabled" } else { "disabled" },
             metadata_cache_entries,
             tile_cache_bytes as f64 / 1024.0 / 1024.0 / 1024.0
         );
@@ -503,6 +512,7 @@ impl CogReader {
             tile_cache: Arc::new(TileDataCache::new(tile_cache_bytes, metrics.clone())),
             metrics,
             http_semaphore: Arc::new(Semaphore::new(max_concurrent_http)),
+            tile_cache_enabled,
         }
     }
 
@@ -671,6 +681,22 @@ impl CogReader {
         image_height: usize,
     ) -> Result<Vec<Arc<TileArray>>> {
         let tx_vec: Vec<usize> = tx_range.collect();
+
+        // Fast path: if cache is disabled, just fetch directly without any caching/single-flight
+        if !self.tile_cache_enabled {
+            let decoded = self.fetch_and_decode_tiles(
+                cog_path,
+                cached,
+                ty,
+                &tx_vec,
+                tile_width,
+                tile_height,
+                image_width,
+                image_height,
+            ).await?;
+            return Ok(decoded.into_iter().map(Arc::new).collect());
+        }
+
         let mut results: Vec<Option<Arc<TileArray>>> = vec![None; tx_vec.len()];
 
         // Track tiles we need to wait for (in-flight) vs fetch ourselves

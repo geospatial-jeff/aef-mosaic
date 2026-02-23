@@ -182,6 +182,7 @@ pub async fn run_pipeline(config: Config) -> Result<PipelineStats> {
     let cog_reader = Arc::new(CogReader::with_http_limit(
         cog_store,
         config.processing.max_concurrent_http,
+        config.processing.tile_cache_enabled,
         config.processing.metadata_cache_entries,
         tile_cache_bytes,
         Some(metrics.clone()),

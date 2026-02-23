@@ -241,7 +241,12 @@ pub struct ProcessingConfig {
     #[serde(default = "default_metrics_interval")]
     pub metrics_interval_secs: u64,
 
-    /// Maximum memory for tile cache in GB
+    /// Enable tile data cache and single-flight deduplication (default: true)
+    /// Disable to reduce memory usage at the cost of potentially re-fetching tiles.
+    #[serde(default = "default_true")]
+    pub tile_cache_enabled: bool,
+
+    /// Maximum memory for tile cache in GB (ignored if tile_cache_enabled is false)
     #[serde(default = "default_tile_cache_gb")]
     pub tile_cache_gb: f64,
 
@@ -283,6 +288,7 @@ impl Default for ProcessingConfig {
             max_concurrent_http: 128,
             enable_metrics: true,
             metrics_interval_secs: 10,
+            tile_cache_enabled: true,
             tile_cache_gb: 32.0,
             metadata_cache_entries: 10_000,
             metrics_output_path: None,
