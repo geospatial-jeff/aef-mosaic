@@ -28,50 +28,78 @@ pub struct ZarrWriter {
 }
 
 impl ZarrWriter {
-    /// Create a new Zarr array for writing.
+    /// Create a new Zarr array for writing, or open existing for resume.
+    ///
+    /// When `resume` is true, existing data is preserved for checkpoint/resume.
+    /// When `resume` is false (default), any existing array is deleted first.
     pub async fn create(
         store: Arc<dyn ObjectStore>,
         path: &str,
         output_grid: Arc<OutputGrid>,
         config: &Config,
     ) -> Result<Self> {
-        // Delete any existing embeddings array to ensure fresh write
-        let embeddings_prefix = if path.is_empty() {
-            object_store::path::Path::from("embeddings")
-        } else {
-            object_store::path::Path::from(format!("{}/embeddings", path))
-        };
+        Self::create_internal(store, path, output_grid, config, false).await
+    }
 
-        // List and delete all existing objects under the embeddings path (parallelized)
-        let existing: Vec<_> = store
-            .list(Some(&embeddings_prefix))
-            .collect::<Vec<_>>()
-            .await;
+    /// Open existing Zarr array for resuming, preserving existing chunks.
+    pub async fn open_for_resume(
+        store: Arc<dyn ObjectStore>,
+        path: &str,
+        output_grid: Arc<OutputGrid>,
+        config: &Config,
+    ) -> Result<Self> {
+        Self::create_internal(store, path, output_grid, config, true).await
+    }
 
-        if !existing.is_empty() {
-            tracing::info!("Deleting {} existing objects under {:?} (parallel)", existing.len(), embeddings_prefix);
+    /// Internal create method with resume flag.
+    async fn create_internal(
+        store: Arc<dyn ObjectStore>,
+        path: &str,
+        output_grid: Arc<OutputGrid>,
+        config: &Config,
+        resume: bool,
+    ) -> Result<Self> {
+        // Only delete existing data if not resuming
+        if !resume {
+            let embeddings_prefix = if path.is_empty() {
+                object_store::path::Path::from("embeddings")
+            } else {
+                object_store::path::Path::from(format!("{}/embeddings", path))
+            };
 
-            // Parallel deletion using buffer_unordered for high concurrency
-            use futures::stream::{self, StreamExt as _};
-            let store_ref = &store;
-            let delete_results: Vec<_> = stream::iter(existing)
-                .filter_map(|result| async move { result.ok() })
-                .map(|meta| async move {
-                    let location = meta.location.clone();
-                    match store_ref.delete(&meta.location).await {
-                        Ok(_) => Ok(()),
-                        Err(e) => {
-                            tracing::warn!("Failed to delete {:?}: {}", location, e);
-                            Err(e)
-                        }
-                    }
-                })
-                .buffer_unordered(64) // Process up to 64 deletes concurrently
-                .collect()
+            // List and delete all existing objects under the embeddings path (parallelized)
+            let existing: Vec<_> = store
+                .list(Some(&embeddings_prefix))
+                .collect::<Vec<_>>()
                 .await;
 
-            let deleted_count = delete_results.iter().filter(|r| r.is_ok()).count();
-            tracing::debug!("Deleted {} objects", deleted_count);
+            if !existing.is_empty() {
+                tracing::info!("Deleting {} existing objects under {:?} (parallel)", existing.len(), embeddings_prefix);
+
+                // Parallel deletion using buffer_unordered for high concurrency
+                use futures::stream::{self, StreamExt as _};
+                let store_ref = &store;
+                let delete_results: Vec<_> = stream::iter(existing)
+                    .filter_map(|result| async move { result.ok() })
+                    .map(|meta| async move {
+                        let location = meta.location.clone();
+                        match store_ref.delete(&meta.location).await {
+                            Ok(_) => Ok(()),
+                            Err(e) => {
+                                tracing::warn!("Failed to delete {:?}: {}", location, e);
+                                Err(e)
+                            }
+                        }
+                    })
+                    .buffer_unordered(64) // Process up to 64 deletes concurrently
+                    .collect()
+                    .await;
+
+                let deleted_count = delete_results.iter().filter(|r| r.is_ok()).count();
+                tracing::debug!("Deleted {} objects", deleted_count);
+            }
+        } else {
+            tracing::info!("Resuming: preserving existing Zarr data");
         }
 
         let zarr_store = Arc::new(AsyncObjectStore::new(store.clone()));

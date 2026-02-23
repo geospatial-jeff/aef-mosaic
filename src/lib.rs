@@ -25,6 +25,7 @@
 //! }
 //! ```
 
+pub mod checkpoint;
 pub mod config;
 pub mod crs;
 pub mod index;
@@ -32,7 +33,8 @@ pub mod io;
 pub mod pipeline;
 pub mod transform;
 
-pub use config::{Config, FilterConfig};
+pub use checkpoint::CheckpointManager;
+pub use config::{CheckpointConfig, Config, FilterConfig};
 pub use index::{InputIndex, OutputGrid, SpatialLookup};
 pub use io::{CogReader, ZarrWriter};
 pub use pipeline::{Metrics, MetricsReporter, Pipeline, PipelineConfig, PipelineStats};
@@ -140,13 +142,36 @@ pub async fn run_pipeline(config: Config) -> Result<PipelineStats> {
     let coverage = spatial_lookup.coverage_stats();
     tracing::info!("{}", coverage);
 
-    // Create Zarr writer
+    // Create checkpoint manager first to determine if we're resuming
+    let output_prefix = io::get_output_prefix(&config);
+    let checkpoint_manager = if config.processing.checkpoint.enabled {
+        Some(Arc::new(
+            CheckpointManager::load_or_create(
+                output_store.clone(),
+                &output_prefix,
+                &config,
+                config.processing.checkpoint.interval_secs,
+            )
+            .await?,
+        ))
+    } else {
+        None
+    };
+
+    // Check if we're resuming (have completed chunks)
+    let is_resuming = checkpoint_manager
+        .as_ref()
+        .map(|c| c.completed_count() > 0)
+        .unwrap_or(false);
+
+    // Create Zarr writer - use open_for_resume if we have existing progress
     tracing::info!("Writing Zarr output to: {}", config.output.path_display());
 
-    let output_prefix = io::get_output_prefix(&config);
-    let zarr_writer = Arc::new(
-        ZarrWriter::create(output_store.clone(), output_prefix, output_grid.clone(), &config).await?,
-    );
+    let zarr_writer = Arc::new(if is_resuming {
+        ZarrWriter::open_for_resume(output_store.clone(), output_prefix, output_grid.clone(), &config).await?
+    } else {
+        ZarrWriter::create(output_store.clone(), output_prefix, output_grid.clone(), &config).await?
+    });
 
     // Create metrics
     let metrics = Metrics::new();
@@ -167,6 +192,23 @@ pub async fn run_pipeline(config: Config) -> Result<PipelineStats> {
         .filter(|chunk| spatial_lookup.chunk_has_data(chunk))
         .collect();
 
+    // Filter out already-completed chunks if resuming
+    let already_completed = if let Some(ref checkpoint) = checkpoint_manager {
+        let before_count = chunks.len();
+        chunks.retain(|chunk| !checkpoint.is_completed(chunk));
+        let completed = before_count - chunks.len();
+        if completed > 0 {
+            tracing::info!(
+                "Resuming: {} chunks remaining ({} already completed)",
+                chunks.len(),
+                completed
+            );
+        }
+        completed
+    } else {
+        0
+    };
+
     // Sort by time first, then row, then column for cache locality
     // Processing all chunks for one year before moving to the next maximizes
     // tile cache hits since tiles from the same year are reused across spatial chunks
@@ -174,9 +216,10 @@ pub async fn run_pipeline(config: Config) -> Result<PipelineStats> {
 
     let total_chunks = chunks.len();
     tracing::info!(
-        "Work estimate: {} chunks with data (filtered from {} total)",
+        "Work estimate: {} chunks with data (filtered from {} total, {} already completed)",
         total_chunks,
-        output_grid.num_chunks()
+        output_grid.num_chunks(),
+        already_completed
     );
 
     // Create pipeline config
@@ -203,6 +246,7 @@ pub async fn run_pipeline(config: Config) -> Result<PipelineStats> {
         output_grid,
         metrics.clone(),
         pipeline_config,
+        checkpoint_manager.clone(),
     );
 
     // Start metrics reporter if enabled
@@ -243,6 +287,14 @@ pub async fn run_pipeline(config: Config) -> Result<PipelineStats> {
             if let Err(e) = snapshot.save_to_file(path) {
                 tracing::warn!("Failed to save metrics to {}: {}", path, e);
             }
+        }
+    }
+
+    // Shutdown checkpoint manager (flushes final state)
+    if let Some(checkpoint) = checkpoint_manager {
+        // Unwrap Arc to get owned CheckpointManager for shutdown
+        if let Ok(checkpoint) = Arc::try_unwrap(checkpoint) {
+            checkpoint.shutdown().await?;
         }
     }
 
