@@ -25,7 +25,7 @@ use object_store::path::Path;
 use object_store::ObjectStore;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, RwLock, Semaphore};
 
 /// Affine geotransform for converting between pixel and world coordinates.
 ///
@@ -400,6 +400,9 @@ impl TileDataCache {
     }
 }
 
+/// Default maximum concurrent HTTP requests
+const DEFAULT_MAX_CONCURRENT_HTTP: usize = 128;
+
 /// Async COG reader for fetching windowed tile data from S3.
 pub struct CogReader {
     /// Object store for S3 access
@@ -416,6 +419,9 @@ pub struct CogReader {
 
     /// Optional metrics for cache and read statistics
     metrics: Option<Arc<Metrics>>,
+
+    /// Global semaphore to limit concurrent HTTP requests across all workers
+    http_semaphore: Arc<Semaphore>,
 }
 
 /// Default tile cache size: 32 GB
@@ -430,6 +436,7 @@ impl CogReader {
             metadata_cache: Arc::new(TiffMetadataCache::new(10_000, None)),
             tile_cache: Arc::new(TileDataCache::new(DEFAULT_TILE_CACHE_BYTES, None)),
             metrics: None,
+            http_semaphore: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_HTTP)),
         }
     }
 
@@ -441,6 +448,7 @@ impl CogReader {
             metadata_cache: Arc::new(TiffMetadataCache::new(10_000, Some(metrics.clone()))),
             tile_cache: Arc::new(TileDataCache::new(DEFAULT_TILE_CACHE_BYTES, Some(metrics.clone()))),
             metrics: Some(metrics),
+            http_semaphore: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_HTTP)),
         }
     }
 
@@ -463,6 +471,38 @@ impl CogReader {
             metadata_cache: Arc::new(TiffMetadataCache::new(metadata_cache_entries, metrics.clone())),
             tile_cache: Arc::new(TileDataCache::new(tile_cache_bytes, metrics.clone())),
             metrics,
+            http_semaphore: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_HTTP)),
+        }
+    }
+
+    /// Create a new COG reader with HTTP concurrency limit.
+    ///
+    /// # Arguments
+    /// * `store` - Object store for S3 access
+    /// * `max_concurrent_http` - Maximum concurrent HTTP requests (default: 128)
+    /// * `metadata_cache_entries` - Maximum entries in TIFF metadata cache
+    /// * `tile_cache_bytes` - Maximum tile cache size in bytes
+    /// * `metrics` - Optional metrics collector
+    pub fn with_http_limit(
+        store: Arc<dyn ObjectStore>,
+        max_concurrent_http: usize,
+        metadata_cache_entries: usize,
+        tile_cache_bytes: u64,
+        metrics: Option<Arc<Metrics>>,
+    ) -> Self {
+        tracing::info!(
+            "Creating CogReader with max_concurrent_http={}, metadata_cache={}, tile_cache={}GB",
+            max_concurrent_http,
+            metadata_cache_entries,
+            tile_cache_bytes as f64 / 1024.0 / 1024.0 / 1024.0
+        );
+        Self {
+            store,
+            decoder_registry: Arc::new(DecoderRegistry::default()),
+            metadata_cache: Arc::new(TiffMetadataCache::new(metadata_cache_entries, metrics.clone())),
+            tile_cache: Arc::new(TileDataCache::new(tile_cache_bytes, metrics.clone())),
+            metrics,
+            http_semaphore: Arc::new(Semaphore::new(max_concurrent_http)),
         }
     }
 
@@ -738,6 +778,9 @@ impl CogReader {
     }
 
     /// Fetch and decode a batch of tiles with coalesced HTTP request.
+    ///
+    /// Acquires a permit from the global HTTP semaphore before making requests
+    /// to prevent connection exhaustion under high concurrency.
     #[allow(clippy::too_many_arguments)]
     async fn fetch_and_decode_tiles(
         &self,
@@ -755,12 +798,20 @@ impl CogReader {
 
         let xy_coords: Vec<(usize, usize)> = tx_vec.iter().map(|&tx| (tx, ty)).collect();
 
+        // Acquire semaphore permit before HTTP request to limit global concurrency.
+        // Permit is released after fetch completes, before CPU-bound decoding.
+        let permit = self.http_semaphore.acquire().await
+            .map_err(|_| anyhow::anyhow!("HTTP semaphore closed"))?;
+
         let fetch_start = std::time::Instant::now();
         let tiles = ifd
             .fetch_tiles(&xy_coords, cached.reader.as_ref())
             .await
             .with_context(|| format!("Failed to fetch tiles for row {} (x={:?})", ty, tx_vec))?;
         let fetch_elapsed = fetch_start.elapsed();
+
+        // Release permit after HTTP fetch completes - decoding is CPU-bound, not network
+        drop(permit);
 
         // Track bytes and metrics for the row request
         let total_raw_bytes: u64 = tiles.iter().map(|t| {

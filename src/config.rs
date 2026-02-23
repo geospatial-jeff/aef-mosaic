@@ -228,6 +228,11 @@ pub struct ProcessingConfig {
     #[serde(default = "default_write_concurrency")]
     pub write_concurrency: usize,
 
+    /// Maximum concurrent HTTP requests across all workers (default: 128)
+    /// This prevents connection exhaustion with high fetch_concurrency values.
+    #[serde(default = "default_max_concurrent_http")]
+    pub max_concurrent_http: usize,
+
     /// Enable metrics reporting
     #[serde(default = "default_true")]
     pub enable_metrics: bool,
@@ -275,6 +280,7 @@ impl Default for ProcessingConfig {
             fetch_concurrency: 8,
             mosaic_concurrency: 8,
             write_concurrency: 8,
+            max_concurrent_http: 128,
             enable_metrics: true,
             metrics_interval_secs: 10,
             tile_cache_gb: 32.0,
@@ -373,6 +379,7 @@ fn default_spatial_chunks() -> usize { 256 }
 fn default_fetch_concurrency() -> usize { 8 }
 fn default_mosaic_concurrency() -> usize { 8 }
 fn default_write_concurrency() -> usize { 8 }
+fn default_max_concurrent_http() -> usize { 128 }
 fn default_true() -> bool { true }
 fn default_metrics_interval() -> u64 { 10 }
 fn default_checkpoint_interval() -> u64 { 60 }
