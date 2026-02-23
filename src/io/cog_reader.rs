@@ -272,6 +272,7 @@ impl TiffMetadataCache {
     }
 
     /// Load metadata from S3 (internal helper).
+    #[tracing::instrument(skip(self, store), fields(path = %object_path))]
     async fn load_metadata(
         &self,
         store: Arc<dyn ObjectStore>,
@@ -879,9 +880,10 @@ impl CogReader {
     /// 2. Limit concurrent decode tasks, preventing blocking pool saturation
     /// 3. Create natural backpressure between fetch and decode stages
     #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(skip(self, cached), fields(cog = %cog_path, row = ty, cols = ?tx_vec))]
     async fn fetch_and_decode_tiles(
         &self,
-        _cog_path: &str,  // Used by caller for cache keys
+        cog_path: &str,
         cached: &Arc<CachedTiff>,
         ty: usize,
         tx_vec: &[usize],

@@ -396,6 +396,12 @@ impl Pipeline {
             let work_rx = work_rx.clone();
 
             let handle = tokio::spawn(async move {
+                // Random jitter to avoid thundering herd on connection pool.
+                // With large shards, fetches can take 30-60+ seconds, so spreading
+                // workers over 0-30s prevents simultaneous connection storms.
+                let jitter_secs = rand::random::<f64>() * 30.0;
+                tokio::time::sleep(std::time::Duration::from_secs_f64(jitter_secs)).await;
+
                 // Process chunks sequentially from the shared queue
                 while let Ok(work) = work_rx.recv().await {
                     // Fetch all tile windows for this chunk
@@ -477,6 +483,8 @@ impl Pipeline {
                     fetched = mosaic_rx.recv() => {
                         match fetched {
                             Some(fetched) => {
+                                tracing::info!(chunk = ?fetched.chunk, "mosaic worker starting");
+
                                 let output_grid = output_grid.clone();
                                 let metrics = metrics.clone();
                                 let write_tx = write_tx.clone();
