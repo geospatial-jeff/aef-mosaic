@@ -179,11 +179,23 @@ pub async fn run_pipeline(config: Config) -> Result<PipelineStats> {
     // Create COG reader with cache sizes and HTTP concurrency limit from config
     let tile_cache_bytes = (config.processing.tile_cache_gb * 1024.0 * 1024.0 * 1024.0) as u64;
 
+    // Scale metadata cache with tile count: use max of config value or 25% of tiles
+    // This ensures good cache hit rates for large datasets
+    let scaled_metadata_cache = config.processing.metadata_cache_entries
+        .max(input_index.len() / 4);
+
+    tracing::info!(
+        "Metadata cache: {} entries (config: {}, scaled from {} tiles)",
+        scaled_metadata_cache,
+        config.processing.metadata_cache_entries,
+        input_index.len()
+    );
+
     let cog_reader = Arc::new(CogReader::with_http_limit(
         cog_store,
         config.processing.max_concurrent_http,
         config.processing.tile_cache_enabled,
-        config.processing.metadata_cache_entries,
+        scaled_metadata_cache,
         tile_cache_bytes,
         Some(metrics.clone()),
     ));

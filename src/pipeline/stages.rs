@@ -29,15 +29,18 @@ use crate::pipeline::Metrics;
 use crate::transform::{mosaic_tiles, ReprojectConfig, Reprojector};
 use anyhow::Result;
 use dashmap::DashSet;
-use futures::stream::{self, StreamExt};
+use futures::stream::{self, FuturesUnordered, StreamExt};
 use ndarray::Array4;
 use std::cell::RefCell;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
-// Thread-local ProjCache to avoid re-initializing PROJ for every chunk
-// while respecting Proj's thread-safety constraints.
+// Thread-local ProjCache to cache Proj objects per-thread.
+// Note: Proj objects contain raw pointers and are not Send/Sync, so we cannot
+// share them across threads. The thread-local approach is necessary.
+// Memory usage: ~10KB per UTM zone × ~60 zones × N threads.
+// With the blocking pool default of 512 threads, worst case is ~300MB.
 thread_local! {
     static PROJ_CACHE: RefCell<ProjCache> = RefCell::new(ProjCache::new());
 }
@@ -439,8 +442,9 @@ impl Pipeline {
         let mosaic_concurrency = self.config.mosaic_concurrency;
 
         tokio::spawn(async move {
-            // Collect incoming fetched chunks and process them concurrently
-            let mut pending_futures = Vec::new();
+            // Use FuturesUnordered for O(1) polling instead of O(n) select_all
+            let mut pending_futures: FuturesUnordered<tokio::task::JoinHandle<()>> =
+                FuturesUnordered::new();
 
             loop {
                 tokio::select! {
@@ -500,19 +504,17 @@ impl Pipeline {
 
                                 pending_futures.push(tokio::spawn(future));
 
-                                // Limit concurrency
+                                // Limit concurrency - drain completed futures until below limit
                                 while pending_futures.len() >= mosaic_concurrency {
-                                    // Wait for at least one to complete
-                                    let (result, _idx, remaining) = futures::future::select_all(pending_futures).await;
-                                    let _ = result; // Ignore JoinHandle result
-                                    pending_futures = remaining;
+                                    // Wait for at least one to complete (O(1) with FuturesUnordered)
+                                    if pending_futures.next().await.is_none() {
+                                        break;
+                                    }
                                 }
                             }
                             None => {
                                 // Input channel closed, wait for remaining work
-                                for handle in pending_futures {
-                                    let _ = handle.await;
-                                }
+                                while pending_futures.next().await.is_some() {}
                                 return;
                             }
                         }
@@ -533,7 +535,9 @@ impl Pipeline {
         let write_concurrency = self.config.write_concurrency;
 
         tokio::spawn(async move {
-            let mut pending_futures = Vec::new();
+            // Use FuturesUnordered for O(1) polling instead of O(n) select_all
+            let mut pending_futures: FuturesUnordered<tokio::task::JoinHandle<()>> =
+                FuturesUnordered::new();
 
             loop {
                 tokio::select! {
@@ -566,18 +570,17 @@ impl Pipeline {
 
                                 pending_futures.push(tokio::spawn(future));
 
-                                // Limit concurrency
+                                // Limit concurrency - drain completed futures until below limit
                                 while pending_futures.len() >= write_concurrency {
-                                    let (result, _idx, remaining) = futures::future::select_all(pending_futures).await;
-                                    let _ = result;
-                                    pending_futures = remaining;
+                                    // Wait for at least one to complete (O(1) with FuturesUnordered)
+                                    if pending_futures.next().await.is_none() {
+                                        break;
+                                    }
                                 }
                             }
                             None => {
                                 // Input channel closed, wait for remaining work
-                                for handle in pending_futures {
-                                    let _ = handle.await;
-                                }
+                                while pending_futures.next().await.is_some() {}
                                 return;
                             }
                         }
@@ -652,8 +655,7 @@ fn compute_fetch_requests(
     geo_transforms: Vec<(Arc<CogTile>, Result<Option<GeoTransform>, anyhow::Error>)>,
     chunk_bounds_wgs84: &[f64; 4],
 ) -> Vec<FetchRequest> {
-    // Use thread-local ProjCache to cache Proj objects per-thread
-    // This avoids recreating Proj for every chunk while respecting thread-safety
+    // Use thread-local ProjCache - Proj objects are not thread-safe
     PROJ_CACHE.with(|cache| {
         let proj_cache = cache.borrow();
 

@@ -392,7 +392,7 @@ fn default_checkpoint_interval() -> u64 { 60 }
 fn default_num_bands() -> usize { 64 }
 fn default_compression_level() -> i32 { 3 }
 fn default_tile_cache_gb() -> f64 { 32.0 }
-fn default_metadata_cache_entries() -> usize { 10_000 }
+fn default_metadata_cache_entries() -> usize { 50_000 }
 
 #[cfg(test)]
 mod tests {
