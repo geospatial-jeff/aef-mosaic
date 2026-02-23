@@ -163,11 +163,6 @@ impl AdaptiveGrid {
         Self { cells }
     }
 
-    /// Get the cells for iteration.
-    fn iter(&self) -> impl Iterator<Item = &GridCell> {
-        self.cells.iter()
-    }
-
     /// Transform a destination pixel coordinate to source CRS coordinates.
     fn transform_point(
         dst_x: usize,
