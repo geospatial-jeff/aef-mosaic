@@ -142,15 +142,8 @@ pub async fn run_pipeline(config: Config) -> Result<PipelineStats> {
     let coverage = spatial_lookup.coverage_stats();
     tracing::info!("{}", coverage);
 
-    // Create Zarr writer
-    tracing::info!("Writing Zarr output to: {}", config.output.path_display());
-
+    // Create checkpoint manager first to determine if we're resuming
     let output_prefix = io::get_output_prefix(&config);
-    let zarr_writer = Arc::new(
-        ZarrWriter::create(output_store.clone(), output_prefix, output_grid.clone(), &config).await?,
-    );
-
-    // Create checkpoint manager if enabled
     let checkpoint_manager = if config.processing.checkpoint.enabled {
         Some(Arc::new(
             CheckpointManager::load_or_create(
@@ -164,6 +157,21 @@ pub async fn run_pipeline(config: Config) -> Result<PipelineStats> {
     } else {
         None
     };
+
+    // Check if we're resuming (have completed chunks)
+    let is_resuming = checkpoint_manager
+        .as_ref()
+        .map(|c| c.completed_count() > 0)
+        .unwrap_or(false);
+
+    // Create Zarr writer - use open_for_resume if we have existing progress
+    tracing::info!("Writing Zarr output to: {}", config.output.path_display());
+
+    let zarr_writer = Arc::new(if is_resuming {
+        ZarrWriter::open_for_resume(output_store.clone(), output_prefix, output_grid.clone(), &config).await?
+    } else {
+        ZarrWriter::create(output_store.clone(), output_prefix, output_grid.clone(), &config).await?
+    });
 
     // Create metrics
     let metrics = Metrics::new();
