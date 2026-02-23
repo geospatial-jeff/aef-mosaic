@@ -312,9 +312,9 @@ impl Pipeline {
         let total_chunks = chunks.len();
 
         // Create channels between stages
-        // Buffer = 2x downstream workers to keep them fed
-        let fetch_buffer = self.config.mosaic_concurrency * 2;
-        let write_buffer = self.config.write_concurrency * 2;
+        // Buffer = downstream worker count (1:1 to limit memory usage)
+        let fetch_buffer = self.config.mosaic_concurrency;
+        let write_buffer = self.config.write_concurrency;
         let (mosaic_tx, mosaic_rx) = mpsc::channel::<FetchedChunk>(fetch_buffer);
         let (write_tx, write_rx) = async_channel::bounded::<MosaicedChunk>(write_buffer);
 
