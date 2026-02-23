@@ -90,14 +90,21 @@ fn run_command(config_path: PathBuf, concurrency: Option<usize>, dry_run: bool) 
     }
 
     // Build Tokio runtime with explicit thread configuration.
-    // - max_blocking_threads(64): Limits blocking threads from 512 default.
-    //   Each spawn_blocking task runs Rayon par_iter(), so we only need ~64 max.
-    //   This also reduces memory from thread-local ProjCache instances.
+    // - worker_threads: One per CPU core for async tasks
+    // - max_blocking_threads: 2x mosaic_concurrency for spawn_blocking headroom.
+    //   Each spawn_blocking task runs Rayon par_iter(). We limit this to reduce
+    //   memory from thread-local ProjCache instances (~300MB at 512 default).
+    let num_cpus = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4);
+    let max_blocking = (config.processing.mosaic_concurrency * 2).max(num_cpus);
     let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4))
-        .max_blocking_threads(64)
+        .worker_threads(num_cpus)
+        .max_blocking_threads(max_blocking)
         .enable_all()
         .build()?;
+    tracing::info!(
+        "Runtime: {} worker threads, {} max blocking threads",
+        num_cpus, max_blocking
+    );
     runtime.block_on(async { run_pipeline(config).await })?;
 
     Ok(())
@@ -110,9 +117,10 @@ fn analyze_command(config_path: PathBuf) -> Result<()> {
 }
 
 fn analyze_work(config: &Config) -> Result<()> {
+    let num_cpus = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4);
     let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4))
-        .max_blocking_threads(64)
+        .worker_threads(num_cpus)
+        .max_blocking_threads(num_cpus)  // Analyze doesn't need many blocking threads
         .enable_all()
         .build()?;
 
