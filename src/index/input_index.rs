@@ -13,6 +13,24 @@ use std::sync::Arc;
 
 use crate::crs::ProjCache;
 
+/// Reference wrapper for float arrays to avoid allocation during row-wise access.
+/// Handles both Float64Array and Float32Array transparently.
+enum FloatArrayRef<'a> {
+    F64(&'a Float64Array),
+    F32(&'a arrow::array::Float32Array),
+}
+
+impl<'a> FloatArrayRef<'a> {
+    /// Get value at index as f64 (converts f32 if needed).
+    #[inline]
+    fn get_f64(&self, i: usize) -> f64 {
+        match self {
+            FloatArrayRef::F64(arr) => arr.value(i),
+            FloatArrayRef::F32(arr) => arr.value(i) as f64,
+        }
+    }
+}
+
 /// A single COG tile from the AEF index.
 #[derive(Debug, Clone)]
 pub struct CogTile {
@@ -141,14 +159,13 @@ impl InputIndex {
         let reader = builder.build()?;
 
         let proj_cache = ProjCache::new();
-        let mut tiles = Vec::new();
+        // Pre-allocate with Arc directly - avoids double allocation
+        let mut tiles: Vec<Arc<CogTile>> = Vec::new();
         for batch_result in reader {
             let batch = batch_result?;
             Self::extract_tiles_from_batch(&batch, &mut tiles, &proj_cache)?;
         }
 
-        // Wrap tiles in Arc for cheap cloning
-        let tiles: Vec<Arc<CogTile>> = tiles.into_iter().map(Arc::new).collect();
         // Build RTree using ArcTile wrapper (cloning Arc is cheap)
         let rtree_tiles: Vec<ArcTile> = tiles.iter().map(|t| ArcTile(Arc::clone(t))).collect();
         let rtree = RTree::bulk_load(rtree_tiles);
@@ -175,14 +192,13 @@ impl InputIndex {
         let reader = builder.build()?;
 
         let proj_cache = ProjCache::new();
-        let mut tiles = Vec::new();
+        // Pre-allocate with Arc directly - avoids double allocation
+        let mut tiles: Vec<Arc<CogTile>> = Vec::new();
         for batch_result in reader {
             let batch = batch_result?;
             Self::extract_tiles_from_batch(&batch, &mut tiles, &proj_cache)?;
         }
 
-        // Wrap tiles in Arc for cheap cloning
-        let tiles: Vec<Arc<CogTile>> = tiles.into_iter().map(Arc::new).collect();
         // Build RTree using ArcTile wrapper (cloning Arc is cheap)
         let rtree_tiles: Vec<ArcTile> = tiles.iter().map(|t| ArcTile(Arc::clone(t))).collect();
         let rtree = RTree::bulk_load(rtree_tiles);
@@ -193,12 +209,16 @@ impl InputIndex {
     }
 
     /// Extract tiles from a record batch.
+    ///
+    /// Memory-optimized: processes row-by-row and wraps in Arc immediately
+    /// to avoid intermediate column Vecs and double allocation.
     fn extract_tiles_from_batch(
         batch: &RecordBatch,
-        tiles: &mut Vec<CogTile>,
+        tiles: &mut Vec<Arc<CogTile>>,
         proj_cache: &ProjCache,
     ) -> Result<()> {
         let schema = batch.schema();
+        let num_rows = batch.num_rows();
 
         // Get column indices - flexible to handle different column naming conventions
         let tile_id_col = Self::find_column(&schema, &["tile_id", "id", "name", "fid"])?;
@@ -218,57 +238,52 @@ impl InputIndex {
         let max_lat_col = Self::find_column(&schema, &["max_lat", "lat_max", "north", "wgs84_north"])?;
 
         // Resolution is optional for AEF (fixed at 10m)
-        let resolution_col = Self::find_column(&schema, &["resolution", "res", "pixel_size"]);
-        let year_col = Self::find_column(&schema, &["year", "date_year"]);
+        let resolution_col = Self::find_column(&schema, &["resolution", "res", "pixel_size"]).ok();
+        let year_col = Self::find_column(&schema, &["year", "date_year"]).ok();
 
-        // Extract arrays - handle both string and int tile IDs
+        // Get column arrays as references (no allocation) for row-wise processing
         let tile_id_arr = batch.column(tile_id_col);
-        let tile_ids: Vec<String> = if let Some(str_arr) = tile_id_arr.as_any().downcast_ref::<StringArray>() {
-            (0..str_arr.len()).map(|i| str_arr.value(i).to_string()).collect()
-        } else if let Some(i64_arr) = tile_id_arr.as_any().downcast_ref::<arrow::array::Int64Array>() {
-            (0..i64_arr.len()).map(|i| i64_arr.value(i).to_string()).collect()
-        } else if let Some(i32_arr) = tile_id_arr.as_any().downcast_ref::<arrow::array::Int32Array>() {
-            (0..i32_arr.len()).map(|i| i32_arr.value(i).to_string()).collect()
-        } else {
-            anyhow::bail!("tile_id column must be string or integer");
-        };
-
-        let s3_paths = batch.column(s3_path_col).as_any().downcast_ref::<StringArray>()
+        let s3_path_arr = batch.column(s3_path_col).as_any().downcast_ref::<StringArray>()
             .context("s3_path/location column must be string")?;
-        let crs_values = batch.column(crs_col).as_any().downcast_ref::<StringArray>()
+        let crs_arr = batch.column(crs_col).as_any().downcast_ref::<StringArray>()
             .context("crs column must be string")?;
 
-        let min_x = Self::get_f64_array(batch.column(min_x_col))?;
-        let min_y = Self::get_f64_array(batch.column(min_y_col))?;
-        let max_x = Self::get_f64_array(batch.column(max_x_col))?;
-        let max_y = Self::get_f64_array(batch.column(max_y_col))?;
+        // Get float arrays as references
+        let min_x_arr = Self::get_f64_array_ref(batch.column(min_x_col))?;
+        let min_y_arr = Self::get_f64_array_ref(batch.column(min_y_col))?;
+        let max_x_arr = Self::get_f64_array_ref(batch.column(max_x_col))?;
+        let max_y_arr = Self::get_f64_array_ref(batch.column(max_y_col))?;
+        let min_lon_arr = Self::get_f64_array_ref(batch.column(min_lon_col))?;
+        let min_lat_arr = Self::get_f64_array_ref(batch.column(min_lat_col))?;
+        let max_lon_arr = Self::get_f64_array_ref(batch.column(max_lon_col))?;
+        let max_lat_arr = Self::get_f64_array_ref(batch.column(max_lat_col))?;
 
-        let min_lon = Self::get_f64_array(batch.column(min_lon_col))?;
-        let min_lat = Self::get_f64_array(batch.column(min_lat_col))?;
-        let max_lon = Self::get_f64_array(batch.column(max_lon_col))?;
-        let max_lat = Self::get_f64_array(batch.column(max_lat_col))?;
+        // Optional arrays - get references if present
+        let resolution_arr = resolution_col.and_then(|col| Self::get_f64_array_ref(batch.column(col)).ok());
+        let year_arr = year_col.map(|col| batch.column(col));
 
-        // Resolution is optional (default to 10m for AEF)
-        let resolution: Vec<f64> = resolution_col.ok()
-            .and_then(|col| Self::get_f64_array(batch.column(col)).ok())
-            .unwrap_or_else(|| vec![10.0; batch.num_rows()]);
+        // Reserve capacity to avoid reallocations during row iteration
+        tiles.reserve(num_rows);
 
-        // Year is optional
-        let years: Vec<i32> = year_col.ok().map(|col| {
-            let arr = batch.column(col);
-            if let Some(i32_arr) = arr.as_any().downcast_ref::<arrow::array::Int32Array>() {
-                (0..arr.len()).map(|i| i32_arr.value(i)).collect()
-            } else if let Some(i64_arr) = arr.as_any().downcast_ref::<arrow::array::Int64Array>() {
-                (0..arr.len()).map(|i| i64_arr.value(i) as i32).collect()
-            } else {
-                vec![2024; arr.len()]
-            }
-        }).unwrap_or_else(|| vec![2024; batch.num_rows()]);
+        // Process row-by-row, wrapping in Arc immediately
+        for i in 0..num_rows {
+            let bounds_native = [
+                min_x_arr.get_f64(i),
+                min_y_arr.get_f64(i),
+                max_x_arr.get_f64(i),
+                max_y_arr.get_f64(i),
+            ];
+            let bounds_wgs84 = [
+                min_lon_arr.get_f64(i),
+                min_lat_arr.get_f64(i),
+                max_lon_arr.get_f64(i),
+                max_lat_arr.get_f64(i),
+            ];
 
-        for i in 0..batch.num_rows() {
-            let bounds_native = [min_x[i], min_y[i], max_x[i], max_y[i]];
-            let bounds_wgs84 = [min_lon[i], min_lat[i], max_lon[i], max_lat[i]];
-            let crs = crs_values.value(i).to_string();
+            // Get tile_id - handle string or integer
+            let tile_id = Self::get_tile_id(tile_id_arr, i)?;
+
+            let crs = crs_arr.value(i).to_string();
 
             // Compute exact footprint by transforming 4 corners from native CRS to WGS84
             let footprint_wgs84 = CogTile::compute_footprint(&bounds_native, &crs, proj_cache)
@@ -277,20 +292,58 @@ impl InputIndex {
                     CogTile::footprint_from_wgs84_bounds(&bounds_wgs84)
                 });
 
-            let tile = CogTile {
-                tile_id: tile_ids[i].clone(),
-                s3_path: s3_paths.value(i).to_string(),
+            // Get resolution (default 10.0 for AEF)
+            let resolution = resolution_arr
+                .as_ref()
+                .map(|arr| arr.get_f64(i))
+                .unwrap_or(10.0);
+
+            // Get year (default 2024)
+            let year = Self::get_year(year_arr, i);
+
+            // Wrap in Arc immediately to avoid double allocation
+            tiles.push(Arc::new(CogTile {
+                tile_id,
+                s3_path: s3_path_arr.value(i).to_string(),
                 crs,
                 bounds_native,
                 bounds_wgs84,
                 footprint_wgs84,
-                resolution: resolution[i],
-                year: years[i],
-            };
-            tiles.push(tile);
+                resolution,
+                year,
+            }));
         }
 
         Ok(())
+    }
+
+    /// Get tile_id from array at index, handling string or integer types.
+    fn get_tile_id(arr: &Arc<dyn Array>, i: usize) -> Result<String> {
+        if let Some(str_arr) = arr.as_any().downcast_ref::<StringArray>() {
+            Ok(str_arr.value(i).to_string())
+        } else if let Some(i64_arr) = arr.as_any().downcast_ref::<arrow::array::Int64Array>() {
+            Ok(i64_arr.value(i).to_string())
+        } else if let Some(i32_arr) = arr.as_any().downcast_ref::<arrow::array::Int32Array>() {
+            Ok(i32_arr.value(i).to_string())
+        } else {
+            anyhow::bail!("tile_id column must be string or integer")
+        }
+    }
+
+    /// Get year from optional array at index (default 2024).
+    fn get_year(arr: Option<&Arc<dyn Array>>, i: usize) -> i32 {
+        match arr {
+            Some(arr) => {
+                if let Some(i32_arr) = arr.as_any().downcast_ref::<arrow::array::Int32Array>() {
+                    i32_arr.value(i)
+                } else if let Some(i64_arr) = arr.as_any().downcast_ref::<arrow::array::Int64Array>() {
+                    i64_arr.value(i) as i32
+                } else {
+                    2024
+                }
+            }
+            None => 2024,
+        }
     }
 
     /// Find a column by checking multiple possible names.
@@ -306,12 +359,13 @@ impl InputIndex {
         )
     }
 
-    /// Get f64 values from an array (handles f32 and f64).
-    fn get_f64_array(array: &Arc<dyn Array>) -> Result<Vec<f64>> {
+    /// Reference to a float array that supports f64 access without allocation.
+    /// Handles both Float64Array and Float32Array.
+    fn get_f64_array_ref(array: &Arc<dyn Array>) -> Result<FloatArrayRef<'_>> {
         if let Some(arr) = array.as_any().downcast_ref::<Float64Array>() {
-            Ok((0..arr.len()).map(|i| arr.value(i)).collect())
+            Ok(FloatArrayRef::F64(arr))
         } else if let Some(arr) = array.as_any().downcast_ref::<arrow::array::Float32Array>() {
-            Ok((0..arr.len()).map(|i| arr.value(i) as f64).collect())
+            Ok(FloatArrayRef::F32(arr))
         } else {
             anyhow::bail!("Expected float array")
         }

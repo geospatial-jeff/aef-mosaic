@@ -248,11 +248,11 @@ impl Pipeline {
             let (chunk_lon, chunk_lat) = bounds_centroid(&chunk_bounds_wgs84);
             let chunk_hilbert = wgs84_hilbert_index(chunk_lon, chunk_lat);
 
-            let tile_refs: Vec<_> = tiles.iter().map(|t| Arc::clone(t)).collect();
-
+            // Use tiles directly - no need to clone Arc refs since tiles_for_chunk
+            // already returns Vec<Arc<CogTile>>
             work_items.push(ChunkWorkItem {
                 chunk,
-                tiles: tile_refs,
+                tiles,
                 chunk_bounds,
                 chunk_bounds_wgs84,
                 sort_key: (cog_hilbert, chunk_hilbert),
@@ -515,11 +515,9 @@ async fn fetch_tile_windows(
     // Fixed HTTP concurrency within a chunk
     const HTTP_CONCURRENCY: usize = 32;
 
-    // Clone tiles for owned iteration
-    let tiles_owned: Vec<_> = tiles.iter().cloned().collect();
-
     // Step 1: Fetch geotransforms concurrently (async)
-    let geo_transforms: Vec<_> = stream::iter(tiles_owned)
+    // Clone Arc refs during iteration (cheap) instead of pre-cloning entire Vec
+    let geo_transforms: Vec<_> = stream::iter(tiles.iter().cloned())
         .map(|tile| {
             let reader = reader;
             async move {
