@@ -18,17 +18,18 @@ use ndarray::Array3;
 use proj::Proj;
 use rayon::prelude::*;
 use std::cell::UnsafeCell;
+use wide::f32x8;
 
 /// Maximum interpolation error in pixels before subdividing.
-/// GDAL uses 0.125 by default; we use 0.5 for good balance of speed/accuracy.
-const ERROR_THRESHOLD_PIXELS: f64 = 0.5;
+/// GDAL uses 0.125 by default; we use 0.75 for good balance of speed/accuracy.
+const ERROR_THRESHOLD_PIXELS: f64 = 0.75;
 
 /// Initial block size for adaptive grid (will subdivide as needed).
-const INITIAL_BLOCK_SIZE: usize = 64;
+const INITIAL_BLOCK_SIZE: usize = 128;
 
 /// Minimum block size - don't subdivide smaller than this.
 /// Tuned for balance between parallelization overhead and granularity.
-const MIN_BLOCK_SIZE: usize = 8;
+const MIN_BLOCK_SIZE: usize = 16;
 
 /// Nodata value for AEF embeddings (int8).
 const NODATA: i8 = -128;
@@ -166,29 +167,31 @@ impl GridCell {
         // So: val = base + (slope / width) * (dst_col - dst_x0)
         let inv_width = if width > 0.0 { 1.0 / width } else { 0.0 };
 
+        // Cast to f32 for SIMD-friendly operations
         RowCoefficients {
-            base_x: x_left,
-            slope_x: (x_right - x_left) * inv_width,
-            base_y: y_left,
-            slope_y: (y_right - y_left) * inv_width,
+            base_x: x_left as f32,
+            slope_x: ((x_right - x_left) * inv_width) as f32,
+            base_y: y_left as f32,
+            slope_y: ((y_right - y_left) * inv_width) as f32,
         }
     }
 }
 
 /// Pre-computed linear interpolation coefficients for a single row.
+/// Uses f32 for SIMD-friendly operations (8x f32 fits in AVX register).
 /// Reduces bilinear interpolation from ~16 ops to 4 ops per pixel.
 #[derive(Debug, Clone, Copy)]
 struct RowCoefficients {
-    base_x: f64,
-    slope_x: f64,
-    base_y: f64,
-    slope_y: f64,
+    base_x: f32,
+    slope_x: f32,
+    base_y: f32,
+    slope_y: f32,
 }
 
 impl RowCoefficients {
     /// Interpolate source coordinates for a column offset within the cell.
     #[inline]
-    fn interpolate(&self, col_offset: f64) -> (f64, f64) {
+    fn interpolate(&self, col_offset: f32) -> (f32, f32) {
         (
             self.base_x + self.slope_x * col_offset,
             self.base_y + self.slope_y * col_offset,
@@ -221,6 +224,7 @@ struct AdaptiveGrid {
 impl AdaptiveGrid {
     /// Build an adaptive grid for the given transformation.
     /// Also builds row spans for efficient row-level parallelization.
+    /// Uses parallel processing for initial block subdivision.
     fn build(
         dst_width: usize,
         dst_height: usize,
@@ -229,29 +233,36 @@ impl AdaptiveGrid {
         target_resolution: f64,
         source_pixel_size: (f64, f64),
     ) -> Self {
-        let mut cells = Vec::new();
-
-        // Start with coarse blocks covering the entire image
+        // Collect initial blocks as coordinates
+        let mut initial_blocks = Vec::new();
         let mut x = 0;
         while x < dst_width {
             let x1 = (x + INITIAL_BLOCK_SIZE).min(dst_width);
             let mut y = 0;
             while y < dst_height {
                 let y1 = (y + INITIAL_BLOCK_SIZE).min(dst_height);
-
-                Self::subdivide_if_needed(
-                    x, y, x1, y1,
-                    inv_proj,
-                    target_bounds,
-                    target_resolution,
-                    source_pixel_size,
-                    &mut cells,
-                );
-
+                initial_blocks.push((x, y, x1, y1));
                 y = y1;
             }
             x = x1;
         }
+
+        // Process blocks in parallel - each block subdivides independently
+        let cells: Vec<GridCell> = initial_blocks
+            .par_iter()
+            .flat_map(|&(x0, y0, x1, y1)| {
+                let mut local_cells = Vec::new();
+                Self::subdivide_if_needed(
+                    x0, y0, x1, y1,
+                    inv_proj,
+                    target_bounds,
+                    target_resolution,
+                    source_pixel_size,
+                    &mut local_cells,
+                );
+                local_cells
+            })
+            .collect();
 
         // Build row spans: flatten cells into individual row segments
         // with pre-computed linear interpolation coefficients.
@@ -525,42 +536,103 @@ impl Reprojector {
         // Each row span has pre-computed linear interpolation coefficients.
         // This provides better CPU utilization than cell-level parallelization
         // because row spans are more uniform in work distribution.
+        //
+        // SIMD optimization: process 8 pixels at a time using f32x8 vectors.
         grid.row_spans.par_iter().for_each(|span| {
             let dst_row = span.dst_row;
             let coeffs = &span.coefficients;
 
-            // Process each column in this span
-            for dst_col in span.dst_x0..span.dst_x1 {
-                // Linear interpolation using pre-computed coefficients
-                // (reduces bilinear from ~16 ops to 4 ops per pixel)
-                let col_offset = (dst_col - span.dst_x0) as f64;
+            // Pre-compute SIMD constants
+            let base_x = f32x8::splat(coeffs.base_x);
+            let slope_x = f32x8::splat(coeffs.slope_x);
+            let base_y = f32x8::splat(coeffs.base_y);
+            let slope_y = f32x8::splat(coeffs.slope_y);
+            let offset_x = f32x8::splat(src_offset_x as f32);
+            let offset_y = f32x8::splat(src_offset_y as f32);
+            let inv_px_x = f32x8::splat(inv_src_pixel_x as f32);
+            let inv_px_y = f32x8::splat(inv_src_pixel_y as f32);
+            let half = f32x8::splat(0.5);
+
+            let mut dst_col = span.dst_x0;
+
+            // Process 8 columns at a time using SIMD
+            while dst_col + 8 <= span.dst_x1 {
+                let base_offset = (dst_col - span.dst_x0) as f32;
+                let offsets = f32x8::from([
+                    base_offset,
+                    base_offset + 1.0,
+                    base_offset + 2.0,
+                    base_offset + 3.0,
+                    base_offset + 4.0,
+                    base_offset + 5.0,
+                    base_offset + 6.0,
+                    base_offset + 7.0,
+                ]);
+
+                // Vectorized interpolation
+                let src_x = base_x + slope_x * offsets;
+                let src_y = base_y + slope_y * offsets;
+
+                // Vectorized coordinate conversion
+                let src_px = (src_x - offset_x) * inv_px_x - half;
+                let src_py = (src_y - offset_y) * inv_px_y - half;
+
+                // Round to nearest (SIMD)
+                let src_cols = src_px.round();
+                let src_rows = src_py.round();
+
+                // Extract and process (bounds check per pixel)
+                let cols: [f32; 8] = src_cols.into();
+                let rows: [f32; 8] = src_rows.into();
+
+                for i in 0..8 {
+                    let col_i = cols[i] as isize;
+                    let row_i = rows[i] as isize;
+
+                    if col_i >= 0
+                        && col_i < src_width as isize
+                        && row_i >= 0
+                        && row_i < src_height as isize
+                    {
+                        // SAFETY: row spans are non-overlapping in destination space,
+                        // so no two threads write to the same (band, dst_row, dst_col)
+                        Self::copy_bands(
+                            &output, data, bands, dst_row,
+                            dst_col + i, row_i as usize, col_i as usize,
+                        );
+                    }
+                }
+
+                dst_col += 8;
+            }
+
+            // Handle remaining columns (scalar fallback for last 0-7 columns)
+            while dst_col < span.dst_x1 {
+                let col_offset = (dst_col - span.dst_x0) as f32;
                 let (src_x, src_y) = coeffs.interpolate(col_offset);
 
                 // Convert source CRS coordinates to pixel coordinates
                 // Source is bottom-up: row 0 is at min_y
-                let src_px = (src_x - src_offset_x) * inv_src_pixel_x - 0.5;
-                let src_py = (src_y - src_offset_y) * inv_src_pixel_y - 0.5;
+                let src_px = (src_x - src_offset_x as f32) * inv_src_pixel_x as f32 - 0.5;
+                let src_py = (src_y - src_offset_y as f32) * inv_src_pixel_y as f32 - 0.5;
 
-                // Nearest neighbor sampling (for i8 embeddings, interpolation doesn't make sense)
+                // Nearest neighbor sampling
                 let src_col_i = src_px.round() as isize;
                 let src_row_i = src_py.round() as isize;
 
                 // Bounds check
-                if src_col_i < 0
-                    || src_col_i >= src_width as isize
-                    || src_row_i < 0
-                    || src_row_i >= src_height as isize
+                if src_col_i >= 0
+                    && src_col_i < src_width as isize
+                    && src_row_i >= 0
+                    && src_row_i < src_height as isize
                 {
-                    continue; // Outside source bounds
+                    Self::copy_bands(
+                        &output, data, bands, dst_row, dst_col,
+                        src_row_i as usize, src_col_i as usize,
+                    );
                 }
 
-                let src_col = src_col_i as usize;
-                let src_row = src_row_i as usize;
-
-                // Copy all bands using SIMD-friendly loop
-                // SAFETY: row spans are non-overlapping in destination space,
-                // so no two threads write to the same (band, dst_row, dst_col)
-                Self::copy_bands(&output, data, bands, dst_row, dst_col, src_row, src_col);
+                dst_col += 1;
             }
         });
 
