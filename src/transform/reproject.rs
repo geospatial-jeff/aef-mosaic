@@ -9,14 +9,13 @@
 //! projection boundaries, we need finer sampling to maintain accuracy.
 //!
 //! Performance optimizations:
-//! - Row-level parallelization for better CPU utilization with large shards
 //! - Pre-computed per-row linear coefficients (reduces bilinear to 2 ops/pixel)
-//! - SIMD-friendly memory layout for band copying
+//! - SIMD vectorization (8 pixels at a time using f32x8)
+//! - Tile-level parallelism handled by caller (mosaic_tiles)
 
 use anyhow::{Context, Result};
 use ndarray::Array3;
 use proj::Proj;
-use rayon::prelude::*;
 use std::cell::UnsafeCell;
 use wide::f32x8;
 
@@ -524,13 +523,14 @@ impl Reprojector {
         let src_offset_x = source_bounds[0];
         let src_offset_y = source_bounds[1];
 
-        // Row-level parallelization: process row spans in parallel.
-        // Each row span has pre-computed linear interpolation coefficients.
-        // This provides better CPU utilization than cell-level parallelization
-        // because row spans are more uniform in work distribution.
+        // Sequential row processing - tile-level parallelism in mosaic_tiles() is sufficient.
+        // Row-level parallelism was removed because:
+        // - Each row has ~256 pixels of work (~500 CPU cycles)
+        // - Rayon task overhead is ~1000+ cycles per task
+        // - SIMD within rows provides vectorization without scheduling overhead
         //
         // SIMD optimization: process 8 pixels at a time using f32x8 vectors.
-        grid.row_spans.par_iter().for_each(|span| {
+        grid.row_spans.iter().for_each(|span| {
             let dst_row = span.dst_row;
             let coeffs = &span.coefficients;
 
