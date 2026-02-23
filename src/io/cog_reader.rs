@@ -512,14 +512,23 @@ impl CogReader {
     /// affine transform between pixel and world coordinates.
     ///
     /// Returns None if the TIFF doesn't have a geotransform tag.
+    ///
+    /// Note: Acquires HTTP semaphore for cache misses to prevent connection exhaustion.
     pub async fn get_geo_transform(&self, tile: &CogTile) -> Result<Option<GeoTransform>> {
         let object_path = self.tile_path(tile)?;
         let path_str = object_path.to_string();
+
+        // Acquire semaphore before potential HTTP request (cache miss)
+        // Released immediately after metadata is loaded
+        let permit = self.http_semaphore.acquire().await
+            .map_err(|_| anyhow::anyhow!("HTTP semaphore closed"))?;
 
         let cached = self
             .metadata_cache
             .get_or_load(&path_str, self.store.clone(), object_path)
             .await?;
+
+        drop(permit);
 
         Ok(cached.geo_transform)
     }
