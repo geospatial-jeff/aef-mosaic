@@ -224,7 +224,6 @@ struct AdaptiveGrid {
 impl AdaptiveGrid {
     /// Build an adaptive grid for the given transformation.
     /// Also builds row spans for efficient row-level parallelization.
-    /// Uses parallel processing for initial block subdivision.
     fn build(
         dst_width: usize,
         dst_height: usize,
@@ -233,36 +232,29 @@ impl AdaptiveGrid {
         target_resolution: f64,
         source_pixel_size: (f64, f64),
     ) -> Self {
-        // Collect initial blocks as coordinates
-        let mut initial_blocks = Vec::new();
+        let mut cells = Vec::new();
+
+        // Start with coarse blocks covering the entire image
         let mut x = 0;
         while x < dst_width {
             let x1 = (x + INITIAL_BLOCK_SIZE).min(dst_width);
             let mut y = 0;
             while y < dst_height {
                 let y1 = (y + INITIAL_BLOCK_SIZE).min(dst_height);
-                initial_blocks.push((x, y, x1, y1));
-                y = y1;
-            }
-            x = x1;
-        }
 
-        // Process blocks in parallel - each block subdivides independently
-        let cells: Vec<GridCell> = initial_blocks
-            .par_iter()
-            .flat_map(|&(x0, y0, x1, y1)| {
-                let mut local_cells = Vec::new();
                 Self::subdivide_if_needed(
-                    x0, y0, x1, y1,
+                    x, y, x1, y1,
                     inv_proj,
                     target_bounds,
                     target_resolution,
                     source_pixel_size,
-                    &mut local_cells,
+                    &mut cells,
                 );
-                local_cells
-            })
-            .collect();
+
+                y = y1;
+            }
+            x = x1;
+        }
 
         // Build row spans: flatten cells into individual row segments
         // with pre-computed linear interpolation coefficients.
