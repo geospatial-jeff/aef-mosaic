@@ -330,7 +330,7 @@ impl Pipeline {
                 interval.tick().await;
                 let fetch_queue = mosaic_tx_monitor.max_capacity() - mosaic_tx_monitor.capacity();
                 let mosaic_queue = write_tx_monitor.max_capacity() - write_tx_monitor.capacity();
-                tracing::debug!(
+                tracing::info!(
                     "Queue backlog: fetch→mosaic {}/{}, mosaic→write {}/{}",
                     fetch_queue, mosaic_tx_monitor.max_capacity(),
                     mosaic_queue, write_tx_monitor.max_capacity()
