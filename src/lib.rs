@@ -253,8 +253,6 @@ pub async fn run_pipeline(config: Config) -> Result<PipelineStats> {
         fetch_concurrency: config.processing.fetch_concurrency,
         mosaic_concurrency: config.processing.mosaic_concurrency,
         write_concurrency: config.processing.write_concurrency,
-        fetch_buffer: 16,
-        mosaic_buffer: 8,
         http_concurrency_per_chunk,
     };
 

@@ -259,10 +259,6 @@ pub struct PipelineConfig {
     pub mosaic_concurrency: usize,
     /// Number of concurrent Zarr write tasks
     pub write_concurrency: usize,
-    /// Channel buffer size between fetch and mosaic stages
-    pub fetch_buffer: usize,
-    /// Channel buffer size between mosaic and write stages
-    pub mosaic_buffer: usize,
     /// HTTP concurrency per chunk (for tile fetches within a single chunk)
     pub http_concurrency_per_chunk: usize,
 }
@@ -273,8 +269,6 @@ impl Default for PipelineConfig {
             fetch_concurrency: 8,
             mosaic_concurrency: 8,
             write_concurrency: 8,
-            fetch_buffer: 16,
-            mosaic_buffer: 8,
             http_concurrency_per_chunk: 32,
         }
     }
@@ -318,10 +312,11 @@ impl Pipeline {
         let total_chunks = chunks.len();
 
         // Create channels between stages
-        // - fetch→mosaic: tokio mpsc (single consumer)
-        // - mosaic→write: async_channel (multiple consumers for concurrent writes)
-        let (mosaic_tx, mosaic_rx) = mpsc::channel::<FetchedChunk>(self.config.fetch_buffer);
-        let (write_tx, write_rx) = async_channel::bounded::<MosaicedChunk>(self.config.mosaic_buffer);
+        // Buffer = 2x downstream workers to keep them fed
+        let fetch_buffer = self.config.mosaic_concurrency * 2;
+        let write_buffer = self.config.write_concurrency * 2;
+        let (mosaic_tx, mosaic_rx) = mpsc::channel::<FetchedChunk>(fetch_buffer);
+        let (write_tx, write_rx) = async_channel::bounded::<MosaicedChunk>(write_buffer);
 
         // Spawn queue monitor for debugging backpressure
         let mosaic_tx_monitor = mosaic_tx.clone();
@@ -777,8 +772,6 @@ mod tests {
         assert_eq!(config.fetch_concurrency, 8);
         assert_eq!(config.mosaic_concurrency, 8);
         assert_eq!(config.write_concurrency, 8);
-        assert_eq!(config.fetch_buffer, 16);
-        assert_eq!(config.mosaic_buffer, 8);
         assert_eq!(config.http_concurrency_per_chunk, 32);
     }
 
