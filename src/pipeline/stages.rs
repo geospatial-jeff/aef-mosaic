@@ -406,7 +406,6 @@ impl Pipeline {
 
                 // Process chunks sequentially from the shared queue
                 while let Ok(work) = work_rx.recv().await {
-                    let worker_start = Instant::now();
                     let chunk_id = work.chunk.chunk_indices();
 
                     // Fetch all tile windows for this chunk
@@ -418,13 +417,14 @@ impl Pipeline {
                         &metrics,
                         http_concurrency_per_chunk,
                     ).await;
-                    metrics.add_cog_read_time(cog_start.elapsed());
+                    let fetch_duration = cog_start.elapsed();
+                    metrics.add_cog_read_time(fetch_duration);
 
                     if window_data.is_empty() {
                         metrics.add_chunk_skipped();
                         tracing::info!(
                             chunk = ?chunk_id,
-                            duration_ms = worker_start.elapsed().as_millis(),
+                            fetch_ms = fetch_duration.as_millis(),
                             "fetch worker completed (skipped)"
                         );
                         continue;
@@ -439,14 +439,17 @@ impl Pipeline {
                         chunk_bounds: work.chunk_bounds,
                     };
 
+                    let send_start = Instant::now();
                     if mosaic_tx.send(fetched).await.is_err() {
                         tracing::debug!("Mosaic receiver dropped, stopping fetch worker");
                         break;
                     }
+                    let channel_wait = send_start.elapsed();
 
                     tracing::info!(
                         chunk = ?chunk_id,
-                        duration_ms = worker_start.elapsed().as_millis(),
+                        fetch_ms = fetch_duration.as_millis(),
+                        channel_wait_ms = channel_wait.as_millis(),
                         "fetch worker completed"
                     );
                 }
@@ -498,8 +501,8 @@ impl Pipeline {
 
             let handle = tokio::spawn(async move {
                 while let Ok(fetched) = mosaic_rx.recv().await {
-                    let worker_start = Instant::now();
                     let chunk_id = fetched.chunk.chunk_indices();
+                    let num_tiles = fetched.window_data.len();
 
                     let pixel_bounds = output_grid.chunk_pixel_bounds(&fetched.chunk);
                     let height = pixel_bounds[2] - pixel_bounds[0];
@@ -518,6 +521,7 @@ impl Pipeline {
                     let metrics_clone = metrics.clone();
 
                     // CPU-bound work in spawn_blocking
+                    let mosaic_start = Instant::now();
                     let mosaic_result = tokio::task::spawn_blocking(move || {
                         let start = Instant::now();
                         let reprojector = Reprojector::new(&target_crs);
@@ -526,6 +530,7 @@ impl Pipeline {
                         result
                     })
                     .await;
+                    let mosaic_duration = mosaic_start.elapsed();
 
                     match mosaic_result {
                         Ok(Ok(mosaic)) => {
@@ -533,13 +538,18 @@ impl Pipeline {
                                 chunk: fetched.chunk,
                                 data: mosaic,
                             };
+                            let send_start = Instant::now();
                             if write_tx.send(mosaiced).await.is_err() {
                                 tracing::debug!("Write receiver dropped, stopping mosaic worker");
                                 break;
                             }
+                            let channel_wait = send_start.elapsed();
+
                             tracing::info!(
                                 chunk = ?chunk_id,
-                                duration_ms = worker_start.elapsed().as_millis(),
+                                num_tiles = num_tiles,
+                                mosaic_ms = mosaic_duration.as_millis(),
+                                channel_wait_ms = channel_wait.as_millis(),
                                 "mosaic worker completed"
                             );
                         }
@@ -585,20 +595,21 @@ impl Pipeline {
                     //
                     // Each worker can write to a different shard concurrently, and rayon
                     // handles parallel compression within each shard.
-                    let worker_start = Instant::now();
                     let bytes_written = mosaiced.data.len() as u64;
                     let chunk = mosaiced.chunk.clone();
                     let chunk_id = chunk.chunk_indices();
 
+                    let write_start = Instant::now();
                     let write_result = tokio::task::block_in_place(|| {
                         writer.write_chunk_sync(&mosaiced.chunk, mosaiced.data)
                     });
+                    let write_duration = write_start.elapsed();
 
                     if let Err(e) = write_result {
                         tracing::warn!("Zarr write failed: {}", e);
                         metrics.add_failure();
                     } else {
-                        metrics.add_zarr_write_time(worker_start.elapsed());
+                        metrics.add_zarr_write_time(write_duration);
                         metrics.add_bytes_written(bytes_written);
                         metrics.add_chunk_processed();
 
@@ -609,7 +620,8 @@ impl Pipeline {
 
                         tracing::info!(
                             chunk = ?chunk_id,
-                            duration_ms = worker_start.elapsed().as_millis(),
+                            write_ms = write_duration.as_millis(),
+                            bytes = bytes_written,
                             "write worker completed"
                         );
                     }

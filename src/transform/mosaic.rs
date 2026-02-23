@@ -167,6 +167,21 @@ pub fn mosaic_tiles(
     let bands = windows[0].data.dim().0;
     let (height, width) = reproject_config.target_shape;
 
+    // Log input sizes before reprojection
+    let total_input_pixels: usize = windows.iter()
+        .map(|w| w.data.dim().1 * w.data.dim().2)
+        .sum();
+    let output_pixels = height * width;
+    let input_output_ratio = total_input_pixels as f64 / output_pixels as f64;
+
+    tracing::info!(
+        num_tiles = windows.len(),
+        total_input_pixels = total_input_pixels,
+        output_pixels = output_pixels,
+        input_output_ratio = format!("{:.2}", input_output_ratio),
+        "mosaic_tiles starting"
+    );
+
     // Reproject all windows in parallel - each window is independent
     // We create a new Reprojector per thread since Proj objects are thread-local
     let reprojected_tiles: Vec<Result<Array3<i8>>> = windows

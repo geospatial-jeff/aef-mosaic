@@ -17,6 +17,7 @@ use anyhow::{Context, Result};
 use ndarray::Array3;
 use proj::Proj;
 use std::cell::UnsafeCell;
+use std::time::Instant;
 use wide::f32x8;
 
 /// Maximum interpolation error in pixels before subdividing.
@@ -488,13 +489,16 @@ impl Reprojector {
         let (dst_height, dst_width) = config.target_shape;
 
         // Create inverse proj transformation (target -> source, for inverse mapping)
+        let proj_start = Instant::now();
         let inv_proj = Self::create_proj(&config.target_crs, source_crs)?;
+        let proj_time = proj_start.elapsed();
 
         // Source pixel size
         let src_pixel_x = (source_bounds[2] - source_bounds[0]) / src_width as f64;
         let src_pixel_y = (source_bounds[3] - source_bounds[1]) / src_height as f64;
 
         // Build adaptive grid
+        let grid_start = Instant::now();
         let grid = AdaptiveGrid::build(
             dst_width,
             dst_height,
@@ -503,6 +507,7 @@ impl Reprojector {
             config.target_resolution,
             (src_pixel_x, src_pixel_y),
         );
+        let grid_time = grid_start.elapsed();
 
         let num_cells = grid.cells.len();
         let num_row_spans = grid.row_spans.len();
@@ -530,6 +535,7 @@ impl Reprojector {
         // - SIMD within rows provides vectorization without scheduling overhead
         //
         // SIMD optimization: process 8 pixels at a time using f32x8 vectors.
+        let copy_start = Instant::now();
         grid.row_spans.iter().for_each(|span| {
             let dst_row = span.dst_row;
             let coeffs = &span.coefficients;
@@ -628,16 +634,25 @@ impl Reprojector {
             }
         });
 
+        let copy_time = copy_start.elapsed();
+
         let output = output.into_inner();
         let valid_pixels = output.iter().filter(|&&v| v != NODATA).count();
-        tracing::debug!(
-            "Adaptive reproject: {}x{} -> {}x{}, {} cells, {} valid pixels",
-            src_width,
-            src_height,
-            dst_width,
-            dst_height,
-            grid.cells.len(),
-            valid_pixels
+        let input_pixels = src_width * src_height;
+        let output_pixels = dst_width * dst_height;
+
+        tracing::info!(
+            input_shape = ?(src_height, src_width),
+            output_shape = ?(dst_height, dst_width),
+            input_pixels = input_pixels,
+            output_pixels = output_pixels,
+            valid_pixels = valid_pixels,
+            num_cells = num_cells,
+            num_row_spans = num_row_spans,
+            proj_ms = proj_time.as_micros() as f64 / 1000.0,
+            grid_ms = grid_time.as_micros() as f64 / 1000.0,
+            copy_ms = copy_time.as_micros() as f64 / 1000.0,
+            "reproject_tile completed"
         );
 
         Ok(output)
