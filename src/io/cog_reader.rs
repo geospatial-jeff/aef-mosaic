@@ -204,10 +204,10 @@ impl TiffMetadataCache {
         store: Arc<dyn ObjectStore>,
         object_path: Path,
     ) -> Result<Arc<CachedTiff>> {
-        // 1. Check cache first (fast path)
+        // 1. Check cache first (fast path) - use read lock with peek() to avoid contention
         {
-            let mut cache = self.cache.write().await;
-            if let Some(cached) = cache.get(path) {
+            let cache = self.cache.read().await;
+            if let Some(cached) = cache.peek(path) {
                 if let Some(ref m) = self.metrics {
                     m.add_metadata_cache_hit();
                 }
@@ -341,8 +341,9 @@ impl TiffMetadataCache {
 /// Key for tile cache: (cog_path, tile_x, tile_y)
 type TileCacheKey = (String, usize, usize);
 
-/// Number of shards for the tile cache (power of 2 for efficient modulo)
-const TILE_CACHE_SHARDS: usize = 16;
+/// Number of shards for the tile cache (power of 2 for efficient modulo).
+/// With 128 max concurrent HTTP requests, 64 shards gives ~2 requests per shard.
+const TILE_CACHE_SHARDS: usize = 64;
 
 /// A single shard of the tile cache with its own LRU cache and byte tracking.
 struct TileCacheShard {
@@ -382,16 +383,18 @@ impl TileCacheShard {
         self.current_bytes.fetch_add(tile_size, Ordering::Relaxed);
     }
 
-    /// Get a tile from cache if present (updates LRU order).
+    /// Get a tile from cache if present.
+    /// Uses read lock with peek() to avoid contention - LRU order not updated
+    /// but cache hits are still effective since tiles are reused immediately.
     async fn get(&self, key: &TileCacheKey) -> Option<Arc<TileArray>> {
-        let mut cache = self.cache.write().await;
-        cache.get(key).cloned()
+        let cache = self.cache.read().await;
+        cache.peek(key).cloned()
     }
 }
 
 /// Sharded tile cache to reduce lock contention.
 ///
-/// Distributes tiles across 16 shards based on hash of the COG path.
+/// Distributes tiles across 64 shards based on hash of the COG path.
 /// This allows concurrent inserts to different shards without blocking.
 struct ShardedTileCache {
     /// Shards indexed by hash of COG path
