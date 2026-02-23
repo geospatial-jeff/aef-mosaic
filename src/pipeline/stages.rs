@@ -30,9 +30,16 @@ use crate::transform::{mosaic_tiles, ReprojectConfig, Reprojector};
 use anyhow::Result;
 use futures::stream::{self, StreamExt};
 use ndarray::Array4;
+use std::cell::RefCell;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
+
+// Thread-local ProjCache to avoid re-initializing PROJ for every chunk
+// while respecting Proj's thread-safety constraints.
+thread_local! {
+    static PROJ_CACHE: RefCell<ProjCache> = RefCell::new(ProjCache::new());
+}
 
 /// Compute Hilbert curve index for WGS84 coordinates.
 ///
@@ -549,42 +556,45 @@ async fn fetch_tile_windows(
     window_data
 }
 
-/// Compute fetch requests from geotransforms (sync, creates ProjCache internally).
+/// Compute fetch requests from geotransforms (sync, uses thread-local ProjCache).
 fn compute_fetch_requests(
     geo_transforms: Vec<(Arc<CogTile>, Result<Option<GeoTransform>, anyhow::Error>)>,
     chunk_bounds_wgs84: &[f64; 4],
 ) -> Vec<FetchRequest> {
-    // Create ProjCache here - not held across any await
-    let proj_cache = ProjCache::new();
+    // Use thread-local ProjCache to cache Proj objects per-thread
+    // This avoids recreating Proj for every chunk while respecting thread-safety
+    PROJ_CACHE.with(|cache| {
+        let proj_cache = cache.borrow();
 
-    geo_transforms
-        .into_iter()
-        .filter_map(|(tile, gt_result)| {
-            let geo_transform = match gt_result {
-                Ok(Some(gt)) => gt,
-                Ok(None) => {
-                    tracing::warn!("No geotransform for tile {}", tile.tile_id);
-                    return None;
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to get geotransform for {}: {}", tile.tile_id, e);
-                    return None;
-                }
-            };
+        geo_transforms
+            .into_iter()
+            .filter_map(|(tile, gt_result)| {
+                let geo_transform = match gt_result {
+                    Ok(Some(gt)) => gt,
+                    Ok(None) => {
+                        tracing::warn!("No geotransform for tile {}", tile.tile_id);
+                        return None;
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to get geotransform for {}: {}", tile.tile_id, e);
+                        return None;
+                    }
+                };
 
-            match compute_pixel_window(&tile, chunk_bounds_wgs84, &proj_cache, &geo_transform) {
-                Ok((window, intersection)) => Some(FetchRequest {
-                    tile,
-                    window,
-                    intersection_bounds: intersection,
-                }),
-                Err(e) => {
-                    tracing::debug!("No intersection for tile: {}", e);
-                    None
+                match compute_pixel_window(&tile, chunk_bounds_wgs84, &proj_cache, &geo_transform) {
+                    Ok((window, intersection)) => Some(FetchRequest {
+                        tile,
+                        window,
+                        intersection_bounds: intersection,
+                    }),
+                    Err(e) => {
+                        tracing::debug!("No intersection for tile: {}", e);
+                        None
+                    }
                 }
-            }
-        })
-        .collect()
+            })
+            .collect()
+    })
 }
 
 /// Compute pixel window for a tile intersection.
