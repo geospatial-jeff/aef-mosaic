@@ -1,13 +1,24 @@
-//! Mosaicing overlapping tiles using mean aggregation.
+//! Mosaicing overlapping tiles using forward mapping and mean aggregation.
+//!
+//! This module uses forward mapping (source → dest) instead of inverse mapping
+//! (dest → source) to achieve sequential source reads, which are cache-friendly.
+//! The tradeoff is scattered destination writes, but writes are faster than
+//! random reads due to write combining in modern CPUs.
 
 use crate::io::WindowData;
-use crate::transform::{ReprojectConfig, Reprojector};
-use anyhow::Result;
-use ndarray::{s, Array2, Array3, Array4, Axis, Zip};
-use rayon::prelude::*;
+use crate::transform::ReprojectConfig;
+use anyhow::{Context, Result};
+use ndarray::{s, Array2, Array3, Array4, Zip};
+use proj::Proj;
+use std::time::Instant;
 
 /// Nodata value for AEF embeddings (int8).
 const NODATA: i8 = -128;
+
+/// Grid cell size for forward mapping interpolation.
+/// Smaller = more Proj calls but better accuracy.
+/// 32x32 is a good balance for typical reprojection scenarios.
+const FORWARD_GRID_SIZE: usize = 32;
 
 /// Accumulator for mosaicing multiple tiles using mean aggregation.
 ///
@@ -16,8 +27,9 @@ const NODATA: i8 = -128;
 /// This halves memory usage compared to i32 accumulators.
 #[derive(Debug)]
 pub struct MosaicAccumulator {
-    /// Sum of values for each pixel: (1, bands, height, width)
-    sum: Array4<i16>,
+    /// Sum of values for each pixel: (bands, height, width)
+    /// Using 3D instead of 4D for simpler indexing in pixel-level operations
+    sum: Array3<i16>,
 
     /// Count of contributions for each pixel: (height, width)
     count: Array2<u16>,
@@ -34,11 +46,9 @@ pub struct MosaicAccumulator {
 
 impl MosaicAccumulator {
     /// Create a new accumulator for the given dimensions.
-    ///
-    /// Shape: (1, bands, height, width) for the output
     pub fn new(bands: usize, height: usize, width: usize) -> Self {
         Self {
-            sum: Array4::zeros((1, bands, height, width)),
+            sum: Array3::zeros((bands, height, width)),
             count: Array2::zeros((height, width)),
             bands,
             height,
@@ -46,63 +56,68 @@ impl MosaicAccumulator {
         }
     }
 
-    /// Add a tile's reprojected data to the accumulator.
+    /// Accumulate a single pixel from source data directly.
     ///
-    /// The input data should be in shape (bands, height, width) and already
-    /// reprojected to the output grid. Values of -128 are treated as nodata.
-    ///
-    /// Uses ndarray operations for better performance and readability.
-    pub fn add(&mut self, data: &Array3<i8>) {
-        let (bands, height, width) = data.dim();
-        assert_eq!(bands, self.bands, "Band count mismatch");
-        assert_eq!(height, self.height, "Height mismatch");
-        assert_eq!(width, self.width, "Width mismatch");
-
-        // Create a mask: true where ANY band has non-nodata value
-        // Use fold_axis to check across all bands for each pixel
-        let has_data: Array2<bool> = data
-            .map(|&v| v != NODATA)
-            .fold_axis(Axis(0), false, |acc, &val| *acc || val);
-
-        // Update count where we have data using Zip
-        Zip::from(&mut self.count)
-            .and(&has_data)
-            .for_each(|count, &has| {
-                if has {
-                    *count += 1;
-                }
-            });
-
-        // Add data to sum where has_data is true
-        // We need to iterate over bands and use the mask
-        for b in 0..bands {
-            let data_band = data.slice(s![b, .., ..]);
-            let mut sum_band = self.sum.slice_mut(s![0, b, .., ..]);
-
-            Zip::from(&mut sum_band)
-                .and(&data_band)
-                .and(&has_data)
-                .for_each(|sum, &val, &has| {
-                    if has {
-                        *sum += val as i16;
-                    }
-                });
+    /// This is the core operation for forward mapping - we read source pixels
+    /// sequentially and write to scattered destination locations.
+    #[inline]
+    pub fn accumulate_pixel(
+        &mut self,
+        src_data: &Array3<i8>,
+        src_row: usize,
+        src_col: usize,
+        dst_row: usize,
+        dst_col: usize,
+    ) {
+        // Check if source pixel has valid data (any band non-nodata)
+        let mut has_data = false;
+        for b in 0..self.bands {
+            if src_data[[b, src_row, src_col]] != NODATA {
+                has_data = true;
+                break;
+            }
         }
+
+        if !has_data {
+            return;
+        }
+
+        // Accumulate all bands
+        for b in 0..self.bands {
+            let val = src_data[[b, src_row, src_col]];
+            self.sum[[b, dst_row, dst_col]] += val as i16;
+        }
+        self.count[[dst_row, dst_col]] += 1;
+    }
+
+    /// Accumulate a single pixel with pre-fetched band values.
+    /// Used when we've already read the source pixel.
+    #[inline]
+    pub fn accumulate_bands(&mut self, bands: &[i8], dst_row: usize, dst_col: usize) {
+        // Check if any band has valid data
+        let has_data = bands.iter().any(|&v| v != NODATA);
+        if !has_data {
+            return;
+        }
+
+        // Accumulate all bands
+        for (b, &val) in bands.iter().enumerate() {
+            self.sum[[b, dst_row, dst_col]] += val as i16;
+        }
+        self.count[[dst_row, dst_col]] += 1;
     }
 
     /// Finalize the mosaic by computing the mean.
     ///
     /// Returns an int8 array: (1, bands, height, width)
     /// Pixels with no data are set to NODATA (-128).
-    ///
-    /// Uses ndarray operations for element-wise division with rounding.
     pub fn finalize(self) -> Array4<i8> {
         // Initialize with NODATA
         let mut result = Array4::<i8>::from_elem((1, self.bands, self.height, self.width), NODATA);
 
         // Process each band using Zip
         for b in 0..self.bands {
-            let sum_band = self.sum.slice(s![0, b, .., ..]);
+            let sum_band = self.sum.slice(s![b, .., ..]);
             let mut result_band = result.slice_mut(s![0, b, .., ..]);
 
             Zip::from(&mut result_band)
@@ -125,12 +140,6 @@ impl MosaicAccumulator {
         result
     }
 
-    /// Get the number of tiles that contributed to each pixel.
-    /// Returns a view as 3D array for backwards compatibility.
-    pub fn coverage(&self) -> Array3<u16> {
-        self.count.clone().insert_axis(Axis(0))
-    }
-
     /// Get the maximum overlap count.
     pub fn max_overlap(&self) -> u16 {
         *self.count.iter().max().unwrap_or(&0)
@@ -142,20 +151,231 @@ impl MosaicAccumulator {
     }
 }
 
-/// Mosaic multiple tile windows into a single output chunk.
+/// A grid cell for forward mapping interpolation.
+/// Contains pre-projected corner coordinates to enable fast bilinear interpolation.
+#[derive(Debug, Clone, Copy)]
+struct ForwardCell {
+    /// Source pixel bounds [x0, y0, x1, y1]
+    src_x0: usize,
+    src_y0: usize,
+    src_x1: usize,
+    src_y1: usize,
+    /// Destination pixel coordinates at corners (after projection)
+    /// Order: [top-left, top-right, bottom-left, bottom-right]
+    /// Each is (dst_col, dst_row) in floating point
+    dst_corners: [(f64, f64); 4],
+    /// Whether all corners projected successfully
+    valid: bool,
+}
+
+impl ForwardCell {
+    /// Interpolate destination coordinates for a source pixel within this cell.
+    #[inline]
+    fn interpolate(&self, src_col: usize, src_row: usize) -> (f64, f64) {
+        let cell_width = (self.src_x1 - self.src_x0) as f64;
+        let cell_height = (self.src_y1 - self.src_y0) as f64;
+
+        // Normalized position within cell [0, 1]
+        let t_col = if cell_width > 0.0 {
+            (src_col - self.src_x0) as f64 / cell_width
+        } else {
+            0.0
+        };
+        let t_row = if cell_height > 0.0 {
+            (src_row - self.src_y0) as f64 / cell_height
+        } else {
+            0.0
+        };
+
+        let [(x00, y00), (x01, y01), (x10, y10), (x11, y11)] = self.dst_corners;
+
+        // Bilinear interpolation
+        let dst_col = x00 * (1.0 - t_row) * (1.0 - t_col)
+            + x01 * (1.0 - t_row) * t_col
+            + x10 * t_row * (1.0 - t_col)
+            + x11 * t_row * t_col;
+
+        let dst_row = y00 * (1.0 - t_row) * (1.0 - t_col)
+            + y01 * (1.0 - t_row) * t_col
+            + y10 * t_row * (1.0 - t_col)
+            + y11 * t_row * t_col;
+
+        (dst_col, dst_row)
+    }
+}
+
+/// Build a grid of forward-projected cells for a source image.
+fn build_forward_grid(
+    src_width: usize,
+    src_height: usize,
+    source_bounds: &[f64; 4],
+    fwd_proj: &Proj,
+    target_bounds: &[f64; 4],
+    target_resolution: f64,
+) -> Vec<ForwardCell> {
+    let src_pixel_x = (source_bounds[2] - source_bounds[0]) / src_width as f64;
+    let src_pixel_y = (source_bounds[3] - source_bounds[1]) / src_height as f64;
+
+    let inv_target_res = 1.0 / target_resolution;
+    let target_min_x = target_bounds[0];
+    let target_max_y = target_bounds[3]; // Top of image (row 0)
+
+    let mut cells = Vec::new();
+
+    let mut src_y = 0;
+    while src_y < src_height {
+        let src_y1 = (src_y + FORWARD_GRID_SIZE).min(src_height);
+
+        let mut src_x = 0;
+        while src_x < src_width {
+            let src_x1 = (src_x + FORWARD_GRID_SIZE).min(src_width);
+
+            // Project the 4 corners of this cell
+            let corners_src = [
+                (src_x, src_y),         // top-left (in source, which is bottom-up)
+                (src_x1, src_y),        // top-right
+                (src_x, src_y1),        // bottom-left
+                (src_x1, src_y1),       // bottom-right
+            ];
+
+            let mut dst_corners = [(0.0, 0.0); 4];
+            let mut valid = true;
+
+            for (i, &(px, py)) in corners_src.iter().enumerate() {
+                // Source pixel to world coordinates
+                // Source is bottom-up: row 0 is at min_y
+                let world_x = source_bounds[0] + (px as f64 + 0.5) * src_pixel_x;
+                let world_y = source_bounds[1] + (py as f64 + 0.5) * src_pixel_y;
+
+                // Project to target CRS
+                match fwd_proj.convert((world_x, world_y)) {
+                    Ok((target_x, target_y)) => {
+                        // Convert to target pixel coordinates (target is top-down)
+                        let dst_col = (target_x - target_min_x) * inv_target_res;
+                        let dst_row = (target_max_y - target_y) * inv_target_res;
+                        dst_corners[i] = (dst_col, dst_row);
+                    }
+                    Err(_) => {
+                        valid = false;
+                        break;
+                    }
+                }
+            }
+
+            cells.push(ForwardCell {
+                src_x0: src_x,
+                src_y0: src_y,
+                src_x1,
+                src_y1,
+                dst_corners,
+                valid,
+            });
+
+            src_x = src_x1;
+        }
+        src_y = src_y1;
+    }
+
+    cells
+}
+
+/// Forward-map a single tile directly to the accumulator.
 ///
-/// This function:
-/// 1. Computes the geographic bounds of each window
-/// 2. Reprojects each window to the output CRS/grid
-/// 3. Accumulates overlapping pixels using mean
-/// 4. Returns the final int8 mosaic
+/// This uses forward mapping (source → dest) instead of inverse mapping.
+/// Source pixels are read sequentially (cache-friendly), destination writes
+/// are scattered but benefit from write combining.
+fn forward_map_tile(
+    window: &WindowData,
+    config: &ReprojectConfig,
+    accumulator: &mut MosaicAccumulator,
+) -> Result<usize> {
+    let data = &window.data;
+    let (bands, src_height, src_width) = data.dim();
+    let (dst_height, dst_width) = config.target_shape;
+
+    let source_bounds = &window.bounds_native;
+    let source_crs = &window.tile.crs;
+
+    // Create forward projection: source CRS → target CRS
+    let fwd_proj = Proj::new_known_crs(source_crs, &config.target_crs, None)
+        .with_context(|| format!("Failed to create Proj for {} -> {}", source_crs, config.target_crs))?;
+
+    // Build the forward grid
+    let grid = build_forward_grid(
+        src_width,
+        src_height,
+        source_bounds,
+        &fwd_proj,
+        &config.target_bounds,
+        config.target_resolution,
+    );
+
+    let mut pixels_written = 0usize;
+
+    // Pre-allocate a buffer for reading bands (avoids repeated allocations)
+    let mut band_buf: Vec<i8> = vec![0; bands];
+
+    // Process each cell
+    for cell in &grid {
+        if !cell.valid {
+            continue;
+        }
+
+        // Process each source pixel in this cell (sequential reads!)
+        for src_row in cell.src_y0..cell.src_y1 {
+            for src_col in cell.src_x0..cell.src_x1 {
+                // Interpolate destination coordinates
+                let (dst_col_f, dst_row_f) = cell.interpolate(src_col, src_row);
+
+                // Round to nearest pixel
+                let dst_col = dst_col_f.round() as isize;
+                let dst_row = dst_row_f.round() as isize;
+
+                // Bounds check
+                if dst_col < 0 || dst_col >= dst_width as isize
+                    || dst_row < 0 || dst_row >= dst_height as isize
+                {
+                    continue;
+                }
+
+                let dst_col = dst_col as usize;
+                let dst_row = dst_row as usize;
+
+                // Read all bands from source (sequential memory access)
+                let mut has_data = false;
+                for b in 0..bands {
+                    let val = data[[b, src_row, src_col]];
+                    band_buf[b] = val;
+                    if val != NODATA {
+                        has_data = true;
+                    }
+                }
+
+                if !has_data {
+                    continue;
+                }
+
+                // Accumulate to destination
+                accumulator.accumulate_bands(&band_buf, dst_row, dst_col);
+                pixels_written += 1;
+            }
+        }
+    }
+
+    Ok(pixels_written)
+}
+
+/// Mosaic multiple tile windows into a single output chunk using forward mapping.
+///
+/// This function uses forward mapping (source → dest) for cache-friendly source reads.
+/// Each source tile is processed sequentially, with pixels accumulated directly
+/// to the output without creating intermediate reprojected arrays.
 pub fn mosaic_tiles(
     windows: &[WindowData],
-    reprojector: &Reprojector,
+    _reprojector: &crate::transform::Reprojector, // Unused, kept for API compatibility
     reproject_config: &ReprojectConfig,
 ) -> Result<Array4<i8>> {
     if windows.is_empty() {
-        // Return zeros for empty chunks
         return Ok(Array4::zeros((
             1,
             reproject_config.num_bands,
@@ -167,60 +387,52 @@ pub fn mosaic_tiles(
     let bands = windows[0].data.dim().0;
     let (height, width) = reproject_config.target_shape;
 
-    // Log input sizes before reprojection
+    // Log input sizes
     let total_input_pixels: usize = windows.iter()
         .map(|w| w.data.dim().1 * w.data.dim().2)
         .sum();
     let output_pixels = height * width;
-    let input_output_ratio = total_input_pixels as f64 / output_pixels as f64;
 
     tracing::info!(
         num_tiles = windows.len(),
         total_input_pixels = total_input_pixels,
         output_pixels = output_pixels,
-        input_output_ratio = format!("{:.2}", input_output_ratio),
-        "mosaic_tiles starting"
+        input_output_ratio = format!("{:.2}", total_input_pixels as f64 / output_pixels as f64),
+        "mosaic_tiles starting (forward mapping)"
     );
 
-    // Reproject all windows in parallel - each window is independent
-    // We create a new Reprojector per thread since Proj objects are thread-local
-    let reprojected_tiles: Vec<Result<Array3<i8>>> = windows
-        .par_iter()
-        .enumerate()
-        .map(|(i, window_data)| {
-            let window_bounds = window_data.bounds_native;
-
-            tracing::debug!(
-                "Window {} bounds (native CRS {}): [{:.2}, {:.2}, {:.2}, {:.2}], pixel window: ({}, {}, {}x{})",
-                i,
-                window_data.tile.crs,
-                window_bounds[0], window_bounds[1], window_bounds[2], window_bounds[3],
-                window_data.window.x, window_data.window.y, window_data.window.width, window_data.window.height
-            );
-
-            // Reproject window to output grid
-            let reprojected = reprojector.reproject_tile(
-                &window_data.data,
-                &window_data.tile.crs,
-                &window_bounds,
-                reproject_config,
-            )?;
-
-            let valid_pixels = reprojected.iter().filter(|&&v| v != -128).count();
-            tracing::debug!(
-                "Window {} reprojected: shape={:?}, valid_pixels={}",
-                i, reprojected.dim(), valid_pixels
-            );
-
-            Ok(reprojected)
-        })
-        .collect();
-
-    // Accumulate results sequentially (accumulator is not thread-safe)
+    // Create accumulator
     let mut accumulator = MosaicAccumulator::new(bands, height, width);
-    for reprojected in reprojected_tiles {
-        accumulator.add(&reprojected?);
+
+    // Process each tile with forward mapping
+    // Sequential processing avoids synchronization overhead
+    let map_start = Instant::now();
+    let mut total_pixels_written = 0usize;
+
+    for (i, window) in windows.iter().enumerate() {
+        let tile_start = Instant::now();
+        let (_, src_h, src_w) = window.data.dim();
+
+        let pixels_written = forward_map_tile(window, reproject_config, &mut accumulator)?;
+        total_pixels_written += pixels_written;
+
+        tracing::info!(
+            tile = i,
+            input_shape = ?(src_h, src_w),
+            pixels_written = pixels_written,
+            tile_ms = tile_start.elapsed().as_millis(),
+            "forward_map_tile completed"
+        );
     }
+
+    let map_time = map_start.elapsed();
+
+    tracing::info!(
+        total_pixels_written = total_pixels_written,
+        map_ms = map_time.as_millis(),
+        pixels_per_ms = total_pixels_written as f64 / map_time.as_millis() as f64,
+        "forward mapping completed"
+    );
 
     Ok(accumulator.finalize())
 }
@@ -232,95 +444,77 @@ mod tests {
     use ndarray::Array3;
 
     #[test]
-    fn test_accumulator_single_tile() {
-        let mut acc = MosaicAccumulator::new(2, 2, 2);
+    fn test_accumulator_single_pixel() {
+        let mut acc = MosaicAccumulator::new(2, 4, 4);
 
-        let data = Array3::from_shape_vec(
-            (2, 2, 2),
-            vec![10i8, 20, 30, 40, 50, 60, 70, 80],
-        )
-        .unwrap();
+        // Create source data with one valid pixel
+        let mut data = Array3::from_elem((2, 2, 2), NODATA);
+        data[[0, 0, 0]] = 10;
+        data[[1, 0, 0]] = 20;
 
-        acc.add(&data);
+        acc.accumulate_pixel(&data, 0, 0, 1, 1);
 
         let result = acc.finalize();
-
-        assert_eq!(result[[0, 0, 0, 0]], 10);
-        assert_eq!(result[[0, 0, 0, 1]], 20);
-        assert_eq!(result[[0, 1, 0, 0]], 50);
+        assert_eq!(result[[0, 0, 1, 1]], 10);
+        assert_eq!(result[[0, 1, 1, 1]], 20);
     }
 
     #[test]
-    fn test_accumulator_mean() {
+    fn test_accumulator_mean_pixels() {
         let mut acc = MosaicAccumulator::new(1, 2, 2);
 
-        // First tile: all 10s
-        let data1 = Array3::from_elem((1, 2, 2), 10i8);
-        acc.add(&data1);
-
-        // Second tile: all 20s
-        let data2 = Array3::from_elem((1, 2, 2), 20i8);
-        acc.add(&data2);
+        // Accumulate two values at same location
+        acc.accumulate_bands(&[10], 0, 0);
+        acc.accumulate_bands(&[20], 0, 0);
 
         let result = acc.finalize();
-
-        // Mean of 10 and 20 is 15
-        assert_eq!(result[[0, 0, 0, 0]], 15);
-        assert_eq!(result[[0, 0, 0, 1]], 15);
-        assert_eq!(result[[0, 0, 1, 0]], 15);
-        assert_eq!(result[[0, 0, 1, 1]], 15);
+        assert_eq!(result[[0, 0, 0, 0]], 15); // Mean of 10 and 20
     }
 
     #[test]
-    fn test_accumulator_nodata() {
+    fn test_accumulator_nodata_skip() {
         let mut acc = MosaicAccumulator::new(2, 2, 2);
 
-        // First tile: some values, -128 is nodata
-        // Pixel (0,0): both bands have data (10, 50)
-        // Pixel (0,1): both bands are nodata (-128, -128)
-        // Pixel (1,0): both bands are nodata (-128, -128)
-        // Pixel (1,1): both bands have data (40, 80)
-        let data1 = Array3::from_shape_vec(
-            (2, 2, 2),
-            vec![10i8, -128, -128, 40, 50, -128, -128, 80],
-        )
-        .unwrap();
-        acc.add(&data1);
+        // All nodata should not increment count
+        acc.accumulate_bands(&[NODATA, NODATA], 0, 0);
 
-        // Check coverage (using 2D count array)
-        assert_eq!(acc.count[[0, 0]], 1); // (0,0) has data
-        assert_eq!(acc.count[[0, 1]], 0); // (0,1) is nodata
-        assert_eq!(acc.count[[1, 0]], 0); // (1,0) is nodata
-        assert_eq!(acc.count[[1, 1]], 1); // (1,1) has data
+        assert_eq!(acc.count[[0, 0]], 0);
     }
 
     #[test]
-    fn test_accumulator_rounding() {
-        let mut acc = MosaicAccumulator::new(1, 1, 1);
+    fn test_forward_cell_interpolation() {
+        let cell = ForwardCell {
+            src_x0: 0,
+            src_y0: 0,
+            src_x1: 10,
+            src_y1: 10,
+            dst_corners: [
+                (0.0, 0.0),   // top-left
+                (10.0, 0.0),  // top-right
+                (0.0, 10.0),  // bottom-left
+                (10.0, 10.0), // bottom-right
+            ],
+            valid: true,
+        };
 
-        // Add three values: 10, 11, 12 → mean = 11
-        let data1 = Array3::from_elem((1, 1, 1), 10i8);
-        acc.add(&data1);
+        // Center should interpolate to (5, 5)
+        let (x, y) = cell.interpolate(5, 5);
+        assert!((x - 5.0).abs() < 0.01);
+        assert!((y - 5.0).abs() < 0.01);
 
-        let data2 = Array3::from_elem((1, 1, 1), 11i8);
-        acc.add(&data2);
-
-        let data3 = Array3::from_elem((1, 1, 1), 12i8);
-        acc.add(&data3);
-
-        let result = acc.finalize();
-        assert_eq!(result[[0, 0, 0, 0]], 11);
+        // Top-left corner
+        let (x, y) = cell.interpolate(0, 0);
+        assert!((x - 0.0).abs() < 0.01);
+        assert!((y - 0.0).abs() < 0.01);
     }
 
     #[test]
     fn test_max_overlap() {
         let mut acc = MosaicAccumulator::new(1, 2, 2);
 
-        let data = Array3::from_elem((1, 2, 2), 10i8);
-
-        acc.add(&data);
-        acc.add(&data);
-        acc.add(&data);
+        acc.accumulate_bands(&[10], 0, 0);
+        acc.accumulate_bands(&[20], 0, 0);
+        acc.accumulate_bands(&[30], 0, 0);
 
         assert_eq!(acc.max_overlap(), 3);
     }
