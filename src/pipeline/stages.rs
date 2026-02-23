@@ -23,11 +23,12 @@
 
 use crate::checkpoint::CheckpointManager;
 use crate::crs::{self, ProjCache};
-use crate::index::{CogTile, OutputChunk, OutputGrid, SpatialLookup};
+use crate::index::{CogTile, InputIndex, OutputChunk, OutputGrid, SpatialLookup};
 use crate::io::{CogReader, GeoTransform, PixelWindow, WindowData, ZarrWriter};
 use crate::pipeline::Metrics;
 use crate::transform::{mosaic_tiles, ReprojectConfig, Reprojector};
 use anyhow::Result;
+use dashmap::DashSet;
 use futures::stream::{self, StreamExt};
 use ndarray::Array4;
 use std::cell::RefCell;
@@ -97,9 +98,140 @@ struct ChunkWorkItem {
     tiles: Vec<Arc<CogTile>>,
     chunk_bounds: [f64; 4],
     chunk_bounds_wgs84: [f64; 4],
-    /// Two-level sort key: (primary_cog_hilbert, chunk_hilbert)
-    /// Groups chunks by their primary COG, then by spatial locality within.
-    sort_key: (u64, u64),
+    /// Chunk Hilbert index for secondary sorting within COG groups.
+    chunk_hilbert: u64,
+}
+
+/// Streams work items to fetch workers, processing one COG at a time.
+///
+/// This inverts the typical lookup: instead of pre-computing all chunk->COG mappings,
+/// we iterate COGs in Hilbert order and compute intersecting chunks on-the-fly.
+/// This reduces memory from O(all_chunks) to O(chunks_per_COG).
+struct StreamingWorkPublisher {
+    /// COG tiles sorted by Hilbert index of their centroids
+    cog_tiles: Vec<Arc<CogTile>>,
+    /// Output grid for computing chunk intersections
+    output_grid: Arc<OutputGrid>,
+    /// Spatial lookup for finding tiles per chunk
+    spatial_lookup: Arc<SpatialLookup>,
+    /// Work channel to send items to fetch workers
+    work_tx: async_channel::Sender<ChunkWorkItem>,
+    /// Chunks remaining to process (from checkpoint filter)
+    pending_chunks: Arc<DashSet<(usize, usize, usize)>>,
+    /// Chunks already published (for deduplication across COGs)
+    processed_chunks: Arc<DashSet<(usize, usize, usize)>>,
+    /// Metrics for tracking skipped chunks
+    metrics: Arc<Metrics>,
+}
+
+impl StreamingWorkPublisher {
+    /// Create a new streaming publisher.
+    fn new(
+        input_index: &InputIndex,
+        output_grid: Arc<OutputGrid>,
+        spatial_lookup: Arc<SpatialLookup>,
+        pending_chunks: Vec<OutputChunk>,
+        work_tx: async_channel::Sender<ChunkWorkItem>,
+        metrics: Arc<Metrics>,
+    ) -> Self {
+        // Sort COG tiles by Hilbert index of their centroids
+        let mut cog_tiles = input_index.all_tiles().to_vec();
+        cog_tiles.sort_by_key(|t| {
+            let (lon, lat) = bounds_centroid(&t.bounds_wgs84);
+            wgs84_hilbert_index(lon, lat)
+        });
+
+        // Build pending chunks set from input
+        let pending_set = Arc::new(DashSet::with_capacity(pending_chunks.len()));
+        for chunk in pending_chunks {
+            pending_set.insert((chunk.time_idx, chunk.row_idx, chunk.col_idx));
+        }
+
+        Self {
+            cog_tiles,
+            output_grid,
+            spatial_lookup,
+            work_tx,
+            pending_chunks: pending_set,
+            processed_chunks: Arc::new(DashSet::new()),
+            metrics,
+        }
+    }
+
+    /// Publish all work items by iterating COGs in Hilbert order.
+    async fn publish_all(self) -> Result<()> {
+        for cog in &self.cog_tiles {
+            // Find chunks that intersect this COG
+            let chunks = self.output_grid.chunks_for_bounds_wgs84(
+                &cog.bounds_wgs84,
+                cog.year,
+            )?;
+
+            // Filter to pending chunks, deduplicate, and prepare work items
+            let mut work_items: Vec<ChunkWorkItem> = Vec::new();
+            for chunk in chunks {
+                let key = (chunk.time_idx, chunk.row_idx, chunk.col_idx);
+
+                // Skip if not pending or already processed
+                if !self.pending_chunks.contains(&key) {
+                    continue;
+                }
+                if !self.processed_chunks.insert(key) {
+                    continue; // Already published by another COG
+                }
+
+                // Look up all tiles for this chunk (may include other COGs)
+                let tiles = match self.spatial_lookup.tiles_for_chunk(&chunk) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::warn!("Failed to find tiles for chunk {:?}: {}", chunk.chunk_indices(), e);
+                        self.metrics.add_failure();
+                        continue;
+                    }
+                };
+
+                if tiles.is_empty() {
+                    self.metrics.add_chunk_skipped();
+                    continue;
+                }
+
+                let chunk_bounds = self.output_grid.chunk_bounds(&chunk);
+                let chunk_bounds_wgs84 = match self.output_grid.chunk_bounds_wgs84(&chunk) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!("Failed to transform chunk bounds: {}", e);
+                        self.metrics.add_failure();
+                        continue;
+                    }
+                };
+
+                // Compute chunk Hilbert index for sorting within this COG batch
+                let (chunk_lon, chunk_lat) = bounds_centroid(&chunk_bounds_wgs84);
+                let chunk_hilbert = wgs84_hilbert_index(chunk_lon, chunk_lat);
+
+                work_items.push(ChunkWorkItem {
+                    chunk,
+                    tiles,
+                    chunk_bounds,
+                    chunk_bounds_wgs84,
+                    chunk_hilbert,
+                });
+            }
+
+            // Sort by chunk Hilbert index for spatial locality within this COG group
+            work_items.sort_by_key(|w| w.chunk_hilbert);
+
+            // Send work items to fetch workers
+            for item in work_items {
+                if self.work_tx.send(item).await.is_err() {
+                    // Receiver dropped, stop publishing
+                    return Ok(());
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// Data passed from COG fetcher to mosaic worker.
@@ -203,89 +335,32 @@ impl Pipeline {
         })
     }
 
-    /// Run the fetch stage - spawns fetch_concurrency workers that each process chunks sequentially.
+    /// Run the fetch stage using streaming work publisher.
+    ///
+    /// Instead of pre-computing all chunk→COG mappings upfront, this iterates
+    /// COGs in Hilbert order and computes intersecting chunks on-the-fly.
+    /// This reduces memory from O(all_chunks) to O(chunks_per_COG).
     async fn run_fetch_stage(
         &self,
         chunks: Vec<OutputChunk>,
         mosaic_tx: mpsc::Sender<FetchedChunk>,
     ) {
         let fetch_concurrency = self.config.fetch_concurrency;
-
-        // Pre-compute tile lookups and bounds (uses SpatialLookup which is not Send)
-        let mut work_items = Vec::with_capacity(chunks.len());
-        for chunk in chunks {
-            let tiles = match self.spatial_lookup.tiles_for_chunk(&chunk) {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::warn!("Failed to find tiles for chunk {:?}: {}", chunk.chunk_indices(), e);
-                    self.metrics.add_failure();
-                    continue;
-                }
-            };
-
-            if tiles.is_empty() {
-                self.metrics.add_chunk_skipped();
-                continue;
-            }
-
-            let chunk_bounds = self.output_grid.chunk_bounds(&chunk);
-            let chunk_bounds_wgs84 = match self.output_grid.chunk_bounds_wgs84(&chunk) {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::warn!("Failed to transform chunk bounds: {}", e);
-                    self.metrics.add_failure();
-                    continue;
-                }
-            };
-
-            // Compute two-level sort key for cache-optimal ordering:
-            // 1. Primary COG tile's Hilbert index (groups chunks by COG)
-            // 2. Chunk's own Hilbert index (orders within COG group)
-            let primary_cog = &tiles[0]; // Use first (often largest overlap) COG
-            let (cog_lon, cog_lat) = bounds_centroid(&primary_cog.bounds_wgs84);
-            let cog_hilbert = wgs84_hilbert_index(cog_lon, cog_lat);
-
-            let (chunk_lon, chunk_lat) = bounds_centroid(&chunk_bounds_wgs84);
-            let chunk_hilbert = wgs84_hilbert_index(chunk_lon, chunk_lat);
-
-            // Use tiles directly - no need to clone Arc refs since tiles_for_chunk
-            // already returns Vec<Arc<CogTile>>
-            work_items.push(ChunkWorkItem {
-                chunk,
-                tiles,
-                chunk_bounds,
-                chunk_bounds_wgs84,
-                sort_key: (cog_hilbert, chunk_hilbert),
-            });
-        }
-
-        // Sort work items by two-level Hilbert key for optimal cache locality:
-        // - Chunks sharing the same COG are processed together
-        // - Within each COG group, spatially adjacent chunks are processed together
-        work_items.sort_by_key(|item| item.sort_key);
-
-        // Count unique COG groups for logging (count transitions to avoid HashSet allocation)
-        let unique_cog_count = if work_items.is_empty() {
-            0
-        } else {
-            1 + work_items.windows(2)
-                .filter(|w| w[0].sort_key.0 != w[1].sort_key.0)
-                .count()
-        };
+        let total_pending = chunks.len();
 
         tracing::info!(
-            "Sorted {} chunks into {} COG groups (two-level Hilbert ordering)",
-            work_items.len(),
-            unique_cog_count
+            "Starting streaming fetch stage with {} pending chunks, {} COG tiles",
+            total_pending,
+            self.spatial_lookup.input_index().len()
         );
 
         // Create a bounded work queue - small buffer to limit memory usage
-        // Workers will pull from this, and backpressure will slow the sender
+        // Workers will pull from this, and backpressure will slow the publisher
         let channel_capacity = (fetch_concurrency * 4).max(64);
         let (work_tx, work_rx) = async_channel::bounded::<ChunkWorkItem>(channel_capacity);
 
-        // Spawn fetch_concurrency workers FIRST (before sending work items)
-        // This allows backpressure to work - sender blocks when channel is full
+        // Spawn fetch workers FIRST (before starting publisher)
+        // This allows backpressure to work - publisher blocks when channel is full
         let mut handles = Vec::with_capacity(fetch_concurrency);
         for _ in 0..fetch_concurrency {
             let reader = self.cog_reader.clone();
@@ -330,12 +405,25 @@ impl Pipeline {
             handles.push(handle);
         }
 
-        // Now send work items - workers are already running and will consume them
-        // Backpressure from the bounded channel limits memory usage
-        for item in work_items {
-            // This will block if channel is full, providing backpressure
-            let _ = work_tx.send(item).await;
-        }
+        // Create and run the streaming publisher
+        let publisher = StreamingWorkPublisher::new(
+            self.spatial_lookup.input_index(),
+            self.output_grid.clone(),
+            self.spatial_lookup.clone(),
+            chunks,
+            work_tx.clone(),
+            self.metrics.clone(),
+        );
+
+        // Spawn publisher task
+        let publisher_handle = tokio::spawn(async move {
+            if let Err(e) = publisher.publish_all().await {
+                tracing::warn!("Publisher error: {}", e);
+            }
+        });
+
+        // Wait for publisher to complete
+        let _ = publisher_handle.await;
         work_tx.close();
 
         // Wait for all workers to complete
