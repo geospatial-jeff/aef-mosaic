@@ -237,18 +237,27 @@ async fn write_checkpoint(
     completed: &DashSet<String>,
     config_hash: &str,
 ) -> Result<()> {
-    // Collect completed chunks into a sorted vec for deterministic output
-    let mut chunks: Vec<String> = completed.iter().map(|r| r.clone()).collect();
-    chunks.sort();
+    // Collect completed chunks (fast, just cloning references)
+    let chunks_snapshot: Vec<String> = completed.iter().map(|r| r.clone()).collect();
+    let config_hash = config_hash.to_string();
 
-    let data = CheckpointData {
-        version: 1,
-        config_hash: config_hash.to_string(),
-        completed_chunks: chunks,
-        last_checkpoint: Utc::now(),
-    };
+    // Move CPU-intensive work (sorting, serialization) to blocking thread pool
+    let json = tokio::task::spawn_blocking(move || {
+        let mut chunks = chunks_snapshot;
+        chunks.sort();
 
-    let json = serde_json::to_vec_pretty(&data)?;
+        let data = CheckpointData {
+            version: 1,
+            config_hash,
+            completed_chunks: chunks,
+            last_checkpoint: Utc::now(),
+        };
+
+        serde_json::to_vec_pretty(&data)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("Checkpoint serialization task failed: {}", e))??;
+
     store.put(path, json.into()).await?;
 
     Ok(())
