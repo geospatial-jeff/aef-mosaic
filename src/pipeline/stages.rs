@@ -264,27 +264,28 @@ impl Pipeline {
         // - Within each COG group, spatially adjacent chunks are processed together
         work_items.sort_by_key(|item| item.sort_key);
 
-        // Count unique COG groups for logging
-        let unique_cogs: std::collections::HashSet<u64> = work_items.iter()
-            .map(|item| item.sort_key.0)
-            .collect();
+        // Count unique COG groups for logging (count transitions to avoid HashSet allocation)
+        let unique_cog_count = if work_items.is_empty() {
+            0
+        } else {
+            1 + work_items.windows(2)
+                .filter(|w| w[0].sort_key.0 != w[1].sort_key.0)
+                .count()
+        };
 
         tracing::info!(
             "Sorted {} chunks into {} COG groups (two-level Hilbert ordering)",
             work_items.len(),
-            unique_cogs.len()
+            unique_cog_count
         );
 
-        // Create a shared work queue
-        let (work_tx, work_rx) = async_channel::bounded::<ChunkWorkItem>(work_items.len().max(1));
+        // Create a bounded work queue - small buffer to limit memory usage
+        // Workers will pull from this, and backpressure will slow the sender
+        let channel_capacity = (fetch_concurrency * 4).max(64);
+        let (work_tx, work_rx) = async_channel::bounded::<ChunkWorkItem>(channel_capacity);
 
-        // Send all work items to the queue (in sorted order)
-        for item in work_items {
-            let _ = work_tx.send(item).await;
-        }
-        work_tx.close();
-
-        // Spawn fetch_concurrency workers
+        // Spawn fetch_concurrency workers FIRST (before sending work items)
+        // This allows backpressure to work - sender blocks when channel is full
         let mut handles = Vec::with_capacity(fetch_concurrency);
         for _ in 0..fetch_concurrency {
             let reader = self.cog_reader.clone();
@@ -328,6 +329,14 @@ impl Pipeline {
 
             handles.push(handle);
         }
+
+        // Now send work items - workers are already running and will consume them
+        // Backpressure from the bounded channel limits memory usage
+        for item in work_items {
+            // This will block if channel is full, providing backpressure
+            let _ = work_tx.send(item).await;
+        }
+        work_tx.close();
 
         // Wait for all workers to complete
         for handle in handles {
