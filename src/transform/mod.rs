@@ -3,5 +3,5 @@
 mod mosaic;
 mod reproject;
 
-pub use mosaic::{MosaicAccumulator, mosaic_tiles};
+pub use mosaic::{AtomicAccumulator, mosaic_tiles};
 pub use reproject::{Reprojector, ReprojectConfig};

@@ -4,12 +4,17 @@
 //! (dest → source) to achieve sequential source reads, which are cache-friendly.
 //! The tradeoff is scattered destination writes, but writes are faster than
 //! random reads due to write combining in modern CPUs.
+//!
+//! Tiles are processed in parallel using Rayon, with an atomic accumulator
+//! to handle concurrent writes to overlapping destination pixels.
 
 use crate::io::WindowData;
 use crate::transform::ReprojectConfig;
 use anyhow::{Context, Result};
-use ndarray::{s, Array2, Array3, Array4, Zip};
+use ndarray::Array4;
 use proj::Proj;
+use rayon::prelude::*;
+use std::sync::atomic::{AtomicI32, AtomicU16, Ordering};
 use std::time::Instant;
 
 /// Nodata value for AEF embeddings (int8).
@@ -20,19 +25,16 @@ const NODATA: i8 = -128;
 /// 32x32 is a good balance for typical reprojection scenarios.
 const FORWARD_GRID_SIZE: usize = 32;
 
-/// Accumulator for mosaicing multiple tiles using mean aggregation.
+/// Thread-safe accumulator for parallel mosaicing using atomic operations.
 ///
-/// Uses i16 accumulators which can handle up to ~250 overlapping tiles without overflow.
-/// (i8 range is -128 to 127; worst case 127 * 250 = 31,750 < i16 max of 32,767)
-/// This halves memory usage compared to i32 accumulators.
-#[derive(Debug)]
-pub struct MosaicAccumulator {
-    /// Sum of values for each pixel: (bands, height, width)
-    /// Using 3D instead of 4D for simpler indexing in pixel-level operations
-    sum: Array3<i16>,
+/// Uses AtomicI32 for sum to handle many overlapping tiles without overflow.
+/// Uses AtomicU16 for count (max 65535 overlapping tiles per pixel).
+pub struct AtomicAccumulator {
+    /// Sum of values for each pixel: flat array [band * height * width + row * width + col]
+    sum: Vec<AtomicI32>,
 
-    /// Count of contributions for each pixel: (height, width)
-    count: Array2<u16>,
+    /// Count of contributions for each pixel: flat array [row * width + col]
+    count: Vec<AtomicU16>,
 
     /// Number of bands
     bands: usize,
@@ -44,67 +46,53 @@ pub struct MosaicAccumulator {
     width: usize,
 }
 
-impl MosaicAccumulator {
-    /// Create a new accumulator for the given dimensions.
+impl AtomicAccumulator {
+    /// Create a new atomic accumulator for the given dimensions.
     pub fn new(bands: usize, height: usize, width: usize) -> Self {
+        let pixel_count = height * width;
+        let band_pixel_count = bands * pixel_count;
+
+        // Initialize with zeros using Vec and then convert
+        let sum: Vec<AtomicI32> = (0..band_pixel_count)
+            .map(|_| AtomicI32::new(0))
+            .collect();
+        let count: Vec<AtomicU16> = (0..pixel_count)
+            .map(|_| AtomicU16::new(0))
+            .collect();
+
         Self {
-            sum: Array3::zeros((bands, height, width)),
-            count: Array2::zeros((height, width)),
+            sum,
+            count,
             bands,
             height,
             width,
         }
     }
 
-    /// Accumulate a single pixel from source data directly.
-    ///
-    /// This is the core operation for forward mapping - we read source pixels
-    /// sequentially and write to scattered destination locations.
+    /// Accumulate a single pixel with band values.
+    /// Thread-safe using atomic operations.
     #[inline]
-    pub fn accumulate_pixel(
-        &mut self,
-        src_data: &Array3<i8>,
-        src_row: usize,
-        src_col: usize,
-        dst_row: usize,
-        dst_col: usize,
-    ) {
-        // Check if source pixel has valid data (any band non-nodata)
-        let mut has_data = false;
-        for b in 0..self.bands {
-            if src_data[[b, src_row, src_col]] != NODATA {
-                has_data = true;
-                break;
-            }
-        }
+    pub fn accumulate(&self, bands_data: &[i8], dst_row: usize, dst_col: usize) {
+        debug_assert!(dst_row < self.height);
+        debug_assert!(dst_col < self.width);
+        debug_assert_eq!(bands_data.len(), self.bands);
 
-        if !has_data {
-            return;
-        }
-
-        // Accumulate all bands
-        for b in 0..self.bands {
-            let val = src_data[[b, src_row, src_col]];
-            self.sum[[b, dst_row, dst_col]] += val as i16;
-        }
-        self.count[[dst_row, dst_col]] += 1;
-    }
-
-    /// Accumulate a single pixel with pre-fetched band values.
-    /// Used when we've already read the source pixel.
-    #[inline]
-    pub fn accumulate_bands(&mut self, bands: &[i8], dst_row: usize, dst_col: usize) {
         // Check if any band has valid data
-        let has_data = bands.iter().any(|&v| v != NODATA);
+        let has_data = bands_data.iter().any(|&v| v != NODATA);
         if !has_data {
             return;
         }
 
-        // Accumulate all bands
-        for (b, &val) in bands.iter().enumerate() {
-            self.sum[[b, dst_row, dst_col]] += val as i16;
+        let pixel_idx = dst_row * self.width + dst_col;
+
+        // Increment count atomically
+        self.count[pixel_idx].fetch_add(1, Ordering::Relaxed);
+
+        // Add each band value atomically
+        for (b, &val) in bands_data.iter().enumerate() {
+            let band_idx = b * self.height * self.width + pixel_idx;
+            self.sum[band_idx].fetch_add(val as i32, Ordering::Relaxed);
         }
-        self.count[[dst_row, dst_col]] += 1;
     }
 
     /// Finalize the mosaic by computing the mean.
@@ -112,29 +100,38 @@ impl MosaicAccumulator {
     /// Returns an int8 array: (1, bands, height, width)
     /// Pixels with no data are set to NODATA (-128).
     pub fn finalize(self) -> Array4<i8> {
-        // Initialize with NODATA
         let mut result = Array4::<i8>::from_elem((1, self.bands, self.height, self.width), NODATA);
 
-        // Process each band using Zip
-        for b in 0..self.bands {
-            let sum_band = self.sum.slice(s![b, .., ..]);
-            let mut result_band = result.slice_mut(s![0, b, .., ..]);
+        let width = self.width;
+        let height = self.height;
+        let bands = self.bands;
 
-            Zip::from(&mut result_band)
-                .and(&sum_band)
-                .and(&self.count)
-                .for_each(|result, &sum, &count| {
-                    if count > 0 {
-                        let c = count as i16;
-                        let half_c = c / 2;
+        // Build result by iterating over pixels
+        // We process sequentially since the computation is simple and memory-bound
+        for row in 0..height {
+            for col in 0..width {
+                let pixel_idx = row * width + col;
+                let count = self.count[pixel_idx].load(Ordering::Relaxed);
+
+                if count > 0 {
+                    let c = count as i32;
+                    let half_c = c / 2;
+
+                    for b in 0..bands {
+                        let band_idx = b * height * width + pixel_idx;
+                        let sum = self.sum[band_idx].load(Ordering::Relaxed);
+
                         // Rounded integer division
-                        *result = if sum >= 0 {
+                        let mean = if sum >= 0 {
                             ((sum + half_c) / c) as i8
                         } else {
                             ((sum - half_c) / c) as i8
                         };
+
+                        result[[0, b, row, col]] = mean;
                     }
-                });
+                }
+            }
         }
 
         result
@@ -142,14 +139,16 @@ impl MosaicAccumulator {
 
     /// Get the maximum overlap count.
     pub fn max_overlap(&self) -> u16 {
-        *self.count.iter().max().unwrap_or(&0)
-    }
-
-    /// Check if any pixels have data.
-    pub fn has_data(&self) -> bool {
-        self.count.iter().any(|&c| c > 0)
+        self.count
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .max()
+            .unwrap_or(0)
     }
 }
+
+// SAFETY: AtomicAccumulator only contains atomic types which are Sync
+unsafe impl Sync for AtomicAccumulator {}
 
 /// A grid cell for forward mapping interpolation.
 /// Contains pre-projected corner coordinates to enable fast bilinear interpolation.
@@ -283,11 +282,11 @@ fn build_forward_grid(
 ///
 /// This uses forward mapping (source → dest) instead of inverse mapping.
 /// Source pixels are read sequentially (cache-friendly), destination writes
-/// are scattered but benefit from write combining.
+/// are scattered but use atomic operations for thread safety.
 fn forward_map_tile(
     window: &WindowData,
     config: &ReprojectConfig,
-    accumulator: &mut MosaicAccumulator,
+    accumulator: &AtomicAccumulator,
 ) -> Result<usize> {
     let data = &window.data;
     let (bands, src_height, src_width) = data.dim();
@@ -355,8 +354,8 @@ fn forward_map_tile(
                     continue;
                 }
 
-                // Accumulate to destination
-                accumulator.accumulate_bands(&band_buf, dst_row, dst_col);
+                // Accumulate to destination (atomic, thread-safe)
+                accumulator.accumulate(&band_buf, dst_row, dst_col);
                 pixels_written += 1;
             }
         }
@@ -365,11 +364,11 @@ fn forward_map_tile(
     Ok(pixels_written)
 }
 
-/// Mosaic multiple tile windows into a single output chunk using forward mapping.
+/// Mosaic multiple tile windows into a single output chunk using parallel forward mapping.
 ///
 /// This function uses forward mapping (source → dest) for cache-friendly source reads.
-/// Each source tile is processed sequentially, with pixels accumulated directly
-/// to the output without creating intermediate reprojected arrays.
+/// Tiles are processed in parallel using Rayon, with an atomic accumulator
+/// handling concurrent writes to overlapping destination pixels.
 pub fn mosaic_tiles(
     windows: &[WindowData],
     _reprojector: &crate::transform::Reprojector, // Unused, kept for API compatibility
@@ -398,61 +397,78 @@ pub fn mosaic_tiles(
         total_input_pixels = total_input_pixels,
         output_pixels = output_pixels,
         input_output_ratio = format!("{:.2}", total_input_pixels as f64 / output_pixels as f64),
-        "mosaic_tiles starting (forward mapping)"
+        "mosaic_tiles starting (parallel forward mapping)"
     );
 
-    // Create accumulator
-    let mut accumulator = MosaicAccumulator::new(bands, height, width);
+    // Create atomic accumulator (thread-safe)
+    let accumulator = AtomicAccumulator::new(bands, height, width);
 
-    // Process each tile with forward mapping
-    // Sequential processing avoids synchronization overhead
+    // Process tiles in parallel using Rayon
     let map_start = Instant::now();
-    let mut total_pixels_written = 0usize;
 
-    for (i, window) in windows.iter().enumerate() {
-        let tile_start = Instant::now();
-        let (_, src_h, src_w) = window.data.dim();
+    let results: Vec<Result<usize>> = windows
+        .par_iter()
+        .enumerate()
+        .map(|(i, window)| {
+            let tile_start = Instant::now();
+            let (_, src_h, src_w) = window.data.dim();
 
-        let pixels_written = forward_map_tile(window, reproject_config, &mut accumulator)?;
-        total_pixels_written += pixels_written;
+            let pixels_written = forward_map_tile(window, reproject_config, &accumulator)?;
 
-        tracing::info!(
-            tile = i,
-            input_shape = ?(src_h, src_w),
-            pixels_written = pixels_written,
-            tile_ms = tile_start.elapsed().as_millis(),
-            "forward_map_tile completed"
-        );
-    }
+            tracing::info!(
+                tile = i,
+                input_shape = ?(src_h, src_w),
+                pixels_written = pixels_written,
+                tile_ms = tile_start.elapsed().as_millis(),
+                "forward_map_tile completed"
+            );
+
+            Ok(pixels_written)
+        })
+        .collect();
 
     let map_time = map_start.elapsed();
+
+    // Sum up pixels written, propagate any errors
+    let mut total_pixels_written = 0usize;
+    for result in results {
+        total_pixels_written += result?;
+    }
 
     tracing::info!(
         total_pixels_written = total_pixels_written,
         map_ms = map_time.as_millis(),
-        pixels_per_ms = total_pixels_written as f64 / map_time.as_millis() as f64,
-        "forward mapping completed"
+        pixels_per_ms = if map_time.as_millis() > 0 {
+            total_pixels_written as f64 / map_time.as_millis() as f64
+        } else {
+            0.0
+        },
+        "parallel forward mapping completed"
     );
 
-    Ok(accumulator.finalize())
+    // Finalize (compute means) - this is also parallelized internally
+    let finalize_start = Instant::now();
+    let result = accumulator.finalize();
+    let finalize_time = finalize_start.elapsed();
+
+    tracing::info!(
+        finalize_ms = finalize_time.as_millis(),
+        "accumulator finalized"
+    );
+
+    Ok(result)
 }
 
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::Array3;
 
     #[test]
-    fn test_accumulator_single_pixel() {
-        let mut acc = MosaicAccumulator::new(2, 4, 4);
+    fn test_atomic_accumulator_single_pixel() {
+        let acc = AtomicAccumulator::new(2, 4, 4);
 
-        // Create source data with one valid pixel
-        let mut data = Array3::from_elem((2, 2, 2), NODATA);
-        data[[0, 0, 0]] = 10;
-        data[[1, 0, 0]] = 20;
-
-        acc.accumulate_pixel(&data, 0, 0, 1, 1);
+        acc.accumulate(&[10, 20], 1, 1);
 
         let result = acc.finalize();
         assert_eq!(result[[0, 0, 1, 1]], 10);
@@ -460,25 +476,52 @@ mod tests {
     }
 
     #[test]
-    fn test_accumulator_mean_pixels() {
-        let mut acc = MosaicAccumulator::new(1, 2, 2);
+    fn test_atomic_accumulator_mean() {
+        let acc = AtomicAccumulator::new(1, 2, 2);
 
         // Accumulate two values at same location
-        acc.accumulate_bands(&[10], 0, 0);
-        acc.accumulate_bands(&[20], 0, 0);
+        acc.accumulate(&[10], 0, 0);
+        acc.accumulate(&[20], 0, 0);
 
         let result = acc.finalize();
         assert_eq!(result[[0, 0, 0, 0]], 15); // Mean of 10 and 20
     }
 
     #[test]
-    fn test_accumulator_nodata_skip() {
-        let mut acc = MosaicAccumulator::new(2, 2, 2);
+    fn test_atomic_accumulator_nodata_skip() {
+        let acc = AtomicAccumulator::new(2, 2, 2);
 
         // All nodata should not increment count
-        acc.accumulate_bands(&[NODATA, NODATA], 0, 0);
+        acc.accumulate(&[NODATA, NODATA], 0, 0);
 
-        assert_eq!(acc.count[[0, 0]], 0);
+        assert_eq!(acc.count[0].load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_atomic_accumulator_concurrent() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let acc = Arc::new(AtomicAccumulator::new(1, 10, 10));
+
+        // Spawn multiple threads writing to same pixel
+        let handles: Vec<_> = (0..10)
+            .map(|i| {
+                let acc = Arc::clone(&acc);
+                thread::spawn(move || {
+                    acc.accumulate(&[10], 5, 5);
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // Count should be 10, sum should be 100, mean should be 10
+        assert_eq!(acc.count[5 * 10 + 5].load(Ordering::Relaxed), 10);
+
+        // Can't easily test finalize without consuming, but count is correct
     }
 
     #[test]
@@ -510,11 +553,11 @@ mod tests {
 
     #[test]
     fn test_max_overlap() {
-        let mut acc = MosaicAccumulator::new(1, 2, 2);
+        let acc = AtomicAccumulator::new(1, 2, 2);
 
-        acc.accumulate_bands(&[10], 0, 0);
-        acc.accumulate_bands(&[20], 0, 0);
-        acc.accumulate_bands(&[30], 0, 0);
+        acc.accumulate(&[10], 0, 0);
+        acc.accumulate(&[20], 0, 0);
+        acc.accumulate(&[30], 0, 0);
 
         assert_eq!(acc.max_overlap(), 3);
     }

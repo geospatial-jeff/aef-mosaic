@@ -38,7 +38,7 @@ pub use config::{CheckpointConfig, Config, FilterConfig};
 pub use index::{InputIndex, OutputGrid, SpatialLookup};
 pub use io::{CogReader, ZarrWriter};
 pub use pipeline::{Metrics, MetricsReporter, Pipeline, PipelineConfig, PipelineStats};
-pub use transform::MosaicAccumulator;
+pub use transform::AtomicAccumulator;
 
 use anyhow::Result;
 use std::sync::Arc;
