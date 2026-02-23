@@ -1,137 +1,213 @@
-//! Mosaicing overlapping tiles using forward mapping and mean aggregation.
+//! Mosaicing overlapping tiles using block-parallel inverse mapping.
 //!
-//! This module uses forward mapping (source → dest) instead of inverse mapping
-//! (dest → source) to achieve sequential source reads, which are cache-friendly.
-//! The tradeoff is scattered destination writes, but writes are faster than
-//! random reads due to write combining in modern CPUs.
-//!
-//! Tiles are processed in parallel using Rayon, with an atomic accumulator
-//! to handle concurrent writes to overlapping destination pixels.
+//! This module processes output blocks in parallel, using inverse mapping
+//! (destination → source) to sample from overlapping input tiles. Each block
+//! maintains its own local accumulator, eliminating the need for atomic operations.
+//! Mean computation uses ndarray's vectorized Zip operations.
 
 use crate::io::WindowData;
 use crate::transform::ReprojectConfig;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use ndarray::{Array2, Array3, Array4, Axis, Zip, s};
-use ndarray::parallel::prelude::*;
 use proj::Proj;
-use std::sync::atomic::{AtomicI32, AtomicU16, Ordering};
+use rayon::prelude::*;
 use std::time::Instant;
 
 /// Nodata value for AEF embeddings (int8).
 const NODATA: i8 = -128;
 
-/// Grid cell size for forward mapping interpolation.
-/// Smaller = more Proj calls but better accuracy.
-/// 32x32 is a good balance for typical reprojection scenarios.
-const FORWARD_GRID_SIZE: usize = 32;
+/// Block size for parallel processing.
+/// Each output block is processed independently with its own accumulator.
+const BLOCK_SIZE: usize = 256;
 
-/// Thread-safe accumulator for parallel mosaicing using atomic operations.
-///
-/// Uses AtomicI32 for sum to handle many overlapping tiles without overflow.
-/// Uses AtomicU16 for count (max 65535 overlapping tiles per pixel).
-pub struct AtomicAccumulator {
-    /// Sum of values for each pixel: flat array [band * height * width + row * width + col]
-    sum: Vec<AtomicI32>,
+/// Grid cell size for inverse mapping interpolation.
+/// Pre-project grid corners to reduce Proj calls.
+const GRID_SIZE: usize = 32;
 
-    /// Count of contributions for each pixel: flat array [row * width + col]
-    count: Vec<AtomicU16>,
-
-    /// Number of bands
-    bands: usize,
-
-    /// Height in pixels
-    height: usize,
-
-    /// Width in pixels
-    width: usize,
+/// A grid cell for inverse mapping interpolation.
+/// Contains pre-projected corner coordinates for bilinear interpolation.
+#[derive(Debug, Clone)]
+struct InverseGridCell {
+    /// Output pixel bounds in the block [row0, col0, row1, col1]
+    out_row0: usize,
+    out_col0: usize,
+    out_row1: usize,
+    out_col1: usize,
+    /// Source coordinates at corners (after inverse projection)
+    /// Order: [top-left, top-right, bottom-left, bottom-right]
+    /// Each is (src_col, src_row) in floating point
+    src_corners: [(f64, f64); 4],
+    /// Whether all corners projected successfully
+    valid: bool,
 }
 
-impl AtomicAccumulator {
-    /// Create a new atomic accumulator for the given dimensions.
-    pub fn new(bands: usize, height: usize, width: usize) -> Self {
-        let pixel_count = height * width;
-        let band_pixel_count = bands * pixel_count;
-
-        // Initialize with zeros using Vec and then convert
-        let sum: Vec<AtomicI32> = (0..band_pixel_count)
-            .map(|_| AtomicI32::new(0))
-            .collect();
-        let count: Vec<AtomicU16> = (0..pixel_count)
-            .map(|_| AtomicU16::new(0))
-            .collect();
-
-        Self {
-            sum,
-            count,
-            bands,
-            height,
-            width,
-        }
-    }
-
-    /// Accumulate a single pixel with band values.
-    /// Thread-safe using atomic operations.
+impl InverseGridCell {
+    /// Interpolate source coordinates for an output pixel within this cell.
     #[inline]
-    pub fn accumulate(&self, bands_data: &[i8], dst_row: usize, dst_col: usize) {
-        debug_assert!(dst_row < self.height);
-        debug_assert!(dst_col < self.width);
-        debug_assert_eq!(bands_data.len(), self.bands);
+    fn interpolate(&self, out_row: usize, out_col: usize) -> (f64, f64) {
+        let cell_height = (self.out_row1 - self.out_row0) as f64;
+        let cell_width = (self.out_col1 - self.out_col0) as f64;
 
-        // Check if any band has valid data
-        let has_data = bands_data.iter().any(|&v| v != NODATA);
-        if !has_data {
-            return;
+        // Normalized position within cell [0, 1]
+        let t_row = if cell_height > 0.0 {
+            (out_row - self.out_row0) as f64 / cell_height
+        } else {
+            0.0
+        };
+        let t_col = if cell_width > 0.0 {
+            (out_col - self.out_col0) as f64 / cell_width
+        } else {
+            0.0
+        };
+
+        let [(x00, y00), (x01, y01), (x10, y10), (x11, y11)] = self.src_corners;
+
+        // Bilinear interpolation
+        let src_col = x00 * (1.0 - t_row) * (1.0 - t_col)
+            + x01 * (1.0 - t_row) * t_col
+            + x10 * t_row * (1.0 - t_col)
+            + x11 * t_row * t_col;
+
+        let src_row = y00 * (1.0 - t_row) * (1.0 - t_col)
+            + y01 * (1.0 - t_row) * t_col
+            + y10 * t_row * (1.0 - t_col)
+            + y11 * t_row * t_col;
+
+        (src_col, src_row)
+    }
+}
+
+/// Build an inverse grid for mapping output block pixels to source tile pixels.
+fn build_inverse_grid(
+    block_row_start: usize,
+    block_col_start: usize,
+    block_height: usize,
+    block_width: usize,
+    target_bounds: &[f64; 4],
+    target_resolution: f64,
+    source_bounds: &[f64; 4],
+    src_height: usize,
+    src_width: usize,
+    inv_proj: &Proj,
+) -> Vec<InverseGridCell> {
+    let target_min_x = target_bounds[0];
+    let target_max_y = target_bounds[3];
+
+    let src_pixel_x = (source_bounds[2] - source_bounds[0]) / src_width as f64;
+    let src_pixel_y = (source_bounds[3] - source_bounds[1]) / src_height as f64;
+    let src_min_x = source_bounds[0];
+    let src_min_y = source_bounds[1];
+
+    let mut cells = Vec::new();
+
+    let mut out_row = 0;
+    while out_row < block_height {
+        let out_row1 = (out_row + GRID_SIZE).min(block_height);
+
+        let mut out_col = 0;
+        while out_col < block_width {
+            let out_col1 = (out_col + GRID_SIZE).min(block_width);
+
+            // Project the 4 corners of this cell from output to source
+            let corners_out = [
+                (out_row, out_col),     // top-left
+                (out_row, out_col1),    // top-right
+                (out_row1, out_col),    // bottom-left
+                (out_row1, out_col1),   // bottom-right
+            ];
+
+            let mut src_corners = [(0.0, 0.0); 4];
+            let mut valid = true;
+
+            for (i, &(row, col)) in corners_out.iter().enumerate() {
+                // Output pixel to world coordinates (target CRS)
+                let global_row = block_row_start + row;
+                let global_col = block_col_start + col;
+                let world_x = target_min_x + (global_col as f64 + 0.5) * target_resolution;
+                let world_y = target_max_y - (global_row as f64 + 0.5) * target_resolution;
+
+                // Inverse project to source CRS
+                match inv_proj.convert((world_x, world_y)) {
+                    Ok((src_world_x, src_world_y)) => {
+                        // Convert to source pixel coordinates
+                        let src_col_f = (src_world_x - src_min_x) / src_pixel_x - 0.5;
+                        let src_row_f = (src_world_y - src_min_y) / src_pixel_y - 0.5;
+                        src_corners[i] = (src_col_f, src_row_f);
+                    }
+                    Err(_) => {
+                        valid = false;
+                        break;
+                    }
+                }
+            }
+
+            cells.push(InverseGridCell {
+                out_row0: out_row,
+                out_col0: out_col,
+                out_row1,
+                out_col1,
+                src_corners,
+                valid,
+            });
+
+            out_col = out_col1;
         }
+        out_row = out_row1;
+    }
 
-        let pixel_idx = dst_row * self.width + dst_col;
+    cells
+}
 
-        // Increment count atomically
-        self.count[pixel_idx].fetch_add(1, Ordering::Relaxed);
+/// Local block accumulator using ndarray (no atomics needed).
+struct BlockAccumulator {
+    /// Sum of values: [bands, block_height, block_width]
+    sum: Array3<i32>,
+    /// Count of contributions: [block_height, block_width]
+    count: Array2<u16>,
+    bands: usize,
+}
 
-        // Add each band value atomically
-        for (b, &val) in bands_data.iter().enumerate() {
-            let band_idx = b * self.height * self.width + pixel_idx;
-            self.sum[band_idx].fetch_add(val as i32, Ordering::Relaxed);
+impl BlockAccumulator {
+    fn new(bands: usize, height: usize, width: usize) -> Self {
+        Self {
+            sum: Array3::zeros((bands, height, width)),
+            count: Array2::zeros((height, width)),
+            bands,
         }
     }
 
-    /// Finalize the mosaic by computing the mean.
-    ///
-    /// Returns an int8 array: (1, bands, height, width)
-    /// Pixels with no data are set to NODATA (-128).
-    ///
-    /// Uses ndarray's parallel Zip for efficient array operations.
-    pub fn finalize(self) -> Array4<i8> {
-        let width = self.width;
-        let height = self.height;
-        let bands = self.bands;
+    /// Accumulate a pixel value at the given local coordinates.
+    #[inline]
+    fn accumulate(&mut self, data: &Array3<i8>, src_row: usize, src_col: usize, out_row: usize, out_col: usize) {
+        let mut has_data = false;
 
-        // Convert atomics to regular values (just reads inner values, no sync overhead)
-        let sum_data: Vec<i32> = self.sum.into_iter()
-            .map(|a| a.into_inner())
-            .collect();
-        let count_data: Vec<u16> = self.count.into_iter()
-            .map(|a| a.into_inner())
-            .collect();
+        for b in 0..self.bands {
+            let val = data[[b, src_row, src_col]];
+            if val != NODATA {
+                has_data = true;
+                self.sum[[b, out_row, out_col]] += val as i32;
+            }
+        }
 
-        // Create ndarray views - sum is [bands, height, width], count is [height, width]
-        let sum_arr = Array3::<i32>::from_shape_vec((bands, height, width), sum_data)
-            .expect("sum shape mismatch");
-        let count_arr = Array2::<u16>::from_shape_vec((height, width), count_data)
-            .expect("count shape mismatch");
+        if has_data {
+            self.count[[out_row, out_col]] += 1;
+        }
+    }
 
-        // Create result array initialized to NODATA
-        let mut result = Array4::<i8>::from_elem((1, bands, height, width), NODATA);
+    /// Finalize using ndarray Zip for vectorized mean computation.
+    fn finalize(self) -> Array3<i8> {
+        let (bands, height, width) = self.sum.dim();
+        let mut result = Array3::<i8>::from_elem((bands, height, width), NODATA);
 
-        // Process each band using parallel Zip (broadcasts count across pixels)
+        // Compute means using ndarray Zip (vectorized, efficient)
         for b in 0..bands {
-            let sum_band = sum_arr.index_axis(Axis(0), b);
-            let mut result_band = result.slice_mut(s![0, b, .., ..]);
+            let sum_band = self.sum.index_axis(Axis(0), b);
+            let mut result_band = result.index_axis_mut(Axis(0), b);
 
             Zip::from(&mut result_band)
                 .and(&sum_band)
-                .and(&count_arr)
-                .par_for_each(|r, &s, &c| {
+                .and(&self.count)
+                .for_each(|r, &s, &c| {
                     if c > 0 {
                         let c = c as i32;
                         let half_c = c / 2;
@@ -146,402 +222,256 @@ impl AtomicAccumulator {
 
         result
     }
-
-    /// Get the maximum overlap count.
-    pub fn max_overlap(&self) -> u16 {
-        self.count
-            .iter()
-            .map(|c| c.load(Ordering::Relaxed))
-            .max()
-            .unwrap_or(0)
-    }
 }
 
-// SAFETY: AtomicAccumulator only contains atomic types which are Sync
-unsafe impl Sync for AtomicAccumulator {}
-
-/// A grid cell for forward mapping interpolation.
-/// Contains pre-projected corner coordinates to enable fast bilinear interpolation.
-#[derive(Debug, Clone, Copy)]
-struct ForwardCell {
-    /// Source pixel bounds [x0, y0, x1, y1]
-    src_x0: usize,
-    src_y0: usize,
-    src_x1: usize,
-    src_y1: usize,
-    /// Destination pixel coordinates at corners (after projection)
-    /// Order: [top-left, top-right, bottom-left, bottom-right]
-    /// Each is (dst_col, dst_row) in floating point
-    dst_corners: [(f64, f64); 4],
-    /// Whether all corners projected successfully
-    valid: bool,
-}
-
-impl ForwardCell {
-    /// Interpolate destination coordinates for a source pixel within this cell.
-    #[inline]
-    fn interpolate(&self, src_col: usize, src_row: usize) -> (f64, f64) {
-        let cell_width = (self.src_x1 - self.src_x0) as f64;
-        let cell_height = (self.src_y1 - self.src_y0) as f64;
-
-        // Normalized position within cell [0, 1]
-        let t_col = if cell_width > 0.0 {
-            (src_col - self.src_x0) as f64 / cell_width
-        } else {
-            0.0
-        };
-        let t_row = if cell_height > 0.0 {
-            (src_row - self.src_y0) as f64 / cell_height
-        } else {
-            0.0
-        };
-
-        let [(x00, y00), (x01, y01), (x10, y10), (x11, y11)] = self.dst_corners;
-
-        // Bilinear interpolation
-        let dst_col = x00 * (1.0 - t_row) * (1.0 - t_col)
-            + x01 * (1.0 - t_row) * t_col
-            + x10 * t_row * (1.0 - t_col)
-            + x11 * t_row * t_col;
-
-        let dst_row = y00 * (1.0 - t_row) * (1.0 - t_col)
-            + y01 * (1.0 - t_row) * t_col
-            + y10 * t_row * (1.0 - t_col)
-            + y11 * t_row * t_col;
-
-        (dst_col, dst_row)
-    }
-}
-
-/// Build a grid of forward-projected cells for a source image.
-fn build_forward_grid(
-    src_width: usize,
-    src_height: usize,
-    source_bounds: &[f64; 4],
-    fwd_proj: &Proj,
-    target_bounds: &[f64; 4],
-    target_resolution: f64,
-) -> Vec<ForwardCell> {
-    let src_pixel_x = (source_bounds[2] - source_bounds[0]) / src_width as f64;
-    let src_pixel_y = (source_bounds[3] - source_bounds[1]) / src_height as f64;
-
-    let inv_target_res = 1.0 / target_resolution;
-    let target_min_x = target_bounds[0];
-    let target_max_y = target_bounds[3]; // Top of image (row 0)
-
-    let mut cells = Vec::new();
-
-    let mut src_y = 0;
-    while src_y < src_height {
-        let src_y1 = (src_y + FORWARD_GRID_SIZE).min(src_height);
-
-        let mut src_x = 0;
-        while src_x < src_width {
-            let src_x1 = (src_x + FORWARD_GRID_SIZE).min(src_width);
-
-            // Project the 4 corners of this cell
-            let corners_src = [
-                (src_x, src_y),         // top-left (in source, which is bottom-up)
-                (src_x1, src_y),        // top-right
-                (src_x, src_y1),        // bottom-left
-                (src_x1, src_y1),       // bottom-right
-            ];
-
-            let mut dst_corners = [(0.0, 0.0); 4];
-            let mut valid = true;
-
-            for (i, &(px, py)) in corners_src.iter().enumerate() {
-                // Source pixel to world coordinates
-                // Source is bottom-up: row 0 is at min_y
-                let world_x = source_bounds[0] + (px as f64 + 0.5) * src_pixel_x;
-                let world_y = source_bounds[1] + (py as f64 + 0.5) * src_pixel_y;
-
-                // Project to target CRS
-                match fwd_proj.convert((world_x, world_y)) {
-                    Ok((target_x, target_y)) => {
-                        // Convert to target pixel coordinates (target is top-down)
-                        let dst_col = (target_x - target_min_x) * inv_target_res;
-                        let dst_row = (target_max_y - target_y) * inv_target_res;
-                        dst_corners[i] = (dst_col, dst_row);
-                    }
-                    Err(_) => {
-                        valid = false;
-                        break;
-                    }
-                }
-            }
-
-            cells.push(ForwardCell {
-                src_x0: src_x,
-                src_y0: src_y,
-                src_x1,
-                src_y1,
-                dst_corners,
-                valid,
-            });
-
-            src_x = src_x1;
-        }
-        src_y = src_y1;
-    }
-
-    cells
-}
-
-/// Forward-map a single tile directly to the accumulator.
-///
-/// This uses forward mapping (source → dest) instead of inverse mapping.
-/// Source pixels are read sequentially (cache-friendly), destination writes
-/// are scattered but use atomic operations for thread safety.
-fn forward_map_tile(
-    window: &WindowData,
+/// Process a single output block using inverse mapping.
+fn process_block(
+    block_row_start: usize,
+    block_col_start: usize,
+    block_height: usize,
+    block_width: usize,
+    bands: usize,
+    windows: &[WindowData],
     config: &ReprojectConfig,
-    accumulator: &AtomicAccumulator,
-) -> Result<usize> {
-    let data = &window.data;
-    let (bands, src_height, src_width) = data.dim();
-    let (dst_height, dst_width) = config.target_shape;
+) -> Result<Array3<i8>> {
+    let mut accumulator = BlockAccumulator::new(bands, block_height, block_width);
 
-    let source_bounds = &window.bounds_native;
-    let source_crs = &window.tile.crs;
+    // Process each source tile
+    for window in windows {
+        let data = &window.data;
+        let (_, src_height, src_width) = data.dim();
+        let source_bounds = &window.bounds_native;
+        let source_crs = &window.tile.crs;
 
-    // Create forward projection: source CRS → target CRS
-    let fwd_proj = Proj::new_known_crs(source_crs, &config.target_crs, None)
-        .with_context(|| format!("Failed to create Proj for {} -> {}", source_crs, config.target_crs))?;
+        // Create inverse projection: target CRS → source CRS
+        let inv_proj = match Proj::new_known_crs(&config.target_crs, source_crs, None) {
+            Ok(p) => p,
+            Err(_) => continue, // Skip tiles we can't project
+        };
 
-    // Build the forward grid
-    let grid = build_forward_grid(
-        src_width,
-        src_height,
-        source_bounds,
-        &fwd_proj,
-        &config.target_bounds,
-        config.target_resolution,
-    );
+        // Build the inverse grid for this tile
+        let grid = build_inverse_grid(
+            block_row_start,
+            block_col_start,
+            block_height,
+            block_width,
+            &config.target_bounds,
+            config.target_resolution,
+            source_bounds,
+            src_height,
+            src_width,
+            &inv_proj,
+        );
 
-    let mut pixels_written = 0usize;
+        // Process each cell in the grid
+        for cell in &grid {
+            if !cell.valid {
+                continue;
+            }
 
-    // Pre-allocate a buffer for reading bands (avoids repeated allocations)
-    let mut band_buf: Vec<i8> = vec![0; bands];
+            // Process each output pixel in this cell
+            for out_row in cell.out_row0..cell.out_row1 {
+                for out_col in cell.out_col0..cell.out_col1 {
+                    // Interpolate source coordinates
+                    let (src_col_f, src_row_f) = cell.interpolate(out_row, out_col);
 
-    // Process each cell
-    for cell in &grid {
-        if !cell.valid {
-            continue;
-        }
+                    // Nearest neighbor sampling with bounds check
+                    let src_col = src_col_f.round() as isize;
+                    let src_row = src_row_f.round() as isize;
 
-        // Process each source pixel in this cell (sequential reads!)
-        for src_row in cell.src_y0..cell.src_y1 {
-            for src_col in cell.src_x0..cell.src_x1 {
-                // Interpolate destination coordinates
-                let (dst_col_f, dst_row_f) = cell.interpolate(src_col, src_row);
-
-                // Round to nearest pixel
-                let dst_col = dst_col_f.round() as isize;
-                let dst_row = dst_row_f.round() as isize;
-
-                // Bounds check
-                if dst_col < 0 || dst_col >= dst_width as isize
-                    || dst_row < 0 || dst_row >= dst_height as isize
-                {
-                    continue;
-                }
-
-                let dst_col = dst_col as usize;
-                let dst_row = dst_row as usize;
-
-                // Read all bands from source (sequential memory access)
-                let mut has_data = false;
-                for b in 0..bands {
-                    let val = data[[b, src_row, src_col]];
-                    band_buf[b] = val;
-                    if val != NODATA {
-                        has_data = true;
+                    if src_col < 0 || src_col >= src_width as isize
+                        || src_row < 0 || src_row >= src_height as isize
+                    {
+                        continue;
                     }
-                }
 
-                if !has_data {
-                    continue;
+                    accumulator.accumulate(
+                        data,
+                        src_row as usize,
+                        src_col as usize,
+                        out_row,
+                        out_col,
+                    );
                 }
-
-                // Accumulate to destination (atomic, thread-safe)
-                accumulator.accumulate(&band_buf, dst_row, dst_col);
-                pixels_written += 1;
             }
         }
     }
 
-    Ok(pixels_written)
+    Ok(accumulator.finalize())
 }
 
-/// Mosaic multiple tile windows into a single output chunk using parallel forward mapping.
+/// Mosaic multiple tile windows into a single output chunk using block-parallel inverse mapping.
 ///
-/// This function uses forward mapping (source → dest) for cache-friendly source reads.
-/// Tiles are processed in parallel using Rayon, with an atomic accumulator
-/// handling concurrent writes to overlapping destination pixels.
+/// This function splits the output into blocks and processes them in parallel.
+/// Each block uses inverse mapping (dest → source) with local accumulators,
+/// then computes means using ndarray's vectorized operations.
 pub fn mosaic_tiles(
     windows: &[WindowData],
-    _reprojector: &crate::transform::Reprojector, // Unused, kept for API compatibility
+    _reprojector: &crate::transform::Reprojector,
     reproject_config: &ReprojectConfig,
 ) -> Result<Array4<i8>> {
+    let (height, width) = reproject_config.target_shape;
+    let bands = reproject_config.num_bands;
+
     if windows.is_empty() {
-        return Ok(Array4::zeros((
-            1,
-            reproject_config.num_bands,
-            reproject_config.target_shape.0,
-            reproject_config.target_shape.1,
-        )));
+        return Ok(Array4::from_elem((1, bands, height, width), NODATA));
     }
 
-    let bands = windows[0].data.dim().0;
-    let (height, width) = reproject_config.target_shape;
-
     // Log input sizes
-    let total_input_pixels: usize = windows.iter()
+    let total_input_pixels: usize = windows
+        .iter()
         .map(|w| w.data.dim().1 * w.data.dim().2)
         .sum();
     let output_pixels = height * width;
+
+    let num_block_rows = (height + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    let num_block_cols = (width + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    let total_blocks = num_block_rows * num_block_cols;
 
     tracing::info!(
         num_tiles = windows.len(),
         total_input_pixels = total_input_pixels,
         output_pixels = output_pixels,
-        input_output_ratio = format!("{:.2}", total_input_pixels as f64 / output_pixels as f64),
-        "mosaic_tiles starting (parallel forward mapping)"
+        num_blocks = total_blocks,
+        block_size = BLOCK_SIZE,
+        "mosaic_tiles starting (block-parallel inverse mapping)"
     );
 
-    // Create atomic accumulator (thread-safe)
-    let accumulator = AtomicAccumulator::new(bands, height, width);
+    let process_start = Instant::now();
 
-    // Process tiles in parallel using Rayon
-    let map_start = Instant::now();
-
-    let results: Vec<Result<usize>> = windows
-        .par_iter()
-        .enumerate()
-        .map(|(i, window)| {
-            let tile_start = Instant::now();
-            let (_, src_h, src_w) = window.data.dim();
-
-            let pixels_written = forward_map_tile(window, reproject_config, &accumulator)?;
-
-            tracing::info!(
-                tile = i,
-                input_shape = ?(src_h, src_w),
-                pixels_written = pixels_written,
-                tile_ms = tile_start.elapsed().as_millis(),
-                "forward_map_tile completed"
-            );
-
-            Ok(pixels_written)
+    // Generate all block coordinates
+    let blocks: Vec<(usize, usize, usize, usize)> = (0..num_block_rows)
+        .flat_map(|br| {
+            (0..num_block_cols).map(move |bc| {
+                let row_start = br * BLOCK_SIZE;
+                let col_start = bc * BLOCK_SIZE;
+                let block_height = BLOCK_SIZE.min(height - row_start);
+                let block_width = BLOCK_SIZE.min(width - col_start);
+                (row_start, col_start, block_height, block_width)
+            })
         })
         .collect();
 
-    let map_time = map_start.elapsed();
+    // Process blocks in parallel
+    let block_results: Vec<Result<((usize, usize, usize, usize), Array3<i8>)>> = blocks
+        .par_iter()
+        .map(|&(row_start, col_start, block_height, block_width)| {
+            let block_data = process_block(
+                row_start,
+                col_start,
+                block_height,
+                block_width,
+                bands,
+                windows,
+                reproject_config,
+            )?;
+            Ok(((row_start, col_start, block_height, block_width), block_data))
+        })
+        .collect();
 
-    // Sum up pixels written, propagate any errors
-    let mut total_pixels_written = 0usize;
-    for result in results {
-        total_pixels_written += result?;
+    let process_time = process_start.elapsed();
+
+    // Assemble blocks into final output using ndarray slicing
+    let assemble_start = Instant::now();
+    let mut result = Array4::<i8>::from_elem((1, bands, height, width), NODATA);
+
+    for block_result in block_results {
+        let ((row_start, col_start, block_height, block_width), block_data) = block_result?;
+
+        // Use ndarray slice assignment for efficient copy
+        let mut target_slice = result.slice_mut(s![
+            0,
+            ..,
+            row_start..row_start + block_height,
+            col_start..col_start + block_width
+        ]);
+        target_slice.assign(&block_data);
     }
 
+    let assemble_time = assemble_start.elapsed();
+
     tracing::info!(
-        total_pixels_written = total_pixels_written,
-        map_ms = map_time.as_millis(),
-        pixels_per_ms = if map_time.as_millis() > 0 {
-            total_pixels_written as f64 / map_time.as_millis() as f64
+        process_ms = process_time.as_millis(),
+        assemble_ms = assemble_time.as_millis(),
+        pixels_per_ms = if process_time.as_millis() > 0 {
+            output_pixels as f64 / process_time.as_millis() as f64
         } else {
             0.0
         },
-        "parallel forward mapping completed"
-    );
-
-    // Finalize (compute means) - this is also parallelized internally
-    let finalize_start = Instant::now();
-    let result = accumulator.finalize();
-    let finalize_time = finalize_start.elapsed();
-
-    tracing::info!(
-        finalize_ms = finalize_time.as_millis(),
-        "accumulator finalized"
+        "block-parallel inverse mapping completed"
     );
 
     Ok(result)
 }
 
+/// Thread-safe accumulator for parallel mosaicing using atomic operations.
+/// Kept for backwards compatibility and potential future use.
+pub struct AtomicAccumulator {
+    bands: usize,
+    height: usize,
+    width: usize,
+}
+
+impl AtomicAccumulator {
+    /// Create a new atomic accumulator (stub for API compatibility).
+    pub fn new(bands: usize, height: usize, width: usize) -> Self {
+        Self { bands, height, width }
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_atomic_accumulator_single_pixel() {
-        let acc = AtomicAccumulator::new(2, 4, 4);
+    fn test_block_accumulator_single_pixel() {
+        let mut acc = BlockAccumulator::new(2, 4, 4);
 
-        acc.accumulate(&[10, 20], 1, 1);
+        // Create a small test array
+        let data = Array3::from_shape_vec((2, 2, 2), vec![10, 20, 30, 40, 50, 60, 70, 80])
+            .unwrap();
 
-        let result = acc.finalize();
-        assert_eq!(result[[0, 0, 1, 1]], 10);
-        assert_eq!(result[[0, 1, 1, 1]], 20);
-    }
-
-    #[test]
-    fn test_atomic_accumulator_mean() {
-        let acc = AtomicAccumulator::new(1, 2, 2);
-
-        // Accumulate two values at same location
-        acc.accumulate(&[10], 0, 0);
-        acc.accumulate(&[20], 0, 0);
+        acc.accumulate(&data, 0, 0, 1, 1);
 
         let result = acc.finalize();
-        assert_eq!(result[[0, 0, 0, 0]], 15); // Mean of 10 and 20
+        assert_eq!(result[[0, 1, 1]], 10);
+        assert_eq!(result[[1, 1, 1]], 50);
     }
 
     #[test]
-    fn test_atomic_accumulator_nodata_skip() {
-        let acc = AtomicAccumulator::new(2, 2, 2);
+    fn test_block_accumulator_mean() {
+        let mut acc = BlockAccumulator::new(1, 2, 2);
 
-        // All nodata should not increment count
-        acc.accumulate(&[NODATA, NODATA], 0, 0);
+        let data1 = Array3::from_shape_vec((1, 1, 1), vec![10]).unwrap();
+        let data2 = Array3::from_shape_vec((1, 1, 1), vec![20]).unwrap();
 
-        assert_eq!(acc.count[0].load(Ordering::Relaxed), 0);
+        acc.accumulate(&data1, 0, 0, 0, 0);
+        acc.accumulate(&data2, 0, 0, 0, 0);
+
+        let result = acc.finalize();
+        assert_eq!(result[[0, 0, 0]], 15); // Mean of 10 and 20
     }
 
     #[test]
-    fn test_atomic_accumulator_concurrent() {
-        use std::sync::Arc;
-        use std::thread;
+    fn test_block_accumulator_nodata_skip() {
+        let mut acc = BlockAccumulator::new(2, 2, 2);
 
-        let acc = Arc::new(AtomicAccumulator::new(1, 10, 10));
+        // All nodata
+        let data = Array3::from_shape_vec((2, 1, 1), vec![NODATA, NODATA]).unwrap();
 
-        // Spawn multiple threads writing to same pixel
-        let handles: Vec<_> = (0..10)
-            .map(|i| {
-                let acc = Arc::clone(&acc);
-                thread::spawn(move || {
-                    acc.accumulate(&[10], 5, 5);
-                })
-            })
-            .collect();
+        acc.accumulate(&data, 0, 0, 0, 0);
 
-        for handle in handles {
-            handle.join().unwrap();
-        }
-
-        // Count should be 10, sum should be 100, mean should be 10
-        assert_eq!(acc.count[5 * 10 + 5].load(Ordering::Relaxed), 10);
-
-        // Can't easily test finalize without consuming, but count is correct
+        assert_eq!(acc.count[[0, 0]], 0);
     }
 
     #[test]
-    fn test_forward_cell_interpolation() {
-        let cell = ForwardCell {
-            src_x0: 0,
-            src_y0: 0,
-            src_x1: 10,
-            src_y1: 10,
-            dst_corners: [
+    fn test_inverse_grid_cell_interpolation() {
+        let cell = InverseGridCell {
+            out_row0: 0,
+            out_col0: 0,
+            out_row1: 10,
+            out_col1: 10,
+            src_corners: [
                 (0.0, 0.0),   // top-left
                 (10.0, 0.0),  // top-right
                 (0.0, 10.0),  // bottom-left
@@ -559,16 +489,5 @@ mod tests {
         let (x, y) = cell.interpolate(0, 0);
         assert!((x - 0.0).abs() < 0.01);
         assert!((y - 0.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_max_overlap() {
-        let acc = AtomicAccumulator::new(1, 2, 2);
-
-        acc.accumulate(&[10], 0, 0);
-        acc.accumulate(&[20], 0, 0);
-        acc.accumulate(&[30], 0, 0);
-
-        assert_eq!(acc.max_overlap(), 3);
     }
 }
