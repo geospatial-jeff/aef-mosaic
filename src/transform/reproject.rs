@@ -43,7 +43,7 @@ impl UnsafeArray3 {
     /// SAFETY: Caller must ensure no other thread writes to this index.
     #[inline]
     unsafe fn set(&self, index: [usize; 3], value: i8) {
-        (*self.0.get())[index] = value;
+        (&mut *self.0.get())[index] = value;
     }
 
     fn into_inner(self) -> Array3<i8> {
