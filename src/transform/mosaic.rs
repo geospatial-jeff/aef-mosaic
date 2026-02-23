@@ -4,6 +4,7 @@ use crate::io::WindowData;
 use crate::transform::{ReprojectConfig, Reprojector};
 use anyhow::Result;
 use ndarray::{s, Array2, Array3, Array4, Axis, Zip};
+use rayon::prelude::*;
 
 /// Nodata value for AEF embeddings (int8).
 const NODATA: i8 = -128;
@@ -166,36 +167,44 @@ pub fn mosaic_tiles(
     let bands = windows[0].data.dim().0;
     let (height, width) = reproject_config.target_shape;
 
+    // Reproject all windows in parallel - each window is independent
+    // We create a new Reprojector per thread since Proj objects are thread-local
+    let reprojected_tiles: Vec<Result<Array3<i8>>> = windows
+        .par_iter()
+        .enumerate()
+        .map(|(i, window_data)| {
+            let window_bounds = window_data.bounds_native;
+
+            tracing::debug!(
+                "Window {} bounds (native CRS {}): [{:.2}, {:.2}, {:.2}, {:.2}], pixel window: ({}, {}, {}x{})",
+                i,
+                window_data.tile.crs,
+                window_bounds[0], window_bounds[1], window_bounds[2], window_bounds[3],
+                window_data.window.x, window_data.window.y, window_data.window.width, window_data.window.height
+            );
+
+            // Reproject window to output grid
+            let reprojected = reprojector.reproject_tile(
+                &window_data.data,
+                &window_data.tile.crs,
+                &window_bounds,
+                reproject_config,
+            )?;
+
+            let valid_pixels = reprojected.iter().filter(|&&v| v != -128).count();
+            tracing::debug!(
+                "Window {} reprojected: shape={:?}, valid_pixels={}",
+                i, reprojected.dim(), valid_pixels
+            );
+
+            Ok(reprojected)
+        })
+        .collect();
+
+    // Accumulate results sequentially (accumulator is not thread-safe)
     let mut accumulator = MosaicAccumulator::new(bands, height, width);
-
-    for (i, window_data) in windows.iter().enumerate() {
-        // Use the pre-computed intersection bounds from the tile selection phase
-        let window_bounds = window_data.bounds_native;
-
-        tracing::debug!(
-            "Window {} bounds (native CRS {}): [{:.2}, {:.2}, {:.2}, {:.2}], pixel window: ({}, {}, {}x{})",
-            i,
-            window_data.tile.crs,
-            window_bounds[0], window_bounds[1], window_bounds[2], window_bounds[3],
-            window_data.window.x, window_data.window.y, window_data.window.width, window_data.window.height
-        );
-
-        // Reproject window to output grid
-        let reprojected = reprojector.reproject_tile(
-            &window_data.data,
-            &window_data.tile.crs,
-            &window_bounds,
-            reproject_config,
-        )?;
-
-        let valid_pixels = reprojected.iter().filter(|&&v| v != -128).count();
-        tracing::debug!(
-            "Window {} reprojected: shape={:?}, valid_pixels={}",
-            i, reprojected.dim(), valid_pixels
-        );
-
-        // Add to accumulator
-        accumulator.add(&reprojected);
+    for reprojected in reprojected_tiles {
+        accumulator.add(&reprojected?);
     }
 
     Ok(accumulator.finalize())

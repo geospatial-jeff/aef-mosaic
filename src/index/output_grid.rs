@@ -705,6 +705,93 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_chunks_for_bounds_wgs84_basic() {
+        // Create a 4x4 chunk grid in WGS84
+        let grid = OutputGrid::new(
+            [0.0, 0.0, 4.0, 4.0],
+            crs::codes::WGS84.to_string(),
+            1.0,  // 1 degree per pixel
+            vec![2024],
+            64,
+            ChunkShape {
+                time: 1,
+                embedding: 64,
+                height: 1,
+                width: 1,
+            },
+        ).unwrap();
+
+        // Query bounds that should intersect 4 chunks (center of grid)
+        let bounds = [1.5, 1.5, 2.5, 2.5];
+        let chunks = grid.chunks_for_bounds_wgs84(&bounds, 2024).unwrap();
+
+        // Should find 4 chunks
+        assert_eq!(chunks.len(), 4, "Expected 4 intersecting chunks");
+
+        // Verify chunks are sorted by Hilbert index (adjacent chunks)
+        let indices: Vec<_> = chunks.iter()
+            .map(|c| (c.row_idx, c.col_idx))
+            .collect();
+        // The exact order depends on Hilbert curve, but all 4 should be present
+        assert!(indices.contains(&(1, 1)));
+        assert!(indices.contains(&(1, 2)));
+        assert!(indices.contains(&(2, 1)));
+        assert!(indices.contains(&(2, 2)));
+    }
+
+    #[test]
+    fn test_chunks_for_bounds_wgs84_no_intersection() {
+        let grid = OutputGrid::new(
+            [0.0, 0.0, 4.0, 4.0],
+            crs::codes::WGS84.to_string(),
+            1.0,
+            vec![2024],
+            64,
+            ChunkShape {
+                time: 1,
+                embedding: 64,
+                height: 1,
+                width: 1,
+            },
+        ).unwrap();
+
+        // Query bounds outside the grid
+        let bounds = [10.0, 10.0, 11.0, 11.0];
+        let chunks = grid.chunks_for_bounds_wgs84(&bounds, 2024).unwrap();
+        assert!(chunks.is_empty(), "Expected no intersecting chunks");
+    }
+
+    #[test]
+    fn test_chunks_for_bounds_wgs84_wrong_year() {
+        let grid = OutputGrid::new(
+            [0.0, 0.0, 4.0, 4.0],
+            crs::codes::WGS84.to_string(),
+            1.0,
+            vec![2024, 2025],
+            64,
+            ChunkShape {
+                time: 1,
+                embedding: 64,
+                height: 1,
+                width: 1,
+            },
+        ).unwrap();
+
+        // Query with a year not in the grid
+        let bounds = [1.5, 1.5, 2.5, 2.5];
+        let chunks = grid.chunks_for_bounds_wgs84(&bounds, 2020).unwrap();
+        assert!(chunks.is_empty(), "Expected no chunks for non-existent year");
+
+        // Query with valid year should work
+        let chunks = grid.chunks_for_bounds_wgs84(&bounds, 2025).unwrap();
+        assert!(!chunks.is_empty(), "Expected chunks for valid year");
+        // All chunks should have time_idx=1 (2025 is second year)
+        for chunk in &chunks {
+            assert_eq!(chunk.time_idx, 1);
+        }
+    }
+
     /// Test the exact scenario that caused the original bug:
     /// Zarr pixel (838, 886) should map to world (552853, 4181018),
     /// which should be in chunk (0, 0) with correct bounds.

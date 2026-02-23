@@ -11,6 +11,8 @@
 use anyhow::{Context, Result};
 use ndarray::Array3;
 use proj::Proj;
+use rayon::prelude::*;
+use std::cell::UnsafeCell;
 
 /// Maximum interpolation error in pixels before subdividing.
 /// GDAL uses 0.125 by default; we use 0.5 for good balance of speed/accuracy.
@@ -24,6 +26,30 @@ const MIN_BLOCK_SIZE: usize = 4;
 
 /// Nodata value for AEF embeddings (int8).
 const NODATA: i8 = -128;
+
+/// Wrapper for parallel writes to non-overlapping regions of an array.
+/// SAFETY: Caller must ensure no two threads write to the same index.
+struct UnsafeArray3(UnsafeCell<Array3<i8>>);
+
+// SAFETY: We guarantee non-overlapping writes from different threads
+unsafe impl Sync for UnsafeArray3 {}
+
+impl UnsafeArray3 {
+    fn new(arr: Array3<i8>) -> Self {
+        Self(UnsafeCell::new(arr))
+    }
+
+    /// Write a value at the given index.
+    /// SAFETY: Caller must ensure no other thread writes to this index.
+    #[inline]
+    unsafe fn set(&self, index: [usize; 3], value: i8) {
+        (*self.0.get())[index] = value;
+    }
+
+    fn into_inner(self) -> Array3<i8> {
+        self.0.into_inner()
+    }
+}
 
 /// Configuration for reprojection.
 #[derive(Debug, Clone)]
@@ -291,23 +317,24 @@ impl Reprojector {
             (src_pixel_x, src_pixel_y),
         );
 
+        let num_cells = grid.cells.len();
         tracing::debug!(
             "Adaptive grid: {} cells for {}x{} output (initial block: {}, min block: {})",
-            grid.cells.len(),
+            num_cells,
             dst_width,
             dst_height,
             INITIAL_BLOCK_SIZE,
             MIN_BLOCK_SIZE
         );
 
-        // Create output array initialized with NODATA
-        let mut output = Array3::<i8>::from_elem((bands, dst_height, dst_width), NODATA);
+        // Create output array initialized with NODATA, wrapped for parallel writes
+        let output = UnsafeArray3::new(Array3::<i8>::from_elem((bands, dst_height, dst_width), NODATA));
 
-        // Iterate by CELL instead of by pixel - avoids O(pixels × cells) linear search
-        // Each cell knows its pixel bounds, so we just iterate within those bounds
-        for cell in grid.iter() {
+        // Iterate cells in parallel - cells are non-overlapping in destination space,
+        // so parallel writes to different pixels are safe
+        grid.cells.par_iter().for_each(|cell| {
             if !cell.is_valid() {
-                continue;
+                return;
             }
 
             // Iterate over all pixels within this cell's bounds
@@ -338,13 +365,18 @@ impl Reprojector {
                     let src_row = src_row_i as usize;
 
                     // Copy all bands
+                    // SAFETY: cells are non-overlapping in destination space,
+                    // so no two threads write to the same (band, dst_row, dst_col)
                     for band in 0..bands {
-                        output[[band, dst_row, dst_col]] = data[[band, src_row, src_col]];
+                        unsafe {
+                            output.set([band, dst_row, dst_col], data[[band, src_row, src_col]]);
+                        }
                     }
                 }
             }
-        }
+        });
 
+        let output = output.into_inner();
         let valid_pixels = output.iter().filter(|&&v| v != NODATA).count();
         tracing::debug!(
             "Adaptive reproject: {}x{} -> {}x{}, {} cells, {} valid pixels",
