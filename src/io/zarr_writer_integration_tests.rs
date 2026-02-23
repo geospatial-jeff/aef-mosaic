@@ -61,7 +61,7 @@ fn create_test_grid(height: usize, width: usize, chunk_shape: &ChunkShape) -> Ou
 }
 
 /// Test 1: Production-sized full chunks (1, 64, 1024, 1024)
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_production_full_chunk_size() {
     let test_dir = std::path::PathBuf::from("target/test-zarr-prod-size");
     if test_dir.exists() {
@@ -79,7 +79,7 @@ async fn test_production_full_chunk_size() {
     let config = create_test_config(chunk_shape.clone());
     let grid = Arc::new(create_test_grid(1024, 1024, &chunk_shape));
 
-    let writer = ZarrWriter::create(store, "", grid, &config).await.unwrap();
+    let writer = Arc::new(ZarrWriter::create(store, "", grid, &config).await.unwrap());
 
     // Create production-sized data: (1, 64, 1024, 1024) = 67,108,864 elements
     let data = Array4::from_elem((1, 64, 1024, 1024), 42i8);
@@ -92,7 +92,10 @@ async fn test_production_full_chunk_size() {
         col_idx: 0,
     };
 
-    let result = writer.write_chunk_async(&chunk, data).await;
+    let writer_clone = writer.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        writer_clone.write_chunk_sync(&chunk, data)
+    }).await.unwrap();
     println!("Write result: {:?}", result);
     result.unwrap();
 
@@ -114,7 +117,7 @@ async fn test_production_full_chunk_size() {
 // because OutputGrid now guarantees all chunks are full-sized by rounding dimensions up to chunk boundaries.
 
 /// Test 2: Multiple chunks via Arc<ZarrWriter> with buffer_unordered (production pattern)
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_arc_writer_buffer_unordered() {
     let test_dir = std::path::PathBuf::from("target/test-zarr-arc-buffered");
     if test_dir.exists() {
@@ -142,13 +145,15 @@ async fn test_arc_writer_buffer_unordered() {
         OutputChunk { time_idx: 0, row_idx: 1, col_idx: 1 },
     ];
 
-    // Use buffer_unordered like production scheduler
+    // Use buffer_unordered like production scheduler with spawn_blocking for sync API
     let results: Vec<_> = stream::iter(chunks.clone())
         .map(|chunk| {
             let w = writer.clone();
             async move {
                 let data = Array4::from_elem((1, 64, 256, 256), 42i8);
-                w.write_chunk_async(&chunk, data).await
+                tokio::task::spawn_blocking(move || {
+                    w.write_chunk_sync(&chunk, data)
+                }).await.unwrap()
             }
         })
         .buffer_unordered(4) // Concurrent like production
@@ -179,7 +184,7 @@ async fn test_arc_writer_buffer_unordered() {
 
 /// Test 3: Production-like grid dimensions (7719x7116 like SF Bay Area run)
 /// Note: Grid is now chunk-aligned, so all chunks are full 1024x1024
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_production_grid_dimensions() {
     let test_dir = std::path::PathBuf::from("target/test-zarr-prod-grid");
     if test_dir.exists() {
@@ -220,12 +225,18 @@ async fn test_production_grid_dimensions() {
 
     // All chunks are full size (1024x1024) due to chunk alignment
     let first_data = Array4::from_elem((1, 64, 1024, 1024), 42i8);
-    let result1 = writer.write_chunk_async(&first_chunk, first_data).await;
+    let writer_clone = writer.clone();
+    let result1 = tokio::task::spawn_blocking(move || {
+        writer_clone.write_chunk_sync(&first_chunk, first_data)
+    }).await.unwrap();
     println!("First chunk result: {:?}", result1);
     result1.unwrap();
 
     let last_data = Array4::from_elem((1, 64, 1024, 1024), 42i8);
-    let result2 = writer.write_chunk_async(&last_chunk, last_data).await;
+    let writer_clone = writer.clone();
+    let result2 = tokio::task::spawn_blocking(move || {
+        writer_clone.write_chunk_sync(&last_chunk, last_data)
+    }).await.unwrap();
     println!("Last chunk result: {:?}", result2);
     result2.unwrap();
 
@@ -248,7 +259,7 @@ async fn test_production_grid_dimensions() {
 }
 
 /// Test 6: Verify actual data content survives round-trip
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_data_integrity() {
     use zarrs::array::Array;
     use zarrs_object_store::AsyncObjectStore;
@@ -269,7 +280,7 @@ async fn test_data_integrity() {
     let config = create_test_config(chunk_shape.clone());
     let grid = Arc::new(create_test_grid(4, 4, &chunk_shape));
 
-    let writer = ZarrWriter::create(store.clone(), "", grid, &config).await.unwrap();
+    let writer = Arc::new(ZarrWriter::create(store.clone(), "", grid, &config).await.unwrap());
 
     // Write known pattern
     let mut data = Array4::zeros((1, 4, 4, 4));
@@ -284,7 +295,11 @@ async fn test_data_integrity() {
              data[[0, 0, 0, 0]], data[[0, 3, 3, 3]]);
 
     let chunk = OutputChunk { time_idx: 0, row_idx: 0, col_idx: 0 };
-    writer.write_chunk_async(&chunk, data.clone()).await.unwrap();
+    let data_clone = data.clone();
+    let writer_clone = writer.clone();
+    tokio::task::spawn_blocking(move || {
+        writer_clone.write_chunk_sync(&chunk, data_clone)
+    }).await.unwrap().unwrap();
     writer.finalize().unwrap();
 
     // Read back and verify
@@ -305,7 +320,7 @@ async fn test_data_integrity() {
 }
 
 /// Test 7: mosaic_tiles → write flow (exact production data path)
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_mosaic_to_write_flow() {
     use crate::index::CogTile;
     use crate::io::{PixelWindow, WindowData};
@@ -327,7 +342,7 @@ async fn test_mosaic_to_write_flow() {
     let config = create_test_config(chunk_shape.clone());
     let grid = Arc::new(create_test_grid(256, 256, &chunk_shape));
 
-    let writer = ZarrWriter::create(store, "", grid, &config).await.unwrap();
+    let writer = Arc::new(ZarrWriter::create(store, "", grid, &config).await.unwrap());
 
     // Create mock WindowData like production COG reads would produce
     let bounds_wgs84 = [-122.5, 36.5, -122.0, 37.0];
@@ -366,9 +381,12 @@ async fn test_mosaic_to_write_flow() {
     println!("Mosaic shape: {:?}, len: {}", mosaic.shape(), mosaic.len());
     assert_eq!(mosaic.shape(), &[1, 64, 256, 256]);
 
-    // Write the mosaic output
+    // Write the mosaic output using spawn_blocking for sync API
     let chunk = OutputChunk { time_idx: 0, row_idx: 0, col_idx: 0 };
-    let write_result = writer.write_chunk_async(&chunk, mosaic).await;
+    let writer_clone = writer.clone();
+    let write_result = tokio::task::spawn_blocking(move || {
+        writer_clone.write_chunk_sync(&chunk, mosaic)
+    }).await.unwrap();
     println!("Write result: {:?}", write_result);
     write_result.unwrap();
 
@@ -381,7 +399,7 @@ async fn test_mosaic_to_write_flow() {
 }
 
 /// Test 8: Multiple mosaics written concurrently (like scheduler)
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_concurrent_mosaic_writes() {
     use crate::index::CogTile;
     use crate::io::{PixelWindow, WindowData};
@@ -453,8 +471,10 @@ async fn test_concurrent_mosaic_writes() {
                 .unwrap()
                 .unwrap();
 
-                // Write like production
-                w.write_chunk_async(&chunk, mosaic).await
+                // Write like production using spawn_blocking for sync API
+                tokio::task::spawn_blocking(move || {
+                    w.write_chunk_sync(&chunk, mosaic)
+                }).await.unwrap()
             }
         })
         .buffer_unordered(4)
@@ -484,7 +504,7 @@ async fn test_concurrent_mosaic_writes() {
 }
 
 /// Test 9: Use exact production store creation via create_output_store
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_production_store_creation() {
     use crate::io::create_output_store;
 
@@ -513,13 +533,16 @@ async fn test_production_store_creation() {
     let prefix = crate::io::get_output_prefix(&config);
     println!("Using prefix: '{}'", prefix);
 
-    let writer = ZarrWriter::create(store, prefix, grid, &config).await.unwrap();
+    let writer = Arc::new(ZarrWriter::create(store, prefix, grid, &config).await.unwrap());
 
-    // Write a chunk
+    // Write a chunk using spawn_blocking for sync API
     let data = Array4::from_elem((1, 64, 1024, 1024), 42i8);
     let chunk = OutputChunk { time_idx: 0, row_idx: 0, col_idx: 0 };
 
-    let result = writer.write_chunk_async(&chunk, data).await;
+    let writer_clone = writer.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        writer_clone.write_chunk_sync(&chunk, data)
+    }).await.unwrap();
     println!("Production store write result: {:?}", result);
     result.unwrap();
 
@@ -561,7 +584,7 @@ async fn test_production_store_creation() {
 // The partial chunk scenario this test was designed to catch can no longer occur.
 
 /// Test 8: Verify corner chunks work correctly with aligned grid
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_aligned_corner_chunks() {
     use crate::io::create_output_store;
 
@@ -596,13 +619,16 @@ async fn test_aligned_corner_chunks() {
              grid.width, grid.height, grid.chunk_counts);
 
     let prefix = crate::io::get_output_prefix(&config);
-    let writer = ZarrWriter::create(store, prefix, grid.clone(), &config).await.unwrap();
+    let writer = Arc::new(ZarrWriter::create(store, prefix, grid.clone(), &config).await.unwrap());
 
     // Test corner chunk [0, 0, 7, 6] - all chunks are now full 1024x1024
     let corner_chunk = OutputChunk { time_idx: 0, row_idx: 7, col_idx: 6 };
     let data = Array4::from_elem((1, 64, 1024, 1024), 42i8);
 
-    let result = writer.write_chunk_async(&corner_chunk, data).await;
+    let writer_clone = writer.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        writer_clone.write_chunk_sync(&corner_chunk, data)
+    }).await.unwrap();
     println!("Corner chunk write result: {:?}", result);
     result.expect("Corner chunk should write successfully");
 
@@ -617,7 +643,7 @@ async fn test_aligned_corner_chunks() {
 
 /// Test 9: Simulate the exact chunk_processor flow with aligned grid
 /// Tests spawning mosaic work in spawn_blocking then writing via Arc<ZarrWriter>
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_chunk_processor_flow_simulation() {
     use crate::io::create_output_store;
     use futures::stream::{self, StreamExt};
@@ -676,8 +702,10 @@ async fn test_chunk_processor_flow_simulation() {
                 .await
                 .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {}", e))?;
 
-                // Write chunk (like production)
-                writer.write_chunk_async(&chunk, mosaic).await
+                // Write chunk (like production) using spawn_blocking for sync API
+                tokio::task::spawn_blocking(move || {
+                    writer.write_chunk_sync(&chunk, mosaic)
+                }).await.unwrap()
             }
         })
         .buffer_unordered(16)  // Similar concurrency to production
@@ -712,7 +740,7 @@ async fn test_chunk_processor_flow_simulation() {
 
 /// Test 12: Verify chunks can be read back after finalize from a fresh store
 /// This ensures data is actually persisted to disk, not just buffered
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_chunk_persistence_after_finalize() {
     use crate::io::create_output_store;
     use zarrs::array::Array;
@@ -750,15 +778,18 @@ async fn test_chunk_persistence_after_finalize() {
 
         let store = create_output_store(&config).unwrap();
         let prefix = crate::io::get_output_prefix(&config);
-        let writer = ZarrWriter::create(store, prefix, grid.clone(), &config).await.unwrap();
+        let writer = Arc::new(ZarrWriter::create(store, prefix, grid.clone(), &config).await.unwrap());
 
-        // Write 4 chunks with distinct values
+        // Write 4 chunks with distinct values using spawn_blocking for sync API
         for row in 0..2 {
             for col in 0..2 {
                 let value = ((row * 2 + col + 1) * 10) as i8;  // 10, 20, 30, 40
                 let chunk = OutputChunk { time_idx: 0, row_idx: row, col_idx: col };
                 let data = Array4::from_elem((1, 64, 1024, 1024), value);
-                writer.write_chunk_async(&chunk, data).await.unwrap();
+                let writer_clone = writer.clone();
+                tokio::task::spawn_blocking(move || {
+                    writer_clone.write_chunk_sync(&chunk, data)
+                }).await.unwrap().unwrap();
                 println!("Wrote chunk ({}, {}) with value {}", row, col, value);
             }
         }
@@ -813,7 +844,7 @@ async fn test_chunk_persistence_after_finalize() {
 }
 
 /// Test 13: Test with very high concurrency (stress test)
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_high_concurrency_writes() {
     use crate::io::create_output_store;
     use futures::stream::{self, StreamExt};
@@ -857,13 +888,15 @@ async fn test_high_concurrency_writes() {
 
     println!("Writing {} chunks with high concurrency...", chunks.len());
 
-    // Process with high concurrency (like production scheduler with 256)
+    // Process with high concurrency (like production scheduler with 256) using spawn_blocking
     let results: Vec<Result<(), anyhow::Error>> = stream::iter(chunks)
         .map(|chunk| {
             let writer = writer.clone();
             async move {
                 let data = Array4::from_elem((1, 64, 1024, 1024), (chunk.row_idx + chunk.col_idx) as i8);
-                writer.write_chunk_async(&chunk, data).await
+                tokio::task::spawn_blocking(move || {
+                    writer.write_chunk_sync(&chunk, data)
+                }).await.unwrap()
             }
         })
         .buffer_unordered(256)  // Very high concurrency
@@ -896,7 +929,7 @@ async fn test_high_concurrency_writes() {
 
 /// Test 14: Verify error on oversized chunk data
 /// The mosaic should never produce data larger than chunk size, but test the behavior
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_oversized_chunk_error() {
     use crate::io::create_output_store;
 
@@ -929,7 +962,7 @@ async fn test_oversized_chunk_error() {
 
     let store = create_output_store(&config).unwrap();
     let prefix = crate::io::get_output_prefix(&config);
-    let writer = ZarrWriter::create(store, prefix, grid, &config).await.unwrap();
+    let writer = Arc::new(ZarrWriter::create(store, prefix, grid, &config).await.unwrap());
 
     // Try to write oversized data (larger than chunk size)
     // This simulates a bug where mosaic returns more data than expected
@@ -942,10 +975,13 @@ async fn test_oversized_chunk_error() {
     // into an undersized array. A panic is acceptable here because:
     // 1. It's a programming error if mosaic returns oversized data
     // 2. It's caught immediately rather than silently corrupting data
+    let writer_clone = writer.clone();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // Need to block on the async call
+        // Need to block on the sync call
         tokio::runtime::Handle::current().block_on(async {
-            writer.write_chunk_async(&chunk, oversized_data).await
+            tokio::task::spawn_blocking(move || {
+                writer_clone.write_chunk_sync(&chunk, oversized_data)
+            }).await.unwrap()
         })
     }));
 
@@ -957,7 +993,7 @@ async fn test_oversized_chunk_error() {
 }
 
 /// Test 15: Verify sharding produces a single shard file with multiple chunks
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_sharding_enabled() {
     use crate::io::create_output_store;
 
@@ -1025,13 +1061,16 @@ async fn test_sharding_enabled() {
 
     let store = create_output_store(&config).unwrap();
     let prefix = crate::io::get_output_prefix(&config);
-    let writer = ZarrWriter::create(store, prefix, grid, &config).await.unwrap();
+    let writer = Arc::new(ZarrWriter::create(store, prefix, grid, &config).await.unwrap());
 
-    // Write the shard (contains 2x2 = 4 chunks internally)
+    // Write the shard (contains 2x2 = 4 chunks internally) using spawn_blocking
     let data = Array4::from_elem((1, 64, shard_height, shard_width), 42i8);
     let chunk = OutputChunk { time_idx: 0, row_idx: 0, col_idx: 0 };
 
-    let result = writer.write_chunk_async(&chunk, data).await;
+    let writer_clone = writer.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        writer_clone.write_chunk_sync(&chunk, data)
+    }).await.unwrap();
     println!("Sharded write result: {:?}", result);
     result.unwrap();
 

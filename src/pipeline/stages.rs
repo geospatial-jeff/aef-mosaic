@@ -553,12 +553,13 @@ impl Pipeline {
                                 let metrics = metrics.clone();
                                 let checkpoint = checkpoint_manager.clone();
 
-                                let future = async move {
+                                // Use spawn_blocking for sync zarrs API (enables parallel compression)
+                                let future = tokio::task::spawn_blocking(move || {
                                     let bytes_written = mosaiced.data.len() as u64;
                                     let chunk = mosaiced.chunk.clone();
 
                                     let start = Instant::now();
-                                    if let Err(e) = writer.write_chunk_async(&mosaiced.chunk, mosaiced.data).await {
+                                    if let Err(e) = writer.write_chunk_sync(&mosaiced.chunk, mosaiced.data) {
                                         tracing::warn!("Zarr write failed: {}", e);
                                         metrics.add_failure();
                                         return;
@@ -571,9 +572,9 @@ impl Pipeline {
                                     if let Some(ref checkpoint) = checkpoint {
                                         checkpoint.mark_completed(&chunk);
                                     }
-                                };
+                                });
 
-                                pending_futures.push(tokio::spawn(future));
+                                pending_futures.push(future);
 
                                 // Limit concurrency - drain completed futures until below limit
                                 while pending_futures.len() >= write_concurrency {
