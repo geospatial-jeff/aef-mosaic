@@ -6,13 +6,13 @@
 use crate::config::Config;
 use crate::index::OutputChunk;
 use anyhow::Result;
-use chrono::{DateTime, Utc};
 use dashmap::DashSet;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
+use std::time::SystemTime;
 use tokio::sync::mpsc;
 
 /// Checkpoint file name (stored adjacent to output).
@@ -37,8 +37,8 @@ struct CheckpointData {
     config_hash: String,
     /// List of completed chunk keys ("time:row:col").
     completed_chunks: Vec<String>,
-    /// Timestamp of last checkpoint write.
-    last_checkpoint: DateTime<Utc>,
+    /// Unix timestamp (seconds since epoch) of last checkpoint write.
+    last_checkpoint: u64,
 }
 
 
@@ -250,7 +250,10 @@ async fn write_checkpoint(
             version: 1,
             config_hash,
             completed_chunks: chunks,
-            last_checkpoint: Utc::now(),
+            last_checkpoint: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
         };
 
         serde_json::to_vec_pretty(&data)
@@ -354,11 +357,15 @@ mod tests {
 
     #[test]
     fn test_checkpoint_data_serialization() {
+        let timestamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         let data = CheckpointData {
             version: 1,
             config_hash: "sha256:abc123".to_string(),
             completed_chunks: vec!["0:0:0".to_string(), "0:0:1".to_string()],
-            last_checkpoint: Utc::now(),
+            last_checkpoint: timestamp,
         };
 
         let json = serde_json::to_string(&data).unwrap();

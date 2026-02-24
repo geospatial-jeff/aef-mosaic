@@ -1,4 +1,4 @@
-//! Async Zarr writing using zarrs.
+//! Zarr writing using zarrs sync API for parallel compression.
 
 use crate::config::Config;
 use crate::crs::epsg_to_proj_definition;
@@ -11,17 +11,33 @@ use std::sync::Arc;
 use zarrs::array::codec::bytes_to_bytes::zstd::ZstdCodec;
 use zarrs::array::{Array, ArrayBuilder};
 use zarrs::group::GroupBuilder;
+use zarrs::storage::storage_adapter::async_to_sync::{AsyncToSyncBlockOn, AsyncToSyncStorageAdapter};
 use zarrs_object_store::AsyncObjectStore;
 
+/// Bridges async ObjectStore to sync zarrs API using tokio Handle.
+///
+/// This allows the sync zarrs API (which uses rayon for parallel compression)
+/// to make storage calls through the async ObjectStore.
+struct TokioBlockOn(tokio::runtime::Handle);
 
-/// Async Zarr writer for output chunks.
+impl AsyncToSyncBlockOn for TokioBlockOn {
+    fn block_on<F: core::future::Future>(&self, future: F) -> F::Output {
+        self.0.block_on(future)
+    }
+}
+
+/// Sync store adapter wrapping the async ObjectStore.
+type SyncStore = AsyncToSyncStorageAdapter<AsyncObjectStore<Arc<dyn ObjectStore>>, TokioBlockOn>;
+
+
+/// Sync Zarr writer for output chunks using sync API for parallel compression.
 ///
 /// Note: The zarrs::Array type is designed for concurrent writes to different chunks.
 /// Each chunk write is independent, so we don't need a mutex for synchronization.
-/// The underlying AsyncObjectStore handles concurrent access to the storage backend.
+/// The sync API uses rayon for parallel codec operations within shards.
 pub struct ZarrWriter {
     /// The Zarr array (thread-safe for concurrent writes to different chunks)
-    array: Array<AsyncObjectStore<Arc<dyn ObjectStore>>>,
+    array: Array<SyncStore>,
 
     /// Output grid configuration
     output_grid: Arc<OutputGrid>,
@@ -102,12 +118,16 @@ impl ZarrWriter {
             tracing::info!("Resuming: preserving existing Zarr data");
         }
 
-        let zarr_store = Arc::new(AsyncObjectStore::new(store.clone()));
+        // Capture tokio handle for sync-to-async bridging
+        let handle = tokio::runtime::Handle::current();
+        let async_store = Arc::new(AsyncObjectStore::new(store.clone()));
+        let zarr_store = Arc::new(AsyncToSyncStorageAdapter::new(async_store, TokioBlockOn(handle.clone())));
 
         // Create root group - zarrs requires paths to start with /
+        // Use block_in_place since we're in async context but calling sync zarrs API
         let group_path = if path.is_empty() { "/".to_string() } else { format!("/{}", path) };
         let group = GroupBuilder::new().build(zarr_store.clone(), &group_path)?;
-        group.async_store_metadata().await?;
+        tokio::task::block_in_place(|| group.store_metadata())?;
 
         // Define array shape: (time, bands, height, width)
         let shape = output_grid.array_shape();
@@ -203,6 +223,18 @@ impl ZarrWriter {
                 output_grid.bounds[3]
             ]),
         );
+        // Add spatial:transform for rioxarray/GeoZarr compatibility (PR #905)
+        attributes.insert(
+            "spatial:transform".to_string(),
+            serde_json::json!([
+                output_grid.resolution,
+                0.0,
+                output_grid.bounds[0],
+                0.0,
+                -output_grid.resolution,
+                output_grid.bounds[3]
+            ]),
+        );
         attributes.insert(
             "bounds".to_string(),
             serde_json::json!(output_grid.bounds),
@@ -229,14 +261,17 @@ impl ZarrWriter {
         builder.attributes(attributes);
 
         let array = builder.build(zarr_store.clone(), &array_path)?;
-        array.async_store_metadata().await?;
+        tokio::task::block_in_place(|| array.store_metadata())?;
 
         // Create coordinate arrays for xarray compatibility
-        Self::create_coordinate_arrays(
-            &zarr_store,
-            &path,
-            &output_grid,
-        ).await?;
+        // Use block_in_place for sync zarrs API calls
+        tokio::task::block_in_place(|| {
+            Self::create_coordinate_arrays(
+                &zarr_store,
+                &path,
+                &output_grid,
+            )
+        })?;
 
         tracing::info!(
             "Created Zarr array at {} with shape {:?}",
@@ -250,10 +285,17 @@ impl ZarrWriter {
         })
     }
 
-    /// Write a chunk to the Zarr array asynchronously.
+    /// Write a chunk to the Zarr array synchronously.
+    ///
+    /// This method uses the sync zarrs API which enables parallel compression
+    /// of chunks within shards via rayon.
+    ///
+    /// MUST be called from within `block_in_place` (not `spawn_blocking`) because the zarrs
+    /// AsyncToSyncStorageAdapter uses `handle.block_on()` internally, which requires running
+    /// on a tokio runtime thread.
     ///
     /// Chunks are always full-sized because OutputGrid rounds dimensions up to chunk boundaries.
-    pub async fn write_chunk_async(&self, chunk: &OutputChunk, data: Array4<i8>) -> Result<()> {
+    pub fn write_chunk_sync(&self, chunk: &OutputChunk, data: Array4<i8>) -> Result<()> {
         let indices = chunk.chunk_indices();
         let chunk_indices: [u64; 4] = [
             indices[0] as u64,
@@ -283,8 +325,7 @@ impl ZarrWriter {
         let chunk_data = data.as_slice().expect("chunk data should be contiguous");
 
         self.array
-            .async_store_chunk(&chunk_indices, chunk_data)
-            .await
+            .store_chunk(&chunk_indices, chunk_data)
             .map_err(|e| {
                 tracing::error!(
                     "Chunk {:?} write failed: {:?}. Data shape: {:?}",
@@ -312,14 +353,16 @@ impl ZarrWriter {
         Ok(())
     }
 
-    /// Create coordinate arrays for xarray compatibility.
+    /// Create coordinate arrays for xarray compatibility (sync version).
     ///
     /// Creates three 1D arrays:
     /// - `/x` - Float64 array of x-coordinates (column centers)
     /// - `/y` - Float64 array of y-coordinates (row centers)
     /// - `/time` - Int32 array of years
-    async fn create_coordinate_arrays(
-        zarr_store: &Arc<AsyncObjectStore<Arc<dyn ObjectStore>>>,
+    ///
+    /// Must be called from within block_in_place or spawn_blocking.
+    fn create_coordinate_arrays(
+        zarr_store: &Arc<SyncStore>,
         path: &str,
         output_grid: &OutputGrid,
     ) -> Result<()> {
@@ -344,8 +387,8 @@ impl ZarrWriter {
         )
         .dimension_names(Some(vec![Some("x".to_string())]))
         .build(zarr_store.clone(), &x_path)?;
-        x_array.async_store_metadata().await?;
-        x_array.async_store_chunk(&[0], &x_coords).await?;
+        x_array.store_metadata()?;
+        x_array.store_chunk(&[0], &x_coords)?;
 
         // Create y coordinate array
         let y_path = if path.is_empty() { "/y".to_string() } else { format!("/{}/y", path) };
@@ -357,8 +400,8 @@ impl ZarrWriter {
         )
         .dimension_names(Some(vec![Some("y".to_string())]))
         .build(zarr_store.clone(), &y_path)?;
-        y_array.async_store_metadata().await?;
-        y_array.async_store_chunk(&[0], &y_coords).await?;
+        y_array.store_metadata()?;
+        y_array.store_chunk(&[0], &y_coords)?;
 
         // Create time coordinate array
         let time_path = if path.is_empty() { "/time".to_string() } else { format!("/{}/time", path) };
@@ -371,8 +414,8 @@ impl ZarrWriter {
         )
         .dimension_names(Some(vec![Some("time".to_string())]))
         .build(zarr_store.clone(), &time_path)?;
-        time_array.async_store_metadata().await?;
-        time_array.async_store_chunk(&[0], &time_coords).await?;
+        time_array.store_metadata()?;
+        time_array.store_chunk(&[0], &time_coords)?;
 
         tracing::info!(
             "Created coordinate arrays: x[{}], y[{}], time[{}]",
@@ -454,7 +497,7 @@ mod integration_tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_zarr_writer_creates_metadata() {
         let temp_dir = TempDir::new().unwrap();
         let zarr_path = temp_dir.path().join("test.zarr");
@@ -482,7 +525,7 @@ mod integration_tests {
         writer.finalize().unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_zarr_writer_attributes() {
         let temp_dir = TempDir::new().unwrap();
         let zarr_path = temp_dir.path().join("test.zarr");
@@ -527,7 +570,7 @@ mod integration_tests {
         assert_eq!(attrs.get("num_years").and_then(|v| v.as_i64()), Some(1));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_zarr_writer_writes_chunk() {
         let temp_dir = TempDir::new().unwrap();
         let zarr_path = temp_dir.path().join("test.zarr");
@@ -543,7 +586,7 @@ mod integration_tests {
         let config = create_test_config(chunk_shape.clone());
         let grid = Arc::new(create_test_grid(8, 8, &chunk_shape));
 
-        let writer = ZarrWriter::create(store, "", grid, &config).await.unwrap();
+        let writer = Arc::new(ZarrWriter::create(store, "", grid, &config).await.unwrap());
 
         // Create test data - full chunk size
         let data = Array4::from_elem((1, 4, 4, 4), 42i8);
@@ -553,8 +596,11 @@ mod integration_tests {
             col_idx: 0,
         };
 
-        // Write chunk
-        let result = writer.write_chunk_async(&chunk, data).await;
+        // Write chunk using spawn_blocking for sync API
+        let writer_clone = writer.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            writer_clone.write_chunk_sync(&chunk, data)
+        }).await.unwrap();
         println!("Write result: {:?}", result);
         result.unwrap();
 
@@ -594,7 +640,7 @@ mod production_test {
     use object_store::local::LocalFileSystem;
     use std::path::PathBuf;
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_zarr_writer_relative_path() {
         // This test mimics production setup with relative path
         let test_dir = PathBuf::from("target/test-zarr");
@@ -645,7 +691,7 @@ mod production_test {
             chunk_counts: [1, 1, 2, 2],
         });
 
-        let writer = ZarrWriter::create(store, "", grid, &config).await.unwrap();
+        let writer = Arc::new(ZarrWriter::create(store, "", grid, &config).await.unwrap());
 
         // Create and write a chunk
         let data = Array4::from_elem((1, 4, 4, 4), 42i8);
@@ -655,7 +701,11 @@ mod production_test {
             col_idx: 0,
         };
 
-        let result = writer.write_chunk_async(&chunk, data).await;
+        // Write chunk using spawn_blocking for sync API
+        let writer_clone = writer.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            writer_clone.write_chunk_sync(&chunk, data)
+        }).await.unwrap();
         println!("Write result: {:?}", result);
         result.unwrap();
 
@@ -686,7 +736,7 @@ mod production_test {
         std::fs::remove_dir_all(&test_dir).ok();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_zarr_writer_dyn_store() {
         use crate::config::ChunkShape;
 
@@ -740,7 +790,7 @@ mod production_test {
             chunk_counts: [1, 1, 2, 2],
         });
 
-        let writer = ZarrWriter::create(store, "", grid, &config).await.unwrap();
+        let writer = Arc::new(ZarrWriter::create(store, "", grid, &config).await.unwrap());
 
         // Create and write a chunk
         let data = Array4::from_elem((1, 4, 4, 4), 42i8);
@@ -750,7 +800,11 @@ mod production_test {
             col_idx: 0,
         };
 
-        let result = writer.write_chunk_async(&chunk, data).await;
+        // Write chunk using spawn_blocking for sync API
+        let writer_clone = writer.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            writer_clone.write_chunk_sync(&chunk, data)
+        }).await.unwrap();
         println!("Write result (dyn store): {:?}", result);
         result.unwrap();
 
@@ -759,7 +813,7 @@ mod production_test {
         // Verify files exist
         let chunk_path = test_dir.join("embeddings").join("c").join("0").join("0").join("0").join("0");
         println!("Looking for chunk at: {:?}", chunk_path);
-        
+
         fn list_recursive(path: &std::path::PathBuf, depth: usize) {
             if let Ok(entries) = std::fs::read_dir(path) {
                 for entry in entries.flatten() {
@@ -776,7 +830,7 @@ mod production_test {
         list_recursive(&test_dir, 0);
 
         assert!(chunk_path.exists(), "Chunk should exist at {:?}", chunk_path);
-        
+
         // Cleanup
         std::fs::remove_dir_all(&test_dir).ok();
     }
@@ -789,7 +843,7 @@ mod concurrent_test {
     use futures::stream::{self, StreamExt};
     use object_store::ObjectStore;
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_zarr_writer_concurrent_writes() {
         let test_dir = std::path::PathBuf::from("target/test-zarr-concurrent");
         if test_dir.exists() {
@@ -851,12 +905,15 @@ mod concurrent_test {
             OutputChunk { time_idx: 0, row_idx: 1, col_idx: 1 },
         ];
 
+        // Write chunks concurrently using spawn_blocking for sync API
         let results: Vec<_> = stream::iter(chunks.clone())
             .map(|chunk| {
                 let w = writer.clone();
                 async move {
                     let data = Array4::from_elem((1, 4, 4, 4), 42i8);
-                    w.write_chunk_async(&chunk, data).await
+                    tokio::task::spawn_blocking(move || {
+                        w.write_chunk_sync(&chunk, data)
+                    }).await.unwrap()
                 }
             })
             .buffer_unordered(4)

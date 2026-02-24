@@ -89,8 +89,22 @@ fn run_command(config_path: PathBuf, concurrency: Option<usize>, dry_run: bool) 
         return analyze_work(&config);
     }
 
-    // Build and run Tokio runtime (uses default thread counts)
-    let runtime = tokio::runtime::Runtime::new()?;
+    // Build Tokio runtime with explicit thread configuration.
+    // - worker_threads: One per CPU core for async tasks
+    // - max_blocking_threads: 2x mosaic_concurrency for spawn_blocking headroom.
+    //   Each spawn_blocking task runs Rayon par_iter(). We limit this to reduce
+    //   memory from thread-local ProjCache instances (~300MB at 512 default).
+    let num_cpus = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4);
+    let max_blocking = (config.processing.mosaic_concurrency * 2).max(num_cpus);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(num_cpus)
+        .max_blocking_threads(max_blocking)
+        .enable_all()
+        .build()?;
+    tracing::info!(
+        "Runtime: {} worker threads, {} max blocking threads",
+        num_cpus, max_blocking
+    );
     runtime.block_on(async { run_pipeline(config).await })?;
 
     Ok(())
@@ -103,7 +117,12 @@ fn analyze_command(config_path: PathBuf) -> Result<()> {
 }
 
 fn analyze_work(config: &Config) -> Result<()> {
-    let runtime = tokio::runtime::Runtime::new()?;
+    let num_cpus = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(num_cpus)
+        .max_blocking_threads(num_cpus)  // Analyze doesn't need many blocking threads
+        .enable_all()
+        .build()?;
 
     runtime.block_on(async {
         use aef_mosaic::{io, InputIndex, OutputGrid, SpatialLookup};
@@ -113,7 +132,7 @@ fn analyze_work(config: &Config) -> Result<()> {
         tracing::info!("Loading tile index from {}", config.input.index_path);
         let input_index = if config.input.index_path.starts_with("s3://") {
             let (bucket, key) = io::parse_s3_uri(&config.input.index_path)?;
-            let store = io::create_anonymous_store(bucket)?;
+            let store = io::create_anonymous_store(bucket, config.processing.max_concurrent_http)?;
             let path = object_store::path::Path::from(key);
             InputIndex::from_s3(store, &path).await?
         } else {

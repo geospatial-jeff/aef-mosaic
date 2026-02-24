@@ -304,6 +304,85 @@ impl OutputGrid {
         })
     }
 
+    /// Find all output chunks that intersect the given WGS84 bounds for a specific year.
+    ///
+    /// This method inverts the typical lookup direction: instead of asking
+    /// "which COGs intersect this chunk?", we ask "which chunks does this COG intersect?".
+    /// This enables streaming processing where we iterate through COGs and compute
+    /// intersecting chunks on-the-fly, rather than pre-computing all intersections.
+    ///
+    /// Returns chunks sorted by their Hilbert index for cache locality.
+    pub fn chunks_for_bounds_wgs84(&self, bounds_wgs84: &[f64; 4], year: i32) -> anyhow::Result<Vec<OutputChunk>> {
+        // Get time index for the year
+        let time_idx = match self.time_idx_for_year(year) {
+            Some(idx) => idx,
+            None => return Ok(Vec::new()), // Year not in output grid
+        };
+
+        // Transform WGS84 bounds to output CRS
+        let bounds_crs = Self::transform_bounds_to_crs(bounds_wgs84, &self.crs)?;
+
+        // Compute chunk index ranges that could intersect
+        // Chunk dimensions in CRS units
+        let chunk_width_crs = self.chunk_shape.width as f64 * self.resolution;
+        let chunk_height_crs = self.chunk_shape.height as f64 * self.resolution;
+
+        // Clamp bounds to grid extent
+        let clamped_min_x = bounds_crs[0].max(self.bounds[0]);
+        let clamped_min_y = bounds_crs[1].max(self.bounds[1]);
+        let clamped_max_x = bounds_crs[2].min(self.bounds[2]);
+        let clamped_max_y = bounds_crs[3].min(self.bounds[3]);
+
+        // Check if there's any intersection
+        if clamped_min_x >= clamped_max_x || clamped_min_y >= clamped_max_y {
+            return Ok(Vec::new());
+        }
+
+        // Convert to chunk indices
+        // Column indices: straightforward x mapping
+        let col_min = ((clamped_min_x - self.bounds[0]) / chunk_width_crs).floor() as usize;
+        let col_max = ((clamped_max_x - self.bounds[0]) / chunk_width_crs).ceil() as usize;
+        let col_max = col_max.min(self.chunk_counts[3]);
+
+        // Row indices: top-down convention (row 0 is at max_y)
+        // Row increases as y decreases
+        let row_min = ((self.bounds[3] - clamped_max_y) / chunk_height_crs).floor() as usize;
+        let row_max = ((self.bounds[3] - clamped_min_y) / chunk_height_crs).ceil() as usize;
+        let row_max = row_max.min(self.chunk_counts[2]);
+
+        // Collect intersecting chunks
+        let num_rows = self.chunk_counts[2];
+        let num_cols = self.chunk_counts[3];
+        let order = hilbert_order_for_grid(num_rows, num_cols);
+
+        let mut chunks: Vec<(u64, OutputChunk)> = Vec::with_capacity(
+            (row_max - row_min) * (col_max - col_min)
+        );
+
+        for row_idx in row_min..row_max {
+            for col_idx in col_min..col_max {
+                // Verify actual intersection (handles edge cases)
+                let chunk = OutputChunk { time_idx, row_idx, col_idx };
+                let chunk_bounds = self.chunk_bounds(&chunk);
+
+                // Check intersection in CRS space
+                if chunk_bounds[0] < clamped_max_x
+                    && chunk_bounds[2] > clamped_min_x
+                    && chunk_bounds[1] < clamped_max_y
+                    && chunk_bounds[3] > clamped_min_y
+                {
+                    let h_idx = hilbert_index(col_idx, row_idx, order);
+                    chunks.push((h_idx, chunk));
+                }
+            }
+        }
+
+        // Sort by Hilbert index for cache locality
+        chunks.sort_by_key(|(h_idx, _)| *h_idx);
+
+        Ok(chunks.into_iter().map(|(_, chunk)| chunk).collect())
+    }
+
     /// Get the time index for a given year.
     /// Returns None if the year is not in the years list.
     pub fn time_idx_for_year(&self, year: i32) -> Option<usize> {
@@ -624,6 +703,93 @@ mod tests {
             "Pixel (0,0) y={} should be near grid top 1.0",
             world_y
         );
+    }
+
+    #[test]
+    fn test_chunks_for_bounds_wgs84_basic() {
+        // Create a 4x4 chunk grid in WGS84
+        let grid = OutputGrid::new(
+            [0.0, 0.0, 4.0, 4.0],
+            crs::codes::WGS84.to_string(),
+            1.0,  // 1 degree per pixel
+            vec![2024],
+            64,
+            ChunkShape {
+                time: 1,
+                embedding: 64,
+                height: 1,
+                width: 1,
+            },
+        ).unwrap();
+
+        // Query bounds that should intersect 4 chunks (center of grid)
+        let bounds = [1.5, 1.5, 2.5, 2.5];
+        let chunks = grid.chunks_for_bounds_wgs84(&bounds, 2024).unwrap();
+
+        // Should find 4 chunks
+        assert_eq!(chunks.len(), 4, "Expected 4 intersecting chunks");
+
+        // Verify chunks are sorted by Hilbert index (adjacent chunks)
+        let indices: Vec<_> = chunks.iter()
+            .map(|c| (c.row_idx, c.col_idx))
+            .collect();
+        // The exact order depends on Hilbert curve, but all 4 should be present
+        assert!(indices.contains(&(1, 1)));
+        assert!(indices.contains(&(1, 2)));
+        assert!(indices.contains(&(2, 1)));
+        assert!(indices.contains(&(2, 2)));
+    }
+
+    #[test]
+    fn test_chunks_for_bounds_wgs84_no_intersection() {
+        let grid = OutputGrid::new(
+            [0.0, 0.0, 4.0, 4.0],
+            crs::codes::WGS84.to_string(),
+            1.0,
+            vec![2024],
+            64,
+            ChunkShape {
+                time: 1,
+                embedding: 64,
+                height: 1,
+                width: 1,
+            },
+        ).unwrap();
+
+        // Query bounds outside the grid
+        let bounds = [10.0, 10.0, 11.0, 11.0];
+        let chunks = grid.chunks_for_bounds_wgs84(&bounds, 2024).unwrap();
+        assert!(chunks.is_empty(), "Expected no intersecting chunks");
+    }
+
+    #[test]
+    fn test_chunks_for_bounds_wgs84_wrong_year() {
+        let grid = OutputGrid::new(
+            [0.0, 0.0, 4.0, 4.0],
+            crs::codes::WGS84.to_string(),
+            1.0,
+            vec![2024, 2025],
+            64,
+            ChunkShape {
+                time: 1,
+                embedding: 64,
+                height: 1,
+                width: 1,
+            },
+        ).unwrap();
+
+        // Query with a year not in the grid
+        let bounds = [1.5, 1.5, 2.5, 2.5];
+        let chunks = grid.chunks_for_bounds_wgs84(&bounds, 2020).unwrap();
+        assert!(chunks.is_empty(), "Expected no chunks for non-existent year");
+
+        // Query with valid year should work
+        let chunks = grid.chunks_for_bounds_wgs84(&bounds, 2025).unwrap();
+        assert!(!chunks.is_empty(), "Expected chunks for valid year");
+        // All chunks should have time_idx=1 (2025 is second year)
+        for chunk in &chunks {
+            assert_eq!(chunk.time_idx, 1);
+        }
     }
 
     /// Test the exact scenario that caused the original bug:

@@ -23,16 +23,26 @@
 
 use crate::checkpoint::CheckpointManager;
 use crate::crs::{self, ProjCache};
-use crate::index::{CogTile, OutputChunk, OutputGrid, SpatialLookup};
+use crate::index::{CogTile, InputIndex, OutputChunk, OutputGrid, SpatialLookup};
 use crate::io::{CogReader, GeoTransform, PixelWindow, WindowData, ZarrWriter};
 use crate::pipeline::Metrics;
 use crate::transform::{mosaic_tiles, ReprojectConfig, Reprojector};
 use anyhow::Result;
+use dashmap::DashSet;
 use futures::stream::{self, StreamExt};
 use ndarray::Array4;
+use std::cell::RefCell;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::mpsc;
+
+// Thread-local ProjCache to cache Proj objects per-thread.
+// Note: Proj objects contain raw pointers and are not Send/Sync, so we cannot
+// share them across threads. The thread-local approach is necessary.
+// Memory usage: ~10KB per UTM zone × ~60 zones × N threads.
+// With the blocking pool default of 512 threads, worst case is ~300MB.
+thread_local! {
+    static PROJ_CACHE: RefCell<ProjCache> = RefCell::new(ProjCache::new());
+}
 
 /// Compute Hilbert curve index for WGS84 coordinates.
 ///
@@ -90,9 +100,140 @@ struct ChunkWorkItem {
     tiles: Vec<Arc<CogTile>>,
     chunk_bounds: [f64; 4],
     chunk_bounds_wgs84: [f64; 4],
-    /// Two-level sort key: (primary_cog_hilbert, chunk_hilbert)
-    /// Groups chunks by their primary COG, then by spatial locality within.
-    sort_key: (u64, u64),
+    /// Chunk Hilbert index for secondary sorting within COG groups.
+    chunk_hilbert: u64,
+}
+
+/// Streams work items to fetch workers, processing one COG at a time.
+///
+/// This inverts the typical lookup: instead of pre-computing all chunk->COG mappings,
+/// we iterate COGs in Hilbert order and compute intersecting chunks on-the-fly.
+/// This reduces memory from O(all_chunks) to O(chunks_per_COG).
+struct StreamingWorkPublisher {
+    /// COG tiles sorted by Hilbert index of their centroids
+    cog_tiles: Vec<Arc<CogTile>>,
+    /// Output grid for computing chunk intersections
+    output_grid: Arc<OutputGrid>,
+    /// Spatial lookup for finding tiles per chunk
+    spatial_lookup: Arc<SpatialLookup>,
+    /// Work channel to send items to fetch workers
+    work_tx: async_channel::Sender<ChunkWorkItem>,
+    /// Chunks remaining to process (from checkpoint filter)
+    pending_chunks: Arc<DashSet<(usize, usize, usize)>>,
+    /// Chunks already published (for deduplication across COGs)
+    processed_chunks: Arc<DashSet<(usize, usize, usize)>>,
+    /// Metrics for tracking skipped chunks
+    metrics: Arc<Metrics>,
+}
+
+impl StreamingWorkPublisher {
+    /// Create a new streaming publisher.
+    fn new(
+        input_index: &InputIndex,
+        output_grid: Arc<OutputGrid>,
+        spatial_lookup: Arc<SpatialLookup>,
+        pending_chunks: Vec<OutputChunk>,
+        work_tx: async_channel::Sender<ChunkWorkItem>,
+        metrics: Arc<Metrics>,
+    ) -> Self {
+        // Sort COG tiles by Hilbert index of their centroids
+        let mut cog_tiles = input_index.all_tiles().to_vec();
+        cog_tiles.sort_by_key(|t| {
+            let (lon, lat) = bounds_centroid(&t.bounds_wgs84);
+            wgs84_hilbert_index(lon, lat)
+        });
+
+        // Build pending chunks set from input
+        let pending_set = Arc::new(DashSet::with_capacity(pending_chunks.len()));
+        for chunk in pending_chunks {
+            pending_set.insert((chunk.time_idx, chunk.row_idx, chunk.col_idx));
+        }
+
+        Self {
+            cog_tiles,
+            output_grid,
+            spatial_lookup,
+            work_tx,
+            pending_chunks: pending_set,
+            processed_chunks: Arc::new(DashSet::new()),
+            metrics,
+        }
+    }
+
+    /// Publish all work items by iterating COGs in Hilbert order.
+    async fn publish_all(self) -> Result<()> {
+        for cog in &self.cog_tiles {
+            // Find chunks that intersect this COG
+            let chunks = self.output_grid.chunks_for_bounds_wgs84(
+                &cog.bounds_wgs84,
+                cog.year,
+            )?;
+
+            // Filter to pending chunks, deduplicate, and prepare work items
+            let mut work_items: Vec<ChunkWorkItem> = Vec::new();
+            for chunk in chunks {
+                let key = (chunk.time_idx, chunk.row_idx, chunk.col_idx);
+
+                // Skip if not pending or already processed
+                if !self.pending_chunks.contains(&key) {
+                    continue;
+                }
+                if !self.processed_chunks.insert(key) {
+                    continue; // Already published by another COG
+                }
+
+                // Look up all tiles for this chunk (may include other COGs)
+                let tiles = match self.spatial_lookup.tiles_for_chunk(&chunk) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::warn!("Failed to find tiles for chunk {:?}: {}", chunk.chunk_indices(), e);
+                        self.metrics.add_failure();
+                        continue;
+                    }
+                };
+
+                if tiles.is_empty() {
+                    self.metrics.add_chunk_skipped();
+                    continue;
+                }
+
+                let chunk_bounds = self.output_grid.chunk_bounds(&chunk);
+                let chunk_bounds_wgs84 = match self.output_grid.chunk_bounds_wgs84(&chunk) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!("Failed to transform chunk bounds: {}", e);
+                        self.metrics.add_failure();
+                        continue;
+                    }
+                };
+
+                // Compute chunk Hilbert index for sorting within this COG batch
+                let (chunk_lon, chunk_lat) = bounds_centroid(&chunk_bounds_wgs84);
+                let chunk_hilbert = wgs84_hilbert_index(chunk_lon, chunk_lat);
+
+                work_items.push(ChunkWorkItem {
+                    chunk,
+                    tiles,
+                    chunk_bounds,
+                    chunk_bounds_wgs84,
+                    chunk_hilbert,
+                });
+            }
+
+            // Sort by chunk Hilbert index for spatial locality within this COG group
+            work_items.sort_by_key(|w| w.chunk_hilbert);
+
+            // Send work items to fetch workers
+            for item in work_items {
+                if self.work_tx.send(item).await.is_err() {
+                    // Receiver dropped, stop publishing
+                    return Ok(());
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// Data passed from COG fetcher to mosaic worker.
@@ -117,10 +258,8 @@ pub struct PipelineConfig {
     pub mosaic_concurrency: usize,
     /// Number of concurrent Zarr write tasks
     pub write_concurrency: usize,
-    /// Channel buffer size between fetch and mosaic stages
-    pub fetch_buffer: usize,
-    /// Channel buffer size between mosaic and write stages
-    pub mosaic_buffer: usize,
+    /// HTTP concurrency per chunk (for tile fetches within a single chunk)
+    pub http_concurrency_per_chunk: usize,
 }
 
 impl Default for PipelineConfig {
@@ -129,8 +268,7 @@ impl Default for PipelineConfig {
             fetch_concurrency: 8,
             mosaic_concurrency: 8,
             write_concurrency: 8,
-            fetch_buffer: 16,
-            mosaic_buffer: 8,
+            http_concurrency_per_chunk: 32,
         }
     }
 }
@@ -173,21 +311,52 @@ impl Pipeline {
         let total_chunks = chunks.len();
 
         // Create channels between stages
-        let (mosaic_tx, mosaic_rx) = mpsc::channel::<FetchedChunk>(self.config.fetch_buffer);
-        let (write_tx, write_rx) = mpsc::channel::<MosaicedChunk>(self.config.mosaic_buffer);
+        // Buffer = downstream worker count (1:1 to limit memory usage)
+        let fetch_buffer = self.config.mosaic_concurrency;
+        let write_buffer = self.config.write_concurrency;
+        let (mosaic_tx, mosaic_rx) = async_channel::bounded::<FetchedChunk>(fetch_buffer);
+        let (write_tx, write_rx) = async_channel::bounded::<MosaicedChunk>(write_buffer);
 
-        // Spawn mosaic stage
-        let mosaic_handle = self.spawn_mosaic_stage(mosaic_rx, write_tx);
+        // Spawn queue monitor for debugging backpressure
+        let mosaic_tx_monitor = mosaic_tx.clone();
+        let write_tx_monitor = write_tx.clone();
+        let queue_monitor = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                let fetch_queue = mosaic_tx_monitor.len();
+                let fetch_capacity = mosaic_tx_monitor.capacity().unwrap_or(0);
+                let mosaic_queue = write_tx_monitor.len();
+                let mosaic_capacity = write_tx_monitor.capacity().unwrap_or(0);
+                tracing::info!(
+                    "Queue backlog: fetch→mosaic {}/{}, mosaic→write {}/{}",
+                    fetch_queue, fetch_capacity,
+                    mosaic_queue, mosaic_capacity
+                );
+            }
+        });
 
-        // Spawn write stage
-        let write_handle = self.spawn_write_stage(write_rx, self.checkpoint_manager.clone());
+        // Spawn mosaic stage (multiple workers for concurrent mosaicing)
+        let mosaic_handles = self.spawn_mosaic_stage(mosaic_rx, write_tx);
+
+        // Spawn write stage (multiple workers for concurrent shard writes)
+        let write_handles = self.spawn_write_stage(write_rx, self.checkpoint_manager.clone());
 
         // Run fetch stage (this is the main work - processes all chunks)
         self.run_fetch_stage(chunks, mosaic_tx).await;
 
+        // Stop queue monitor BEFORE waiting for downstream stages.
+        // The monitor holds clones of the channel senders, which would prevent
+        // channels from closing and cause downstream workers to hang forever.
+        queue_monitor.abort();
+
         // Wait for downstream stages to complete
-        mosaic_handle.await?;
-        write_handle.await?;
+        for handle in mosaic_handles {
+            handle.await?;
+        }
+        for handle in write_handles {
+            handle.await?;
+        }
 
         Ok(PipelineStats {
             total_chunks,
@@ -196,98 +365,51 @@ impl Pipeline {
         })
     }
 
-    /// Run the fetch stage - spawns fetch_concurrency workers that each process chunks sequentially.
+    /// Run the fetch stage using streaming work publisher.
+    ///
+    /// Instead of pre-computing all chunk→COG mappings upfront, this iterates
+    /// COGs in Hilbert order and computes intersecting chunks on-the-fly.
+    /// This reduces memory from O(all_chunks) to O(chunks_per_COG).
     async fn run_fetch_stage(
         &self,
         chunks: Vec<OutputChunk>,
-        mosaic_tx: mpsc::Sender<FetchedChunk>,
+        mosaic_tx: async_channel::Sender<FetchedChunk>,
     ) {
         let fetch_concurrency = self.config.fetch_concurrency;
-
-        // Pre-compute tile lookups and bounds (uses SpatialLookup which is not Send)
-        let mut work_items = Vec::with_capacity(chunks.len());
-        for chunk in chunks {
-            let tiles = match self.spatial_lookup.tiles_for_chunk(&chunk) {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::warn!("Failed to find tiles for chunk {:?}: {}", chunk.chunk_indices(), e);
-                    self.metrics.add_failure();
-                    continue;
-                }
-            };
-
-            if tiles.is_empty() {
-                self.metrics.add_chunk_skipped();
-                continue;
-            }
-
-            let chunk_bounds = self.output_grid.chunk_bounds(&chunk);
-            let chunk_bounds_wgs84 = match self.output_grid.chunk_bounds_wgs84(&chunk) {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::warn!("Failed to transform chunk bounds: {}", e);
-                    self.metrics.add_failure();
-                    continue;
-                }
-            };
-
-            // Compute two-level sort key for cache-optimal ordering:
-            // 1. Primary COG tile's Hilbert index (groups chunks by COG)
-            // 2. Chunk's own Hilbert index (orders within COG group)
-            let primary_cog = &tiles[0]; // Use first (often largest overlap) COG
-            let (cog_lon, cog_lat) = bounds_centroid(&primary_cog.bounds_wgs84);
-            let cog_hilbert = wgs84_hilbert_index(cog_lon, cog_lat);
-
-            let (chunk_lon, chunk_lat) = bounds_centroid(&chunk_bounds_wgs84);
-            let chunk_hilbert = wgs84_hilbert_index(chunk_lon, chunk_lat);
-
-            let tile_refs: Vec<_> = tiles.iter().map(|t| Arc::clone(t)).collect();
-
-            work_items.push(ChunkWorkItem {
-                chunk,
-                tiles: tile_refs,
-                chunk_bounds,
-                chunk_bounds_wgs84,
-                sort_key: (cog_hilbert, chunk_hilbert),
-            });
-        }
-
-        // Sort work items by two-level Hilbert key for optimal cache locality:
-        // - Chunks sharing the same COG are processed together
-        // - Within each COG group, spatially adjacent chunks are processed together
-        work_items.sort_by_key(|item| item.sort_key);
-
-        // Count unique COG groups for logging
-        let unique_cogs: std::collections::HashSet<u64> = work_items.iter()
-            .map(|item| item.sort_key.0)
-            .collect();
+        let total_pending = chunks.len();
 
         tracing::info!(
-            "Sorted {} chunks into {} COG groups (two-level Hilbert ordering)",
-            work_items.len(),
-            unique_cogs.len()
+            "Starting streaming fetch stage with {} pending chunks, {} COG tiles",
+            total_pending,
+            self.spatial_lookup.input_index().len()
         );
 
-        // Create a shared work queue
-        let (work_tx, work_rx) = async_channel::bounded::<ChunkWorkItem>(work_items.len().max(1));
+        // Create a bounded work queue - small buffer to limit memory usage
+        // Workers will pull from this, and backpressure will slow the publisher
+        let channel_capacity = (fetch_concurrency * 4).max(64);
+        let (work_tx, work_rx) = async_channel::bounded::<ChunkWorkItem>(channel_capacity);
 
-        // Send all work items to the queue (in sorted order)
-        for item in work_items {
-            let _ = work_tx.send(item).await;
-        }
-        work_tx.close();
-
-        // Spawn fetch_concurrency workers
+        // Spawn fetch workers FIRST (before starting publisher)
+        // This allows backpressure to work - publisher blocks when channel is full
         let mut handles = Vec::with_capacity(fetch_concurrency);
-        for _ in 0..fetch_concurrency {
+        let http_concurrency_per_chunk = self.config.http_concurrency_per_chunk;
+        for worker_id in 0..fetch_concurrency {
             let reader = self.cog_reader.clone();
             let metrics = self.metrics.clone();
             let mosaic_tx = mosaic_tx.clone();
             let work_rx = work_rx.clone();
 
             let handle = tokio::spawn(async move {
+                // Fixed-rate startup to avoid thundering herd on connection pool.
+                // Each worker starts 0.5s after the previous one, providing consistent
+                // spacing regardless of worker count.
+                let startup_delay_secs = worker_id as f64 * 0.5;
+                tokio::time::sleep(std::time::Duration::from_secs_f64(startup_delay_secs)).await;
+
                 // Process chunks sequentially from the shared queue
                 while let Ok(work) = work_rx.recv().await {
+                    let chunk_id = work.chunk.chunk_indices();
+
                     // Fetch all tile windows for this chunk
                     let cog_start = Instant::now();
                     let window_data = fetch_tile_windows(
@@ -295,11 +417,18 @@ impl Pipeline {
                         &work.tiles,
                         work.chunk_bounds_wgs84,
                         &metrics,
+                        http_concurrency_per_chunk,
                     ).await;
-                    metrics.add_cog_read_time(cog_start.elapsed());
+                    let fetch_duration = cog_start.elapsed();
+                    metrics.add_cog_read_time(fetch_duration);
 
                     if window_data.is_empty() {
                         metrics.add_chunk_skipped();
+                        tracing::info!(
+                            chunk = ?chunk_id,
+                            fetch_ms = fetch_duration.as_millis(),
+                            "fetch worker completed (skipped)"
+                        );
                         continue;
                     }
 
@@ -312,15 +441,41 @@ impl Pipeline {
                         chunk_bounds: work.chunk_bounds,
                     };
 
+                    let send_start = Instant::now();
                     if mosaic_tx.send(fetched).await.is_err() {
                         tracing::debug!("Mosaic receiver dropped, stopping fetch worker");
                         break;
                     }
+                    let channel_wait = send_start.elapsed();
+
+                    tracing::info!(
+                        chunk = ?chunk_id,
+                        fetch_ms = fetch_duration.as_millis(),
+                        channel_wait_ms = channel_wait.as_millis(),
+                        "fetch worker completed"
+                    );
                 }
             });
 
             handles.push(handle);
         }
+
+        // Create and run the streaming publisher in the current task
+        // (SpatialLookup contains ProjCache which isn't Send-safe)
+        let publisher = StreamingWorkPublisher::new(
+            self.spatial_lookup.input_index(),
+            self.output_grid.clone(),
+            self.spatial_lookup.clone(),
+            chunks,
+            work_tx.clone(),
+            self.metrics.clone(),
+        );
+
+        // Run publisher in current task (not spawned)
+        if let Err(e) = publisher.publish_all().await {
+            tracing::warn!("Publisher error: {}", e);
+        }
+        work_tx.close();
 
         // Wait for all workers to complete
         for handle in handles {
@@ -328,182 +483,173 @@ impl Pipeline {
         }
     }
 
-    /// Spawn the mosaic stage - receives fetched data, mosaics, sends to write stage.
+    /// Spawn the mosaic stage - multiple workers receive fetched data, mosaic, send to write stage.
+    ///
+    /// Each worker independently pulls from the shared channel and processes work.
+    /// This avoids serialization issues where a single task's control flow blocks reception.
     fn spawn_mosaic_stage(
         &self,
-        mut mosaic_rx: mpsc::Receiver<FetchedChunk>,
-        write_tx: mpsc::Sender<MosaicedChunk>,
-    ) -> tokio::task::JoinHandle<()> {
-        let output_grid = self.output_grid.clone();
-        let metrics = self.metrics.clone();
+        mosaic_rx: async_channel::Receiver<FetchedChunk>,
+        write_tx: async_channel::Sender<MosaicedChunk>,
+    ) -> Vec<tokio::task::JoinHandle<()>> {
         let mosaic_concurrency = self.config.mosaic_concurrency;
+        let mut handles = Vec::with_capacity(mosaic_concurrency);
 
-        tokio::spawn(async move {
-            // Collect incoming fetched chunks and process them concurrently
-            let mut pending_futures = Vec::new();
+        for _ in 0..mosaic_concurrency {
+            let output_grid = self.output_grid.clone();
+            let metrics = self.metrics.clone();
+            let mosaic_rx = mosaic_rx.clone();
+            let write_tx = write_tx.clone();
 
-            loop {
-                tokio::select! {
-                    // Check for new work
-                    fetched = mosaic_rx.recv() => {
-                        match fetched {
-                            Some(fetched) => {
-                                let output_grid = output_grid.clone();
-                                let metrics = metrics.clone();
-                                let write_tx = write_tx.clone();
+            let handle = tokio::spawn(async move {
+                while let Ok(fetched) = mosaic_rx.recv().await {
+                    let chunk_id = fetched.chunk.chunk_indices();
+                    let num_tiles = fetched.window_data.len();
 
-                                // Spawn mosaic task
-                                let future = async move {
-                                    let pixel_bounds = output_grid.chunk_pixel_bounds(&fetched.chunk);
-                                    let height = pixel_bounds[2] - pixel_bounds[0];
-                                    let width = pixel_bounds[3] - pixel_bounds[1];
+                    let pixel_bounds = output_grid.chunk_pixel_bounds(&fetched.chunk);
+                    let height = pixel_bounds[2] - pixel_bounds[0];
+                    let width = pixel_bounds[3] - pixel_bounds[1];
 
-                                    let reproject_config = ReprojectConfig {
-                                        target_crs: output_grid.crs.clone(),
-                                        target_resolution: output_grid.resolution,
-                                        target_bounds: fetched.chunk_bounds,
-                                        target_shape: (height, width),
-                                        num_bands: output_grid.num_bands,
-                                    };
+                    let reproject_config = ReprojectConfig {
+                        target_crs: output_grid.crs.clone(),
+                        target_resolution: output_grid.resolution,
+                        target_bounds: fetched.chunk_bounds,
+                        target_shape: (height, width),
+                        num_bands: output_grid.num_bands,
+                    };
 
-                                    let target_crs = reproject_config.target_crs.clone();
-                                    let window_data = fetched.window_data;
-                                    let metrics_clone = metrics.clone();
+                    let target_crs = reproject_config.target_crs.clone();
+                    let window_data = fetched.window_data;
+                    let metrics_clone = metrics.clone();
 
-                                    // CPU-bound work in spawn_blocking
-                                    let mosaic_result = tokio::task::spawn_blocking(move || {
-                                        let start = Instant::now();
-                                        let reprojector = Reprojector::new(&target_crs);
-                                        let result = mosaic_tiles(&window_data, &reprojector, &reproject_config);
-                                        metrics_clone.add_reproject_time(start.elapsed());
-                                        result
-                                    }).await;
+                    // CPU-bound work in spawn_blocking
+                    let mosaic_start = Instant::now();
+                    let mosaic_result = tokio::task::spawn_blocking(move || {
+                        let start = Instant::now();
+                        let reprojector = Reprojector::new(&target_crs);
+                        let result = mosaic_tiles(&window_data, &reprojector, &reproject_config);
+                        metrics_clone.add_reproject_time(start.elapsed());
+                        result
+                    })
+                    .await;
+                    let mosaic_duration = mosaic_start.elapsed();
 
-                                    match mosaic_result {
-                                        Ok(Ok(mosaic)) => {
-                                            let mosaiced = MosaicedChunk {
-                                                chunk: fetched.chunk,
-                                                data: mosaic,
-                                            };
-                                            let _ = write_tx.send(mosaiced).await;
-                                        }
-                                        Ok(Err(e)) => {
-                                            tracing::warn!("Mosaic failed: {}", e);
-                                            metrics.add_failure();
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!("Mosaic task panicked: {}", e);
-                                            metrics.add_failure();
-                                        }
-                                    }
-                                };
-
-                                pending_futures.push(tokio::spawn(future));
-
-                                // Limit concurrency
-                                while pending_futures.len() >= mosaic_concurrency {
-                                    // Wait for at least one to complete
-                                    let (result, _idx, remaining) = futures::future::select_all(pending_futures).await;
-                                    let _ = result; // Ignore JoinHandle result
-                                    pending_futures = remaining;
-                                }
+                    match mosaic_result {
+                        Ok(Ok(mosaic)) => {
+                            let mosaiced = MosaicedChunk {
+                                chunk: fetched.chunk,
+                                data: mosaic,
+                            };
+                            let send_start = Instant::now();
+                            if write_tx.send(mosaiced).await.is_err() {
+                                tracing::debug!("Write receiver dropped, stopping mosaic worker");
+                                break;
                             }
-                            None => {
-                                // Input channel closed, wait for remaining work
-                                for handle in pending_futures {
-                                    let _ = handle.await;
-                                }
-                                return;
-                            }
+                            let channel_wait = send_start.elapsed();
+
+                            tracing::info!(
+                                chunk = ?chunk_id,
+                                num_tiles = num_tiles,
+                                mosaic_ms = mosaic_duration.as_millis(),
+                                channel_wait_ms = channel_wait.as_millis(),
+                                "mosaic worker completed"
+                            );
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!("Mosaic failed: {}", e);
+                            metrics.add_failure();
+                        }
+                        Err(e) => {
+                            tracing::warn!("Mosaic task panicked: {}", e);
+                            metrics.add_failure();
                         }
                     }
                 }
-            }
-        })
+            });
+
+            handles.push(handle);
+        }
+
+        handles
     }
 
-    /// Spawn the write stage - receives mosaiced data, writes to Zarr.
+    /// Spawn the write stage - multiple workers receive mosaiced data, write to Zarr.
     fn spawn_write_stage(
         &self,
-        mut write_rx: mpsc::Receiver<MosaicedChunk>,
+        write_rx: async_channel::Receiver<MosaicedChunk>,
         checkpoint_manager: Option<Arc<CheckpointManager>>,
-    ) -> tokio::task::JoinHandle<()> {
-        let writer = self.zarr_writer.clone();
-        let metrics = self.metrics.clone();
+    ) -> Vec<tokio::task::JoinHandle<()>> {
         let write_concurrency = self.config.write_concurrency;
+        let mut handles = Vec::with_capacity(write_concurrency);
 
-        tokio::spawn(async move {
-            let mut pending_futures = Vec::new();
+        for _ in 0..write_concurrency {
+            let writer = self.zarr_writer.clone();
+            let metrics = self.metrics.clone();
+            let write_rx = write_rx.clone();
+            let checkpoint = checkpoint_manager.clone();
 
-            loop {
-                tokio::select! {
-                    mosaiced = write_rx.recv() => {
-                        match mosaiced {
-                            Some(mosaiced) => {
-                                let writer = writer.clone();
-                                let metrics = metrics.clone();
-                                let checkpoint = checkpoint_manager.clone();
+            let handle = tokio::spawn(async move {
+                while let Ok(mosaiced) = write_rx.recv().await {
+                    // Use block_in_place for sync zarrs API (enables parallel compression)
+                    // Note: Must use block_in_place (not spawn_blocking) because the zarrs
+                    // AsyncToSyncStorageAdapter uses handle.block_on() internally, which
+                    // requires running on a tokio runtime thread.
+                    //
+                    // Each worker can write to a different shard concurrently, and rayon
+                    // handles parallel compression within each shard.
+                    let bytes_written = mosaiced.data.len() as u64;
+                    let chunk = mosaiced.chunk.clone();
+                    let chunk_id = chunk.chunk_indices();
 
-                                let future = async move {
-                                    let bytes_written = mosaiced.data.len() as u64;
-                                    let chunk = mosaiced.chunk.clone();
+                    let write_start = Instant::now();
+                    let write_result = tokio::task::block_in_place(|| {
+                        writer.write_chunk_sync(&mosaiced.chunk, mosaiced.data)
+                    });
+                    let write_duration = write_start.elapsed();
 
-                                    let start = Instant::now();
-                                    if let Err(e) = writer.write_chunk_async(&mosaiced.chunk, mosaiced.data).await {
-                                        tracing::warn!("Zarr write failed: {}", e);
-                                        metrics.add_failure();
-                                        return;
-                                    }
-                                    metrics.add_zarr_write_time(start.elapsed());
-                                    metrics.add_bytes_written(bytes_written);
-                                    metrics.add_chunk_processed();
+                    if let Err(e) = write_result {
+                        tracing::warn!("Zarr write failed: {}", e);
+                        metrics.add_failure();
+                    } else {
+                        metrics.add_zarr_write_time(write_duration);
+                        metrics.add_bytes_written(bytes_written);
+                        metrics.add_chunk_processed();
 
-                                    // Mark chunk as completed in checkpoint
-                                    if let Some(ref checkpoint) = checkpoint {
-                                        checkpoint.mark_completed(&chunk);
-                                    }
-                                };
-
-                                pending_futures.push(tokio::spawn(future));
-
-                                // Limit concurrency
-                                while pending_futures.len() >= write_concurrency {
-                                    let (result, _idx, remaining) = futures::future::select_all(pending_futures).await;
-                                    let _ = result;
-                                    pending_futures = remaining;
-                                }
-                            }
-                            None => {
-                                // Input channel closed, wait for remaining work
-                                for handle in pending_futures {
-                                    let _ = handle.await;
-                                }
-                                return;
-                            }
+                        // Mark chunk as completed in checkpoint
+                        if let Some(ref checkpoint) = checkpoint {
+                            checkpoint.mark_completed(&chunk);
                         }
+
+                        tracing::info!(
+                            chunk = ?chunk_id,
+                            write_ms = write_duration.as_millis(),
+                            bytes = bytes_written,
+                            "write worker completed"
+                        );
                     }
                 }
-            }
-        })
+            });
+
+            handles.push(handle);
+        }
+
+        handles
     }
 }
 
 /// Fetch tile windows for a single chunk.
-/// HTTP requests within a chunk are concurrent (up to 32).
+/// HTTP requests within a chunk are concurrent (up to http_concurrency).
 async fn fetch_tile_windows(
     reader: &CogReader,
     tiles: &[Arc<CogTile>],
     chunk_bounds_wgs84: [f64; 4],
     metrics: &Metrics,
+    http_concurrency: usize,
 ) -> Vec<WindowData> {
-    // Fixed HTTP concurrency within a chunk
-    const HTTP_CONCURRENCY: usize = 32;
-
-    // Clone tiles for owned iteration
-    let tiles_owned: Vec<_> = tiles.iter().cloned().collect();
 
     // Step 1: Fetch geotransforms concurrently (async)
-    let geo_transforms: Vec<_> = stream::iter(tiles_owned)
+    // Clone Arc refs during iteration (cheap) instead of pre-cloning entire Vec
+    let geo_transforms: Vec<_> = stream::iter(tiles.iter().cloned())
         .map(|tile| {
             let reader = reader;
             async move {
@@ -511,7 +657,7 @@ async fn fetch_tile_windows(
                 (tile, gt)
             }
         })
-        .buffer_unordered(HTTP_CONCURRENCY)
+        .buffer_unordered(http_concurrency)
         .collect()
         .await;
 
@@ -526,7 +672,7 @@ async fn fetch_tile_windows(
                 reader.read_window(&req.tile, req.window, req.intersection_bounds).await
             }
         })
-        .buffer_unordered(HTTP_CONCURRENCY)
+        .buffer_unordered(http_concurrency)
         .collect()
         .await;
 
@@ -549,42 +695,44 @@ async fn fetch_tile_windows(
     window_data
 }
 
-/// Compute fetch requests from geotransforms (sync, creates ProjCache internally).
+/// Compute fetch requests from geotransforms (sync, uses thread-local ProjCache).
 fn compute_fetch_requests(
     geo_transforms: Vec<(Arc<CogTile>, Result<Option<GeoTransform>, anyhow::Error>)>,
     chunk_bounds_wgs84: &[f64; 4],
 ) -> Vec<FetchRequest> {
-    // Create ProjCache here - not held across any await
-    let proj_cache = ProjCache::new();
+    // Use thread-local ProjCache - Proj objects are not thread-safe
+    PROJ_CACHE.with(|cache| {
+        let proj_cache = cache.borrow();
 
-    geo_transforms
-        .into_iter()
-        .filter_map(|(tile, gt_result)| {
-            let geo_transform = match gt_result {
-                Ok(Some(gt)) => gt,
-                Ok(None) => {
-                    tracing::warn!("No geotransform for tile {}", tile.tile_id);
-                    return None;
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to get geotransform for {}: {}", tile.tile_id, e);
-                    return None;
-                }
-            };
+        geo_transforms
+            .into_iter()
+            .filter_map(|(tile, gt_result)| {
+                let geo_transform = match gt_result {
+                    Ok(Some(gt)) => gt,
+                    Ok(None) => {
+                        tracing::warn!("No geotransform for tile {}", tile.tile_id);
+                        return None;
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to get geotransform for {}: {}", tile.tile_id, e);
+                        return None;
+                    }
+                };
 
-            match compute_pixel_window(&tile, chunk_bounds_wgs84, &proj_cache, &geo_transform) {
-                Ok((window, intersection)) => Some(FetchRequest {
-                    tile,
-                    window,
-                    intersection_bounds: intersection,
-                }),
-                Err(e) => {
-                    tracing::debug!("No intersection for tile: {}", e);
-                    None
+                match compute_pixel_window(&tile, chunk_bounds_wgs84, &proj_cache, &geo_transform) {
+                    Ok((window, intersection)) => Some(FetchRequest {
+                        tile,
+                        window,
+                        intersection_bounds: intersection,
+                    }),
+                    Err(e) => {
+                        tracing::debug!("No intersection for tile: {}", e);
+                        None
+                    }
                 }
-            }
-        })
-        .collect()
+            })
+            .collect()
+    })
 }
 
 /// Compute pixel window for a tile intersection.
@@ -657,8 +805,7 @@ mod tests {
         assert_eq!(config.fetch_concurrency, 8);
         assert_eq!(config.mosaic_concurrency, 8);
         assert_eq!(config.write_concurrency, 8);
-        assert_eq!(config.fetch_buffer, 16);
-        assert_eq!(config.mosaic_buffer, 8);
+        assert_eq!(config.http_concurrency_per_chunk, 32);
     }
 
     #[test]

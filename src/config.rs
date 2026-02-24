@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use tracing;
 
 /// Main configuration for the mosaic pipeline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,7 +64,8 @@ pub struct OutputConfig {
     #[serde(default = "default_output_crs")]
     pub crs: String,
 
-    /// Output resolution in meters
+    /// Output resolution in CRS units (degrees for EPSG:4326, meters for projected CRS).
+    /// Default: ~10m at the equator (0.0000898 degrees for EPSG:4326).
     #[serde(default = "default_resolution")]
     pub resolution: f64,
 
@@ -228,6 +230,11 @@ pub struct ProcessingConfig {
     #[serde(default = "default_write_concurrency")]
     pub write_concurrency: usize,
 
+    /// Maximum concurrent HTTP requests across all workers (default: 128)
+    /// This prevents connection exhaustion with high fetch_concurrency values.
+    #[serde(default = "default_max_concurrent_http")]
+    pub max_concurrent_http: usize,
+
     /// Enable metrics reporting
     #[serde(default = "default_true")]
     pub enable_metrics: bool,
@@ -236,7 +243,12 @@ pub struct ProcessingConfig {
     #[serde(default = "default_metrics_interval")]
     pub metrics_interval_secs: u64,
 
-    /// Maximum memory for tile cache in GB
+    /// Enable tile data cache and single-flight deduplication (default: true)
+    /// Disable to reduce memory usage at the cost of potentially re-fetching tiles.
+    #[serde(default = "default_true")]
+    pub tile_cache_enabled: bool,
+
+    /// Maximum memory for tile cache in GB (ignored if tile_cache_enabled is false)
     #[serde(default = "default_tile_cache_gb")]
     pub tile_cache_gb: f64,
 
@@ -275,8 +287,10 @@ impl Default for ProcessingConfig {
             fetch_concurrency: 8,
             mosaic_concurrency: 8,
             write_concurrency: 8,
+            max_concurrent_http: 128,
             enable_metrics: true,
             metrics_interval_secs: 10,
+            tile_cache_enabled: true,
             tile_cache_gb: 32.0,
             metadata_cache_entries: 10_000,
             metrics_output_path: None,
@@ -360,26 +374,46 @@ impl Config {
             }
         }
 
+        // Warn if fetch_concurrency may cause excessive queuing
+        // Each fetch worker can issue up to 8 HTTP requests concurrently (min per-chunk limit)
+        // If total potential requests significantly exceeds max_concurrent_http, warn user
+        let potential_requests = self.processing.fetch_concurrency * 8;
+        let threshold = (self.processing.max_concurrent_http as f64 * 1.5) as usize;
+        if potential_requests > threshold {
+            tracing::warn!(
+                "fetch_concurrency={} with min 8 HTTP requests per chunk could issue {} concurrent requests, \
+                 exceeding max_concurrent_http={} by >50%. This will cause request queuing. \
+                 Consider increasing max_concurrent_http or decreasing fetch_concurrency.",
+                self.processing.fetch_concurrency,
+                potential_requests,
+                self.processing.max_concurrent_http
+            );
+        }
+
         Ok(())
     }
 }
 
 // Default value functions for serde
 fn default_output_crs() -> String { "EPSG:4326".to_string() }
-fn default_resolution() -> f64 { 10.0 }
+/// Meters per degree at the equator (Earth's circumference / 360).
+const METERS_PER_DEGREE_AT_EQUATOR: f64 = 111_320.0;
+
+fn default_resolution() -> f64 { 10.0 / METERS_PER_DEGREE_AT_EQUATOR }
 fn default_time_chunks() -> usize { 1 }
 fn default_embedding_chunks() -> usize { 64 }
 fn default_spatial_chunks() -> usize { 256 }
 fn default_fetch_concurrency() -> usize { 8 }
 fn default_mosaic_concurrency() -> usize { 8 }
 fn default_write_concurrency() -> usize { 8 }
+fn default_max_concurrent_http() -> usize { 128 }
 fn default_true() -> bool { true }
 fn default_metrics_interval() -> u64 { 10 }
 fn default_checkpoint_interval() -> u64 { 60 }
 fn default_num_bands() -> usize { 64 }
 fn default_compression_level() -> i32 { 3 }
 fn default_tile_cache_gb() -> f64 { 32.0 }
-fn default_metadata_cache_entries() -> usize { 10_000 }
+fn default_metadata_cache_entries() -> usize { 50_000 }
 
 #[cfg(test)]
 mod tests {

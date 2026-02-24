@@ -38,13 +38,22 @@ pub use config::{CheckpointConfig, Config, FilterConfig};
 pub use index::{InputIndex, OutputGrid, SpatialLookup};
 pub use io::{CogReader, ZarrWriter};
 pub use pipeline::{Metrics, MetricsReporter, Pipeline, PipelineConfig, PipelineStats};
-pub use transform::MosaicAccumulator;
+pub use transform::AtomicAccumulator;
 
 use anyhow::Result;
 use std::sync::Arc;
 
 /// Run the full mosaic pipeline with the given configuration.
 pub async fn run_pipeline(config: Config) -> Result<PipelineStats> {
+    // Configure Rayon thread pool BEFORE any parallel work.
+    // Each spawn_blocking task runs Rayon par_iter internally. Without explicit
+    // config, Rayon uses num_cpus threads per parallel region. We configure it
+    // once globally to prevent oversubscription with multiple spawn_blocking tasks.
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4))
+        .build_global()
+        .ok(); // Ignore if already initialized
+
     // Validate configuration
     config.validate()?;
 
@@ -176,12 +185,26 @@ pub async fn run_pipeline(config: Config) -> Result<PipelineStats> {
     // Create metrics
     let metrics = Metrics::new();
 
-    // Create COG reader with cache sizes from config
+    // Create COG reader with cache sizes and HTTP concurrency limit from config
     let tile_cache_bytes = (config.processing.tile_cache_gb * 1024.0 * 1024.0 * 1024.0) as u64;
 
-    let cog_reader = Arc::new(CogReader::with_cache_size(
-        cog_store,
+    // Scale metadata cache with tile count: use max of config value or 25% of tiles
+    // This ensures good cache hit rates for large datasets
+    let scaled_metadata_cache = config.processing.metadata_cache_entries
+        .max(input_index.len() / 4);
+
+    tracing::info!(
+        "Metadata cache: {} entries (config: {}, scaled from {} tiles)",
+        scaled_metadata_cache,
         config.processing.metadata_cache_entries,
+        input_index.len()
+    );
+
+    let cog_reader = Arc::new(CogReader::with_http_limit(
+        cog_store,
+        config.processing.max_concurrent_http,
+        config.processing.tile_cache_enabled,
+        scaled_metadata_cache,
         tile_cache_bytes,
         Some(metrics.clone()),
     ));
@@ -223,12 +246,14 @@ pub async fn run_pipeline(config: Config) -> Result<PipelineStats> {
     );
 
     // Create pipeline config
+    // Scale HTTP concurrency per chunk based on global HTTP limit and fetch concurrency.
+    // This ensures we don't exceed max_concurrent_http when all fetch workers are active.
+    let http_concurrency_per_chunk = (config.processing.max_concurrent_http / config.processing.fetch_concurrency).max(8);
     let pipeline_config = PipelineConfig {
         fetch_concurrency: config.processing.fetch_concurrency,
         mosaic_concurrency: config.processing.mosaic_concurrency,
         write_concurrency: config.processing.write_concurrency,
-        fetch_buffer: 16,
-        mosaic_buffer: 8,
+        http_concurrency_per_chunk,
     };
 
     tracing::info!(
