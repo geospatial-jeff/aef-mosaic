@@ -345,6 +345,11 @@ impl Pipeline {
         // Run fetch stage (this is the main work - processes all chunks)
         self.run_fetch_stage(chunks, mosaic_tx).await;
 
+        // Stop queue monitor BEFORE waiting for downstream stages.
+        // The monitor holds clones of the channel senders, which would prevent
+        // channels from closing and cause downstream workers to hang forever.
+        queue_monitor.abort();
+
         // Wait for downstream stages to complete
         for handle in mosaic_handles {
             handle.await?;
@@ -352,9 +357,6 @@ impl Pipeline {
         for handle in write_handles {
             handle.await?;
         }
-
-        // Stop queue monitor
-        queue_monitor.abort();
 
         Ok(PipelineStats {
             total_chunks,
