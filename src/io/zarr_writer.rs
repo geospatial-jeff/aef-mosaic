@@ -223,6 +223,18 @@ impl ZarrWriter {
                 output_grid.bounds[3]
             ]),
         );
+        // Add spatial:transform for rioxarray/GeoZarr compatibility (PR #905)
+        attributes.insert(
+            "spatial:transform".to_string(),
+            serde_json::json!([
+                output_grid.resolution,
+                0.0,
+                output_grid.bounds[0],
+                0.0,
+                -output_grid.resolution,
+                output_grid.bounds[3]
+            ]),
+        );
         attributes.insert(
             "bounds".to_string(),
             serde_json::json!(output_grid.bounds),
