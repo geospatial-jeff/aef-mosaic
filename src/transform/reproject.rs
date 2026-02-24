@@ -16,7 +16,6 @@
 use anyhow::{Context, Result};
 use ndarray::Array3;
 use proj::Proj;
-use std::cell::UnsafeCell;
 use std::time::Instant;
 use wide::f32x8;
 
@@ -33,40 +32,6 @@ const MIN_BLOCK_SIZE: usize = 16;
 
 /// Nodata value for AEF embeddings (int8).
 const NODATA: i8 = -128;
-
-/// Wrapper for parallel writes to non-overlapping regions of an array.
-/// SAFETY: Caller must ensure no two threads write to the same index.
-struct UnsafeArray3(UnsafeCell<Array3<i8>>);
-
-// SAFETY: We guarantee non-overlapping writes from different threads
-unsafe impl Sync for UnsafeArray3 {}
-
-impl UnsafeArray3 {
-    fn new(arr: Array3<i8>) -> Self {
-        Self(UnsafeCell::new(arr))
-    }
-
-    /// Get raw pointer to the underlying data for SIMD operations.
-    /// SAFETY: Caller must ensure non-overlapping access.
-    #[inline]
-    unsafe fn as_mut_ptr(&self) -> *mut i8 {
-        (*self.0.get()).as_mut_ptr()
-    }
-
-    /// Get strides for direct memory access.
-    #[inline]
-    fn strides(&self) -> [isize; 3] {
-        unsafe {
-            let arr = &*self.0.get();
-            let strides = arr.strides();
-            [strides[0], strides[1], strides[2]]
-        }
-    }
-
-    fn into_inner(self) -> Array3<i8> {
-        self.0.into_inner()
-    }
-}
 
 /// Configuration for reprojection.
 #[derive(Debug, Clone)]
@@ -413,7 +378,7 @@ impl Reprojector {
     /// Uses direct pointer arithmetic for SIMD-friendly memory access.
     #[inline]
     fn copy_bands(
-        output: &UnsafeArray3,
+        output: &mut Array3<i8>,
         data: &Array3<i8>,
         bands: usize,
         dst_row: usize,
@@ -421,10 +386,18 @@ impl Reprojector {
         src_row: usize,
         src_col: usize,
     ) {
-        // Get strides for direct memory access
-        let dst_strides = output.strides();
-        let src_strides = data.strides();
+        // Copy strides to local array to avoid borrow conflicts with as_mut_ptr()
+        let dst_strides: [isize; 3] = {
+            let s = output.strides();
+            [s[0], s[1], s[2]]
+        };
+        let src_strides: [isize; 3] = {
+            let s = data.strides();
+            [s[0], s[1], s[2]]
+        };
 
+        // SAFETY: We have exclusive mutable access to output, and coordinates
+        // are bounds-checked by the caller.
         unsafe {
             let dst_ptr = output.as_mut_ptr();
             let src_ptr = data.as_ptr();
@@ -519,8 +492,8 @@ impl Reprojector {
             dst_height,
         );
 
-        // Create output array initialized with NODATA, wrapped for parallel writes
-        let output = UnsafeArray3::new(Array3::<i8>::from_elem((bands, dst_height, dst_width), NODATA));
+        // Create output array initialized with NODATA
+        let mut output = Array3::<i8>::from_elem((bands, dst_height, dst_width), NODATA);
 
         // Pre-compute inverse pixel sizes for coordinate conversion
         let inv_src_pixel_x = 1.0 / src_pixel_x;
@@ -536,7 +509,7 @@ impl Reprojector {
         //
         // SIMD optimization: process 8 pixels at a time using f32x8 vectors.
         let copy_start = Instant::now();
-        grid.row_spans.iter().for_each(|span| {
+        for span in &grid.row_spans {
             let dst_row = span.dst_row;
             let coeffs = &span.coefficients;
 
@@ -592,10 +565,8 @@ impl Reprojector {
                         && row_i >= 0
                         && row_i < src_height as isize
                     {
-                        // SAFETY: row spans are non-overlapping in destination space,
-                        // so no two threads write to the same (band, dst_row, dst_col)
                         Self::copy_bands(
-                            &output, data, bands, dst_row,
+                            &mut output, data, bands, dst_row,
                             dst_col + i, row_i as usize, col_i as usize,
                         );
                     }
@@ -625,18 +596,16 @@ impl Reprojector {
                     && src_row_i < src_height as isize
                 {
                     Self::copy_bands(
-                        &output, data, bands, dst_row, dst_col,
+                        &mut output, data, bands, dst_row, dst_col,
                         src_row_i as usize, src_col_i as usize,
                     );
                 }
 
                 dst_col += 1;
             }
-        });
+        }
 
         let copy_time = copy_start.elapsed();
-
-        let output = output.into_inner();
         let valid_pixels = output.iter().filter(|&&v| v != NODATA).count();
         let input_pixels = src_width * src_height;
         let output_pixels = dst_width * dst_height;

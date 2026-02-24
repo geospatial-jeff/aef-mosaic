@@ -69,10 +69,8 @@ url = "2"
 lru = "0.12"
 dashmap = "6"
 
-# Checkpointing
-chrono = { version = "0.4", features = ["serde"] }
+# Checkpointing (config hash)
 sha2 = "0.10"
-rand = "0.10.0"
 
 [dev-dependencies]
 tempfile = "3"

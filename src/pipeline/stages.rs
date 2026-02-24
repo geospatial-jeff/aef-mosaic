@@ -391,17 +391,19 @@ impl Pipeline {
         // This allows backpressure to work - publisher blocks when channel is full
         let mut handles = Vec::with_capacity(fetch_concurrency);
         let http_concurrency_per_chunk = self.config.http_concurrency_per_chunk;
-        for _ in 0..fetch_concurrency {
+        let num_workers = fetch_concurrency;
+        for worker_id in 0..fetch_concurrency {
             let reader = self.cog_reader.clone();
             let metrics = self.metrics.clone();
             let mosaic_tx = mosaic_tx.clone();
             let work_rx = work_rx.clone();
 
             let handle = tokio::spawn(async move {
-                // Random jitter to avoid thundering herd on connection pool.
+                // Deterministic jitter to avoid thundering herd on connection pool.
                 // With large shards, fetches can take 30-60+ seconds, so spreading
                 // workers over 0-30s prevents simultaneous connection storms.
-                let jitter_secs = rand::random::<f64>() * 30.0;
+                // Use linear spacing for deterministic but well-distributed jitter.
+                let jitter_secs = (worker_id as f64 / num_workers as f64) * 30.0;
                 tokio::time::sleep(std::time::Duration::from_secs_f64(jitter_secs)).await;
 
                 // Process chunks sequentially from the shared queue
