@@ -64,7 +64,8 @@ pub struct OutputConfig {
     #[serde(default = "default_output_crs")]
     pub crs: String,
 
-    /// Output resolution in meters
+    /// Output resolution in CRS units (degrees for EPSG:4326, meters for projected CRS).
+    /// Default: ~10m at the equator (0.0000898 degrees for EPSG:4326).
     #[serde(default = "default_resolution")]
     pub resolution: f64,
 
@@ -395,7 +396,10 @@ impl Config {
 
 // Default value functions for serde
 fn default_output_crs() -> String { "EPSG:4326".to_string() }
-fn default_resolution() -> f64 { 10.0 }
+/// Meters per degree at the equator (Earth's circumference / 360).
+const METERS_PER_DEGREE_AT_EQUATOR: f64 = 111_320.0;
+
+fn default_resolution() -> f64 { 10.0 / METERS_PER_DEGREE_AT_EQUATOR }
 fn default_time_chunks() -> usize { 1 }
 fn default_embedding_chunks() -> usize { 64 }
 fn default_spatial_chunks() -> usize { 256 }
