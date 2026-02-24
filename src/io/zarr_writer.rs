@@ -8,8 +8,9 @@ use futures::StreamExt;
 use ndarray::Array4;
 use object_store::{ObjectStore, ObjectStoreExt};
 use std::sync::Arc;
+use std::time::Instant;
 use zarrs::array::codec::bytes_to_bytes::zstd::ZstdCodec;
-use zarrs::array::{Array, ArrayBuilder};
+use zarrs::array::{Array, ArrayBuilder, CodecOptions};
 use zarrs::group::GroupBuilder;
 use zarrs::storage::storage_adapter::async_to_sync::{AsyncToSyncBlockOn, AsyncToSyncStorageAdapter};
 use zarrs_object_store::AsyncObjectStore;
@@ -41,6 +42,9 @@ pub struct ZarrWriter {
 
     /// Output grid configuration
     output_grid: Arc<OutputGrid>,
+
+    /// Codec options for parallel compression (configured for maximum parallelism)
+    codec_options: CodecOptions,
 }
 
 impl ZarrWriter {
@@ -261,8 +265,15 @@ impl ZarrWriter {
             )
         })?;
 
+        // Configure codec options for maximum parallelism within shards.
+        // concurrent_target=0 means unconstrained (use all rayon threads).
+        // chunk_concurrent_minimum=16 allows more inner chunks to be processed in parallel.
+        let codec_options = CodecOptions::default()
+            .with_concurrent_target(0)
+            .with_chunk_concurrent_minimum(16);
+
         tracing::info!(
-            "Created Zarr array at {} with shape {:?}",
+            "Created Zarr array at {} with shape {:?}, codec concurrent_target=unconstrained, chunk_concurrent_min=16",
             array_path,
             shape
         );
@@ -270,6 +281,7 @@ impl ZarrWriter {
         Ok(Self {
             array,
             output_grid,
+            codec_options,
         })
     }
 
@@ -304,16 +316,20 @@ impl ZarrWriter {
             shape, expected_shape
         );
 
-        tracing::debug!(
-            "Writing chunk {:?}: shape={:?}",
-            chunk_indices, shape
-        );
-
         // Pass slice directly to avoid copy (data should be contiguous)
         let chunk_data = data.as_slice().expect("chunk data should be contiguous");
+        let data_size_mb = chunk_data.len() as f64 / (1024.0 * 1024.0);
+
+        tracing::debug!(
+            "Writing chunk {:?}: shape={:?}, size={:.1}MB",
+            chunk_indices, shape, data_size_mb
+        );
+
+        // Time the store operation (includes compression + I/O)
+        let start = Instant::now();
 
         self.array
-            .store_chunk(&chunk_indices, chunk_data)
+            .store_chunk_opt(&chunk_indices, chunk_data, &self.codec_options)
             .map_err(|e| {
                 tracing::error!(
                     "Chunk {:?} write failed: {:?}. Data shape: {:?}",
@@ -322,7 +338,13 @@ impl ZarrWriter {
                 anyhow::anyhow!("Failed to write chunk {:?}: {:?}", chunk_indices, e)
             })?;
 
-        tracing::debug!("Chunk {:?} write completed", chunk_indices);
+        let elapsed = start.elapsed();
+        let throughput_mbps = data_size_mb / elapsed.as_secs_f64();
+
+        tracing::debug!(
+            "Chunk {:?} write completed: {:.2}s ({:.1} MB/s)",
+            chunk_indices, elapsed.as_secs_f64(), throughput_mbps
+        );
         Ok(())
     }
 

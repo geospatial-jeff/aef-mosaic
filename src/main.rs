@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use aef_mosaic::{run_pipeline, Config};
+use zarrs::config::global_config_mut;
 
 #[derive(Parser)]
 #[command(name = "aef-mosaic")]
@@ -87,6 +88,23 @@ fn run_command(config_path: PathBuf, concurrency: Option<usize>, dry_run: bool) 
     if dry_run {
         tracing::info!("Dry run mode - analyzing work without processing");
         return analyze_work(&config);
+    }
+
+    // Configure zarrs for optimal parallel compression within shards.
+    // This sets the global default for codec operations.
+    let num_cpus = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(8);
+    {
+        let mut zarrs_config = global_config_mut();
+        // Use all available cores for codec operations (compression/decompression)
+        zarrs_config.set_codec_concurrent_target(num_cpus);
+        // Process more inner chunks in parallel within shards (default is 4)
+        // With 16x16 shard shape (256 inner chunks), higher concurrency helps
+        zarrs_config.set_chunk_concurrent_minimum(16);
+        tracing::info!(
+            "zarrs config: codec_concurrent_target={}, chunk_concurrent_minimum={}",
+            zarrs_config.codec_concurrent_target(),
+            zarrs_config.chunk_concurrent_minimum()
+        );
     }
 
     // Build Tokio runtime with explicit thread configuration.
