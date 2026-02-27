@@ -1,7 +1,6 @@
 //! Zarr writing using zarrs sync API for parallel compression.
 
 use crate::config::Config;
-use crate::crs::epsg_to_proj_definition;
 use crate::index::{OutputChunk, OutputGrid};
 use anyhow::Result;
 use futures::StreamExt;
@@ -203,27 +202,15 @@ impl ZarrWriter {
 
         // Add attributes for geospatial metadata
         let mut attributes = serde_json::Map::new();
-        attributes.insert("crs".to_string(), serde_json::json!(output_grid.crs));
-        // Add GeoZarr proj: namespace attribute for emerging GeoZarr ecosystem compatibility
+
+        // GeoZarr proj: convention (CRS)
         attributes.insert("proj:code".to_string(), serde_json::json!(output_grid.crs));
 
-        // Add CRS as PROJ definition for additional CRS identification
-        if let Some(proj_def) = epsg_to_proj_definition(&output_grid.crs) {
-            attributes.insert("crs_proj4".to_string(), serde_json::json!(proj_def));
-        }
-
+        // GeoZarr spatial: convention
         attributes.insert(
-            "transform".to_string(),
-            serde_json::json!([
-                output_grid.resolution,
-                0.0,
-                output_grid.bounds[0],
-                0.0,
-                -output_grid.resolution,
-                output_grid.bounds[3]
-            ]),
+            "spatial:dimensions".to_string(),
+            serde_json::json!(["y", "x"]),
         );
-        // Add spatial:transform for rioxarray/GeoZarr compatibility (PR #905)
         attributes.insert(
             "spatial:transform".to_string(),
             serde_json::json!([
@@ -236,18 +223,21 @@ impl ZarrWriter {
             ]),
         );
         attributes.insert(
-            "bounds".to_string(),
+            "spatial:transform_type".to_string(),
+            serde_json::json!("affine"),
+        );
+        attributes.insert(
+            "spatial:bbox".to_string(),
             serde_json::json!(output_grid.bounds),
         );
         attributes.insert(
-            "resolution".to_string(),
-            serde_json::json!(output_grid.resolution),
+            "spatial:shape".to_string(),
+            serde_json::json!([output_grid.height, output_grid.width]),
         );
-
-        // Add time dimension metadata
-        attributes.insert("start_year".to_string(), serde_json::json!(output_grid.start_year()));
-        attributes.insert("num_years".to_string(), serde_json::json!(output_grid.num_years()));
-        attributes.insert("years".to_string(), serde_json::json!(output_grid.years));
+        attributes.insert(
+            "spatial:registration".to_string(),
+            serde_json::json!("pixel"),
+        );
 
         // Add embedding dimension names (AEF convention: A00, A01, ..., A63)
         let dimensions: Vec<String> = (0..output_grid.num_bands)
@@ -255,8 +245,26 @@ impl ZarrWriter {
             .collect();
         attributes.insert("embedding_dimensions".to_string(), serde_json::json!(dimensions));
 
-        // Add CF Conventions attribute for compatibility
-        attributes.insert("Conventions".to_string(), serde_json::json!("CF-1.8"));
+        // Declare GeoZarr conventions compliance (geo-proj and spatial)
+        attributes.insert(
+            "zarr_conventions".to_string(),
+            serde_json::json!([
+                {
+                    "uuid": "f17cb550-5864-4468-aeb7-f3180cfb622f",
+                    "name": "proj:",
+                    "description": "Coordinate reference system information for geospatial data",
+                    "spec_url": "https://github.com/zarr-experimental/geo-proj/blob/v1/README.md",
+                    "schema_url": "https://raw.githubusercontent.com/zarr-experimental/geo-proj/refs/tags/v1/schema.json"
+                },
+                {
+                    "uuid": "689b58e2-cf7b-45e0-9fff-9cfc0883d6b4",
+                    "name": "spatial:",
+                    "description": "Spatial coordinate information",
+                    "spec_url": "https://github.com/zarr-conventions/spatial/blob/v1/README.md",
+                    "schema_url": "https://raw.githubusercontent.com/zarr-conventions/spatial/refs/tags/v1/schema.json"
+                }
+            ]),
+        );
 
         builder.attributes(attributes);
 
@@ -551,23 +559,31 @@ mod integration_tests {
         // Verify attributes exist and have correct values
         let attrs = metadata.get("attributes").expect("attributes should exist");
 
-        // CF-style CRS attribute
-        assert_eq!(attrs.get("crs").and_then(|v| v.as_str()), Some("EPSG:4326"));
-
-        // GeoZarr proj: namespace attribute
+        // GeoZarr proj: convention
         assert_eq!(attrs.get("proj:code").and_then(|v| v.as_str()), Some("EPSG:4326"));
 
-        // CF Conventions marker
-        assert_eq!(attrs.get("Conventions").and_then(|v| v.as_str()), Some("CF-1.8"));
+        // GeoZarr spatial: convention
+        assert_eq!(attrs.get("spatial:dimensions"), Some(&serde_json::json!(["y", "x"])));
+        assert!(attrs.get("spatial:transform").is_some(), "spatial:transform should exist");
+        assert_eq!(attrs.get("spatial:transform_type").and_then(|v| v.as_str()), Some("affine"));
+        assert!(attrs.get("spatial:bbox").is_some(), "spatial:bbox should exist");
+        assert_eq!(attrs.get("spatial:shape"), Some(&serde_json::json!([8, 8])));
+        assert_eq!(attrs.get("spatial:registration").and_then(|v| v.as_str()), Some("pixel"));
 
-        // Geospatial metadata
-        assert!(attrs.get("transform").is_some(), "transform should exist");
-        assert!(attrs.get("bounds").is_some(), "bounds should exist");
-        assert_eq!(attrs.get("resolution").and_then(|v| v.as_f64()), Some(10.0));
+        // GeoZarr zarr_conventions declaration
+        let conventions = attrs.get("zarr_conventions").expect("zarr_conventions should exist");
+        let conventions_arr = conventions.as_array().expect("zarr_conventions should be an array");
+        assert_eq!(conventions_arr.len(), 2, "should declare 2 conventions (geo-proj and spatial)");
 
-        // Time metadata
-        assert_eq!(attrs.get("start_year").and_then(|v| v.as_i64()), Some(2024));
-        assert_eq!(attrs.get("num_years").and_then(|v| v.as_i64()), Some(1));
+        // Verify geo-proj convention
+        let proj_conv = &conventions_arr[0];
+        assert_eq!(proj_conv.get("uuid").and_then(|v| v.as_str()), Some("f17cb550-5864-4468-aeb7-f3180cfb622f"));
+        assert_eq!(proj_conv.get("name").and_then(|v| v.as_str()), Some("proj:"));
+
+        // Verify spatial convention
+        let spatial_conv = &conventions_arr[1];
+        assert_eq!(spatial_conv.get("uuid").and_then(|v| v.as_str()), Some("689b58e2-cf7b-45e0-9fff-9cfc0883d6b4"));
+        assert_eq!(spatial_conv.get("name").and_then(|v| v.as_str()), Some("spatial:"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
