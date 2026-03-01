@@ -15,8 +15,16 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::sync::mpsc;
 
-/// Checkpoint file name (stored adjacent to output).
+/// Default checkpoint file name (stored adjacent to output).
 const CHECKPOINT_FILENAME: &str = ".checkpoint.json";
+
+/// Generate checkpoint filename with optional prefix for multi-VM support.
+fn checkpoint_filename(prefix: Option<&str>) -> String {
+    match prefix {
+        Some(p) => format!(".checkpoint.{}.json", p),
+        None => CHECKPOINT_FILENAME.to_string(),
+    }
+}
 
 /// Command sent to the background checkpoint writer.
 enum CheckpointCommand {
@@ -69,7 +77,8 @@ impl CheckpointManager {
         config: &Config,
         interval_secs: u64,
     ) -> Result<Self> {
-        let checkpoint_path = format!("{}/{}", output_prefix.trim_end_matches('/'), CHECKPOINT_FILENAME);
+        let filename = checkpoint_filename(config.processing.checkpoint.prefix.as_deref());
+        let checkpoint_path = format!("{}/{}", output_prefix.trim_end_matches('/'), filename);
         let path = Path::from(checkpoint_path);
         let config_hash = compute_config_hash(config);
         let completed = Arc::new(DashSet::new());
@@ -319,6 +328,7 @@ mod tests {
                 chunk_shape: ChunkShape::default(),
                 sharding: ShardingConfig::default(),
                 compression_level: 3,
+                years: None,
             },
             processing: ProcessingConfig::default(),
             filter: None,
