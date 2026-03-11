@@ -122,10 +122,73 @@ impl ZarrWriter {
         let async_store = Arc::new(AsyncObjectStore::new(store.clone()));
         let zarr_store = Arc::new(AsyncToSyncStorageAdapter::new(async_store, TokioBlockOn(handle.clone())));
 
-        // Create root group - zarrs requires paths to start with /
+        // Create root group with GeoZarr attributes - zarrs requires paths to start with /
         // Use block_in_place since we're in async context but calling sync zarrs API
         let group_path = if path.is_empty() { "/".to_string() } else { format!("/{}", path) };
-        let group = GroupBuilder::new().build(zarr_store.clone(), &group_path)?;
+
+        // Add GeoZarr attributes at group level
+        let mut group_attributes = serde_json::Map::new();
+
+        // GeoZarr proj: convention (CRS)
+        group_attributes.insert("proj:code".to_string(), serde_json::json!(output_grid.crs));
+
+        // GeoZarr spatial: convention
+        group_attributes.insert(
+            "spatial:dimensions".to_string(),
+            serde_json::json!(["y", "x"]),
+        );
+        group_attributes.insert(
+            "spatial:transform".to_string(),
+            serde_json::json!([
+                output_grid.resolution,
+                0.0,
+                output_grid.bounds[0],
+                0.0,
+                -output_grid.resolution,
+                output_grid.bounds[3]
+            ]),
+        );
+        group_attributes.insert(
+            "spatial:transform_type".to_string(),
+            serde_json::json!("affine"),
+        );
+        group_attributes.insert(
+            "spatial:bbox".to_string(),
+            serde_json::json!(output_grid.bounds),
+        );
+        group_attributes.insert(
+            "spatial:shape".to_string(),
+            serde_json::json!([output_grid.height, output_grid.width]),
+        );
+        group_attributes.insert(
+            "spatial:registration".to_string(),
+            serde_json::json!("pixel"),
+        );
+
+        // Declare GeoZarr conventions compliance (geo-proj and spatial)
+        group_attributes.insert(
+            "zarr_conventions".to_string(),
+            serde_json::json!([
+                {
+                    "uuid": "f17cb550-5864-4468-aeb7-f3180cfb622f",
+                    "name": "proj:",
+                    "description": "Coordinate reference system information for geospatial data",
+                    "spec_url": "https://github.com/zarr-experimental/geo-proj/blob/v1/README.md",
+                    "schema_url": "https://raw.githubusercontent.com/zarr-experimental/geo-proj/refs/tags/v1/schema.json"
+                },
+                {
+                    "uuid": "689b58e2-cf7b-45e0-9fff-9cfc0883d6b4",
+                    "name": "spatial:",
+                    "description": "Spatial coordinate information",
+                    "spec_url": "https://github.com/zarr-conventions/spatial/blob/v1/README.md",
+                    "schema_url": "https://raw.githubusercontent.com/zarr-conventions/spatial/refs/tags/v1/schema.json"
+                }
+            ]),
+        );
+
+        let group = GroupBuilder::new()
+            .attributes(group_attributes)
+            .build(zarr_store.clone(), &group_path)?;
         tokio::task::block_in_place(|| group.store_metadata())?;
 
         // Define array shape: (time, bands, height, width)
@@ -199,74 +262,6 @@ impl ZarrWriter {
             config.output.compression_level,
             false,
         ))]);
-
-        // Add attributes for geospatial metadata
-        let mut attributes = serde_json::Map::new();
-
-        // GeoZarr proj: convention (CRS)
-        attributes.insert("proj:code".to_string(), serde_json::json!(output_grid.crs));
-
-        // GeoZarr spatial: convention
-        attributes.insert(
-            "spatial:dimensions".to_string(),
-            serde_json::json!(["y", "x"]),
-        );
-        attributes.insert(
-            "spatial:transform".to_string(),
-            serde_json::json!([
-                output_grid.resolution,
-                0.0,
-                output_grid.bounds[0],
-                0.0,
-                -output_grid.resolution,
-                output_grid.bounds[3]
-            ]),
-        );
-        attributes.insert(
-            "spatial:transform_type".to_string(),
-            serde_json::json!("affine"),
-        );
-        attributes.insert(
-            "spatial:bbox".to_string(),
-            serde_json::json!(output_grid.bounds),
-        );
-        attributes.insert(
-            "spatial:shape".to_string(),
-            serde_json::json!([output_grid.height, output_grid.width]),
-        );
-        attributes.insert(
-            "spatial:registration".to_string(),
-            serde_json::json!("pixel"),
-        );
-
-        // Add embedding dimension names (AEF convention: A00, A01, ..., A63)
-        let dimensions: Vec<String> = (0..output_grid.num_bands)
-            .map(|i| format!("A{:02}", i))
-            .collect();
-        attributes.insert("embedding_dimensions".to_string(), serde_json::json!(dimensions));
-
-        // Declare GeoZarr conventions compliance (geo-proj and spatial)
-        attributes.insert(
-            "zarr_conventions".to_string(),
-            serde_json::json!([
-                {
-                    "uuid": "f17cb550-5864-4468-aeb7-f3180cfb622f",
-                    "name": "proj:",
-                    "description": "Coordinate reference system information for geospatial data",
-                    "spec_url": "https://github.com/zarr-experimental/geo-proj/blob/v1/README.md",
-                    "schema_url": "https://raw.githubusercontent.com/zarr-experimental/geo-proj/refs/tags/v1/schema.json"
-                },
-                {
-                    "uuid": "689b58e2-cf7b-45e0-9fff-9cfc0883d6b4",
-                    "name": "spatial:",
-                    "description": "Spatial coordinate information",
-                    "spec_url": "https://github.com/zarr-conventions/spatial/blob/v1/README.md",
-                    "schema_url": "https://raw.githubusercontent.com/zarr-conventions/spatial/refs/tags/v1/schema.json"
-                }
-            ]),
-        );
-
-        builder.attributes(attributes);
 
         let array = builder.build(zarr_store.clone(), &array_path)?;
         tokio::task::block_in_place(|| array.store_metadata())?;
@@ -363,10 +358,11 @@ impl ZarrWriter {
 
     /// Create coordinate arrays for xarray compatibility (sync version).
     ///
-    /// Creates three 1D arrays:
+    /// Creates four 1D arrays:
     /// - `/x` - Float64 array of x-coordinates (column centers)
     /// - `/y` - Float64 array of y-coordinates (row centers)
     /// - `/time` - Int32 array of years
+    /// - `/embedding` - String array of embedding dimension names (A00, A01, ..., A63)
     ///
     /// Must be called from within block_in_place or spawn_blocking.
     fn create_coordinate_arrays(
@@ -425,11 +421,28 @@ impl ZarrWriter {
         time_array.store_metadata()?;
         time_array.store_chunk(&[0], &time_coords)?;
 
+        // Create embedding coordinate array (AEF convention: A00, A01, ..., A63)
+        let embedding_path = if path.is_empty() { "/embedding".to_string() } else { format!("/{}/embedding", path) };
+        let embedding_coords: Vec<String> = (0..output_grid.num_bands)
+            .map(|i| format!("A{:02}", i))
+            .collect();
+        let embedding_array = ArrayBuilder::new(
+            vec![output_grid.num_bands as u64],
+            vec![output_grid.num_bands as u64], // Single chunk
+            "string",
+            "",
+        )
+        .dimension_names(Some(vec![Some("embedding".to_string())]))
+        .build(zarr_store.clone(), &embedding_path)?;
+        embedding_array.store_metadata()?;
+        embedding_array.store_chunk(&[0], &embedding_coords)?;
+
         tracing::info!(
-            "Created coordinate arrays: x[{}], y[{}], time[{}]",
+            "Created coordinate arrays: x[{}], y[{}], time[{}], embedding[{}]",
             x_coords.len(),
             y_coords.len(),
-            time_coords.len()
+            time_coords.len(),
+            embedding_coords.len()
         );
 
         Ok(())
@@ -552,9 +565,9 @@ mod integration_tests {
 
         let _writer = ZarrWriter::create(store, "", grid, &config).await.unwrap();
 
-        // Read and parse the array metadata
-        let array_json = zarr_path.join("embeddings").join("zarr.json");
-        let metadata_str = std::fs::read_to_string(&array_json).unwrap();
+        // Read and parse the root group metadata (GeoZarr attributes are at group level)
+        let group_json = zarr_path.join("zarr.json");
+        let metadata_str = std::fs::read_to_string(&group_json).unwrap();
         let metadata: serde_json::Value = serde_json::from_str(&metadata_str).unwrap();
 
         // Verify attributes exist and have correct values
