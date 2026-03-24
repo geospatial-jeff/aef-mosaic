@@ -101,38 +101,62 @@ pub async fn run_pipeline(config: Config) -> Result<PipelineStats> {
             .ok_or_else(|| anyhow::anyhow!("No tiles in index"))?,
     };
 
-    // Determine years to process: from filter or from input data
-    let years: Vec<i32> = match &config.filter {
+    // Determine OUTPUT years for the Zarr array dimensions.
+    // If output.years is explicitly set, use that (for multi-VM parallel processing).
+    // Otherwise, derive from filter.years or input data.
+    let output_years: Vec<i32> = if let Some(ref explicit_years) = config.output.years {
+        let mut y = explicit_years.clone();
+        y.sort();
+        y
+    } else {
+        // Fall back to filter years or input data years
+        match &config.filter {
+            Some(f) if f.years.as_ref().map_or(false, |y| !y.is_empty()) => {
+                let mut y = f.years.clone().unwrap();
+                y.sort();
+                y
+            }
+            _ => input_index.unique_years(), // All years in input data (already sorted)
+        }
+    };
+
+    if output_years.is_empty() {
+        anyhow::bail!("No years for output - check output.years, filter.years, or input data");
+    }
+
+    // Years to actually process (for filtering work items)
+    // This may be a subset of output_years when using multi-VM parallel processing
+    let process_years: Vec<i32> = match &config.filter {
         Some(f) if f.years.as_ref().map_or(false, |y| !y.is_empty()) => {
             let mut y = f.years.clone().unwrap();
             y.sort();
             y
         }
-        _ => input_index.unique_years(), // All years in input data (already sorted)
+        _ => output_years.clone(), // Process all output years if no filter
     };
-
-    if years.is_empty() {
-        anyhow::bail!("No years to process - check filter configuration or input data");
-    }
 
     let input_index = Arc::new(input_index);
 
     tracing::info!(
-        "Processing bounds: [{:.4}, {:.4}, {:.4}, {:.4}], years: {:?}",
+        "Output array years: {:?}, processing years: {:?}",
+        output_years,
+        process_years
+    );
+    tracing::info!(
+        "Processing bounds: [{:.4}, {:.4}, {:.4}, {:.4}]",
         bounds[0],
         bounds[1],
         bounds[2],
-        bounds[3],
-        years
+        bounds[3]
     );
 
-    // Create output grid
+    // Create output grid with full output years (for multi-VM: this is the global array shape)
     // Use effective_chunk_shape which returns shard size when sharding is enabled
     let output_grid = Arc::new(OutputGrid::new(
         bounds,
         config.output.crs.clone(),
         config.output.resolution,
-        years,
+        output_years.clone(),
         config.output.num_bands,
         config.output.effective_chunk_shape(),
     )?);
@@ -209,9 +233,16 @@ pub async fn run_pipeline(config: Config) -> Result<PipelineStats> {
         Some(metrics.clone()),
     ));
 
-    // Collect chunks to process (pre-filter empty chunks)
+    // Build set of time indices to process (for multi-VM: subset of output years)
+    let process_time_indices: std::collections::HashSet<usize> = process_years
+        .iter()
+        .filter_map(|&year| output_grid.time_idx_for_year(year))
+        .collect();
+
+    // Collect chunks to process (pre-filter empty chunks and filter to process_years)
     let mut chunks: Vec<_> = output_grid
         .enumerate_chunks()
+        .filter(|chunk| process_time_indices.contains(&chunk.time_idx))
         .filter(|chunk| spatial_lookup.chunk_has_data(chunk))
         .collect();
 

@@ -84,6 +84,13 @@ pub struct OutputConfig {
     /// Compression level (0-22 for zstd)
     #[serde(default = "default_compression_level")]
     pub compression_level: i32,
+
+    /// Explicit years for the output array dimensions.
+    /// If specified, the Zarr array's time dimension will span these years,
+    /// independent of filter.years. This allows multiple VMs to write to
+    /// different time slices of the same output array.
+    #[serde(default)]
+    pub years: Option<Vec<i32>>,
 }
 
 impl OutputConfig {
@@ -204,6 +211,11 @@ pub struct CheckpointConfig {
     /// Checkpoint flush interval in seconds (default: 60)
     #[serde(default = "default_checkpoint_interval")]
     pub interval_secs: u64,
+
+    /// Optional prefix for checkpoint filename (e.g., "2020" for ".checkpoint.2020.json").
+    /// Used for multi-VM parallel processing where each VM processes a different year.
+    #[serde(default)]
+    pub prefix: Option<String>,
 }
 
 impl Default for CheckpointConfig {
@@ -211,6 +223,7 @@ impl Default for CheckpointConfig {
         Self {
             enabled: true,
             interval_secs: 60,
+            prefix: None,
         }
     }
 }
@@ -452,6 +465,7 @@ mod tests {
                 chunk_shape: ChunkShape::default(),
                 sharding: ShardingConfig::default(),
                 compression_level: 3,
+                years: None,
             },
             processing: ProcessingConfig::default(),
             filter: None,
@@ -477,6 +491,7 @@ mod tests {
                 chunk_shape: ChunkShape::default(),
                 sharding: ShardingConfig::default(),
                 compression_level: 3,
+                years: None,
             },
             processing: ProcessingConfig::default(),
             filter: None,
@@ -503,6 +518,7 @@ mod tests {
                 chunk_shape: ChunkShape::default(),
                 sharding: ShardingConfig::default(),
                 compression_level: 3,
+                years: None,
             },
             processing: ProcessingConfig::default(),
             filter: None,
@@ -532,6 +548,7 @@ mod tests {
                     shard_shape: [0, 16], // Invalid: zero rows
                 },
                 compression_level: 3,
+                years: None,
             },
             processing: ProcessingConfig::default(),
             filter: None,
@@ -568,6 +585,7 @@ mod tests {
                     shard_shape: [16, 16],
                 },
                 compression_level: 3,
+                years: None,
             },
             processing: ProcessingConfig::default(),
             filter: None,
