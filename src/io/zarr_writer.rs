@@ -165,7 +165,39 @@ impl ZarrWriter {
             serde_json::json!("pixel"),
         );
 
-        // Declare GeoZarr conventions compliance (geo-proj and spatial)
+        // geoemb: convention for geo-embeddings metadata
+        group_attributes.insert("geoemb:type".to_string(), serde_json::json!("pixel"));
+        group_attributes.insert(
+            "geoemb:dimensions".to_string(),
+            serde_json::json!(output_grid.num_bands),
+        );
+        group_attributes.insert(
+            "geoemb:model".to_string(),
+            serde_json::json!("https://developers.google.com/earth-engine/datasets/catalog/GOOGLE_SATELLITE_EMBEDDING_V1_ANNUAL"),
+        );
+        group_attributes.insert(
+            "geoemb:source_data".to_string(),
+            serde_json::json!("https://source.coop/tge-labs/aef/v1/annual/"),
+        );
+        group_attributes.insert("geoemb:data_type".to_string(), serde_json::json!("int8"));
+        // GSD in native CRS units (same as resolution in spatial:transform)
+        group_attributes.insert(
+            "geoemb:gsd".to_string(),
+            serde_json::json!(output_grid.resolution),
+        );
+        group_attributes.insert(
+            "geoemb:quantization".to_string(),
+            serde_json::json!({
+                "method": "signed_square",
+                "original_dtype": "float32",
+                "quantized_dtype": "int8",
+                "formula": "(x / 127.5) ** 2 * sign(x)",
+                "valid_range": [-127, 127],
+                "nodata": -128
+            }),
+        );
+
+        // Declare GeoZarr conventions compliance (geo-proj, spatial, and geoemb)
         group_attributes.insert(
             "zarr_conventions".to_string(),
             serde_json::json!([
@@ -182,6 +214,12 @@ impl ZarrWriter {
                     "description": "Spatial coordinate information",
                     "spec_url": "https://github.com/zarr-conventions/spatial/blob/v1/README.md",
                     "schema_url": "https://raw.githubusercontent.com/zarr-conventions/spatial/refs/tags/v1/schema.json"
+                },
+                {
+                    "uuid": "61c12cc5-0e28-4056-999a-480cf3fb7e4c",
+                    "name": "geoemb:",
+                    "description": "Geo-embeddings metadata for machine learning embeddings stored in Zarr",
+                    "spec_url": "https://github.com/geo-embeddings/embeddings-zarr-convention/tree/add-convention"
                 }
             ]),
         );
@@ -252,7 +290,7 @@ impl ZarrWriter {
         // Add dimension names
         builder.dimension_names(Some(vec![
             Some("time".to_string()),
-            Some("embedding".to_string()),
+            Some("band".to_string()),
             Some("y".to_string()),
             Some("x".to_string()),
         ]));
@@ -362,7 +400,7 @@ impl ZarrWriter {
     /// - `/x` - Float64 array of x-coordinates (column centers)
     /// - `/y` - Float64 array of y-coordinates (row centers)
     /// - `/time` - Int32 array of years
-    /// - `/embedding` - String array of embedding dimension names (A00, A01, ..., A63)
+    /// - `/band` - String array of band dimension names (A00, A01, ..., A63)
     ///
     /// Must be called from within block_in_place or spawn_blocking.
     fn create_coordinate_arrays(
@@ -421,28 +459,28 @@ impl ZarrWriter {
         time_array.store_metadata()?;
         time_array.store_chunk(&[0], &time_coords)?;
 
-        // Create embedding coordinate array (AEF convention: A00, A01, ..., A63)
-        let embedding_path = if path.is_empty() { "/embedding".to_string() } else { format!("/{}/embedding", path) };
-        let embedding_coords: Vec<String> = (0..output_grid.num_bands)
+        // Create band coordinate array (AEF convention: A00, A01, ..., A63)
+        let band_path = if path.is_empty() { "/band".to_string() } else { format!("/{}/band", path) };
+        let band_coords: Vec<String> = (0..output_grid.num_bands)
             .map(|i| format!("A{:02}", i))
             .collect();
-        let embedding_array = ArrayBuilder::new(
+        let band_array = ArrayBuilder::new(
             vec![output_grid.num_bands as u64],
             vec![output_grid.num_bands as u64], // Single chunk
             "string",
             "",
         )
-        .dimension_names(Some(vec![Some("embedding".to_string())]))
-        .build(zarr_store.clone(), &embedding_path)?;
-        embedding_array.store_metadata()?;
-        embedding_array.store_chunk(&[0], &embedding_coords)?;
+        .dimension_names(Some(vec![Some("band".to_string())]))
+        .build(zarr_store.clone(), &band_path)?;
+        band_array.store_metadata()?;
+        band_array.store_chunk(&[0], &band_coords)?;
 
         tracing::info!(
-            "Created coordinate arrays: x[{}], y[{}], time[{}], embedding[{}]",
+            "Created coordinate arrays: x[{}], y[{}], time[{}], band[{}]",
             x_coords.len(),
             y_coords.len(),
             time_coords.len(),
-            embedding_coords.len()
+            band_coords.len()
         );
 
         Ok(())
@@ -587,7 +625,7 @@ mod integration_tests {
         // GeoZarr zarr_conventions declaration
         let conventions = attrs.get("zarr_conventions").expect("zarr_conventions should exist");
         let conventions_arr = conventions.as_array().expect("zarr_conventions should be an array");
-        assert_eq!(conventions_arr.len(), 2, "should declare 2 conventions (geo-proj and spatial)");
+        assert_eq!(conventions_arr.len(), 3, "should declare 3 conventions (geo-proj, spatial, and geoemb)");
 
         // Verify geo-proj convention
         let proj_conv = &conventions_arr[0];
@@ -598,6 +636,30 @@ mod integration_tests {
         let spatial_conv = &conventions_arr[1];
         assert_eq!(spatial_conv.get("uuid").and_then(|v| v.as_str()), Some("689b58e2-cf7b-45e0-9fff-9cfc0883d6b4"));
         assert_eq!(spatial_conv.get("name").and_then(|v| v.as_str()), Some("spatial:"));
+
+        // Verify geoemb convention
+        let geoemb_conv = &conventions_arr[2];
+        assert_eq!(geoemb_conv.get("uuid").and_then(|v| v.as_str()), Some("61c12cc5-0e28-4056-999a-480cf3fb7e4c"));
+        assert_eq!(geoemb_conv.get("name").and_then(|v| v.as_str()), Some("geoemb:"));
+
+        // geoemb: attributes
+        assert_eq!(attrs.get("geoemb:type").and_then(|v| v.as_str()), Some("pixel"));
+        assert_eq!(attrs.get("geoemb:dimensions").and_then(|v| v.as_i64()), Some(4)); // test uses 4 bands
+        assert_eq!(attrs.get("geoemb:data_type").and_then(|v| v.as_str()), Some("int8"));
+        assert_eq!(attrs.get("geoemb:gsd").and_then(|v| v.as_f64()), Some(10.0)); // test uses resolution=10.0
+        assert!(attrs.get("geoemb:model").is_some(), "geoemb:model should exist");
+        assert!(attrs.get("geoemb:source_data").is_some(), "geoemb:source_data should exist");
+
+        // Verify geoemb:quantization object
+        let quantization = attrs.get("geoemb:quantization").expect("geoemb:quantization should exist");
+        assert_eq!(quantization.get("method").and_then(|v| v.as_str()), Some("signed_square"));
+        assert_eq!(quantization.get("original_dtype").and_then(|v| v.as_str()), Some("float32"));
+        assert_eq!(quantization.get("quantized_dtype").and_then(|v| v.as_str()), Some("int8"));
+        assert_eq!(quantization.get("nodata").and_then(|v| v.as_i64()), Some(-128));
+        let valid_range = quantization.get("valid_range").and_then(|v| v.as_array()).expect("valid_range should be an array");
+        assert_eq!(valid_range.len(), 2);
+        assert_eq!(valid_range[0].as_i64(), Some(-127));
+        assert_eq!(valid_range[1].as_i64(), Some(127));
     }
 
     #[tokio::test(flavor = "multi_thread")]
