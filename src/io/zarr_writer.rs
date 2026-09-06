@@ -1,6 +1,7 @@
 //! Zarr writing using zarrs sync API for parallel compression.
 
 use crate::config::Config;
+use crate::dtype::ChunkData;
 use crate::index::{OutputChunk, OutputGrid};
 use anyhow::Result;
 use futures::StreamExt;
@@ -8,7 +9,7 @@ use ndarray::Array4;
 use object_store::{ObjectStore, ObjectStoreExt};
 use std::sync::Arc;
 use zarrs::array::codec::bytes_to_bytes::zstd::ZstdCodec;
-use zarrs::array::{Array, ArrayBuilder};
+use zarrs::array::{Array, ArrayBuilder, Element};
 use zarrs::group::GroupBuilder;
 use zarrs::storage::storage_adapter::async_to_sync::{AsyncToSyncBlockOn, AsyncToSyncStorageAdapter};
 use zarrs_object_store::AsyncObjectStore;
@@ -74,6 +75,9 @@ impl ZarrWriter {
         config: &Config,
         resume: bool,
     ) -> Result<Self> {
+        // Resolve the dataset: drives array dtype, fill value, geoemb metadata, band names.
+        let dataset = config.dataset()?;
+
         // Only delete existing data if not resuming
         if !resume {
             let embeddings_prefix = if path.is_empty() {
@@ -165,37 +169,10 @@ impl ZarrWriter {
             serde_json::json!("pixel"),
         );
 
-        // geoemb: convention for geo-embeddings metadata
-        group_attributes.insert("geoemb:type".to_string(), serde_json::json!("pixel"));
-        group_attributes.insert(
-            "geoemb:dimensions".to_string(),
-            serde_json::json!(output_grid.num_bands),
-        );
-        group_attributes.insert(
-            "geoemb:model".to_string(),
-            serde_json::json!("https://developers.google.com/earth-engine/datasets/catalog/GOOGLE_SATELLITE_EMBEDDING_V1_ANNUAL"),
-        );
-        group_attributes.insert(
-            "geoemb:source_data".to_string(),
-            serde_json::json!("https://source.coop/tge-labs/aef/v1/annual/"),
-        );
-        group_attributes.insert("geoemb:data_type".to_string(), serde_json::json!("int8"));
-        // GSD in native CRS units (same as resolution in spatial:transform)
-        group_attributes.insert(
-            "geoemb:gsd".to_string(),
-            serde_json::json!(output_grid.resolution),
-        );
-        group_attributes.insert(
-            "geoemb:quantization".to_string(),
-            serde_json::json!({
-                "method": "signed_square",
-                "original_dtype": "float32",
-                "quantized_dtype": "int8",
-                "formula": "(x / 127.5) ** 2 * sign(x)",
-                "valid_range": [-127, 127],
-                "nodata": -128
-            }),
-        );
+        // geoemb: convention for geo-embeddings metadata (dataset-specific).
+        for (key, value) in dataset.geoemb_attributes(output_grid.num_bands, output_grid.resolution) {
+            group_attributes.insert(key, value);
+        }
 
         // Declare GeoZarr conventions compliance (geo-proj, spatial, and geoemb)
         group_attributes.insert(
@@ -236,9 +213,6 @@ impl ZarrWriter {
         // Build the array - zarrs requires paths to start with /
         let array_path = if path.is_empty() { "/embeddings".to_string() } else { format!("/{}/embeddings", path) };
 
-        // Use -128 as fill value to match AEF COG nodata convention
-        const NODATA: i8 = -128;
-
         // When sharding is enabled:
         // - chunk_grid = shard size (chunk_shape * shard_shape)
         // - subchunk_shape = chunk size (chunk_shape)
@@ -262,12 +236,17 @@ impl ZarrWriter {
             ]
         };
 
-        let mut builder = ArrayBuilder::new(
-            vec![shape[0] as u64, shape[1] as u64, shape[2] as u64, shape[3] as u64],
-            chunk_grid.clone(),
-            "int8",  // Data type as string
-            NODATA,  // Fill value matches AEF COG nodata
-        );
+        // Data type + fill value come from the dataset:
+        // int8 uses -128 (AEF nodata); float32 uses NaN.
+        let array_shape = vec![shape[0] as u64, shape[1] as u64, shape[2] as u64, shape[3] as u64];
+        let mut builder = match dataset.data_type() {
+            crate::dtype::DataType::Int8 => {
+                ArrayBuilder::new(array_shape, chunk_grid.clone(), "int8", -128i8)
+            }
+            crate::dtype::DataType::Float32 => {
+                ArrayBuilder::new(array_shape, chunk_grid.clone(), "float32", f32::NAN)
+            }
+        };
 
         // Configure sharding if enabled
         if sharding.enabled {
@@ -306,11 +285,13 @@ impl ZarrWriter {
 
         // Create coordinate arrays for xarray compatibility
         // Use block_in_place for sync zarrs API calls
+        let band_names = dataset.band_names(output_grid.num_bands);
         tokio::task::block_in_place(|| {
             Self::create_coordinate_arrays(
                 &zarr_store,
                 &path,
                 &output_grid,
+                &band_names,
             )
         })?;
 
@@ -337,6 +318,35 @@ impl ZarrWriter {
     ///
     /// Chunks are always full-sized because OutputGrid rounds dimensions up to chunk boundaries.
     pub fn write_chunk_sync(&self, chunk: &OutputChunk, data: Array4<i8>) -> Result<()> {
+        let chunk_indices = self.checked_chunk_indices(chunk, data.shape());
+        // Pass slice directly to avoid copy (data should be contiguous)
+        let chunk_data = data.as_slice().expect("chunk data should be contiguous");
+        self.store_chunk_slice(&chunk_indices, chunk_data)
+    }
+
+    /// Write a float32 chunk to the Zarr array synchronously.
+    ///
+    /// Float32 counterpart of [`write_chunk_sync`](Self::write_chunk_sync); the same
+    /// `block_in_place` calling convention applies.
+    pub fn write_chunk_f32(&self, chunk: &OutputChunk, data: Array4<f32>) -> Result<()> {
+        let chunk_indices = self.checked_chunk_indices(chunk, data.shape());
+        let chunk_data = data.as_slice().expect("chunk data should be contiguous");
+        self.store_chunk_slice(&chunk_indices, chunk_data)
+    }
+
+    /// Write a chunk of either supported element type, dispatching on the [`ChunkData`]
+    /// variant. This is the entry point used by the pipeline write stage.
+    pub fn write_chunk_dyn(&self, chunk: &OutputChunk, data: ChunkData) -> Result<()> {
+        match data {
+            ChunkData::Int8(a) => self.write_chunk_sync(chunk, a),
+            ChunkData::Float32(a) => self.write_chunk_f32(chunk, a),
+        }
+    }
+
+    /// Compute the Zarr chunk indices for an output chunk and verify the data is
+    /// full-sized (OutputGrid guarantees this by rounding dimensions up to chunk
+    /// boundaries).
+    fn checked_chunk_indices(&self, chunk: &OutputChunk, shape: &[usize]) -> [u64; 4] {
         let indices = chunk.chunk_indices();
         let chunk_indices: [u64; 4] = [
             indices[0] as u64,
@@ -345,11 +355,9 @@ impl ZarrWriter {
             indices[3] as u64,
         ];
 
-        let shape = data.shape();
         let chunk_shape = &self.output_grid.chunk_shape;
         let expected_shape = [1, chunk_shape.embedding, chunk_shape.height, chunk_shape.width];
 
-        // Verify chunk is full-sized (OutputGrid guarantees this by rounding up dimensions)
         debug_assert_eq!(
             shape,
             expected_shape.as_slice(),
@@ -357,21 +365,17 @@ impl ZarrWriter {
             shape, expected_shape
         );
 
-        tracing::debug!(
-            "Writing chunk {:?}: shape={:?}",
-            chunk_indices, shape
-        );
+        tracing::debug!("Writing chunk {:?}: shape={:?}", chunk_indices, shape);
 
-        // Pass slice directly to avoid copy (data should be contiguous)
-        let chunk_data = data.as_slice().expect("chunk data should be contiguous");
+        chunk_indices
+    }
 
+    /// Store a contiguous slice of chunk elements at the given chunk indices.
+    fn store_chunk_slice<T: Element>(&self, chunk_indices: &[u64; 4], data: &[T]) -> Result<()> {
         self.array
-            .store_chunk(&chunk_indices, chunk_data)
+            .store_chunk(chunk_indices, data)
             .map_err(|e| {
-                tracing::error!(
-                    "Chunk {:?} write failed: {:?}. Data shape: {:?}",
-                    chunk_indices, e, shape
-                );
+                tracing::error!("Chunk {:?} write failed: {:?}", chunk_indices, e);
                 anyhow::anyhow!("Failed to write chunk {:?}: {:?}", chunk_indices, e)
             })?;
 
@@ -400,13 +404,14 @@ impl ZarrWriter {
     /// - `/x` - Float64 array of x-coordinates (column centers)
     /// - `/y` - Float64 array of y-coordinates (row centers)
     /// - `/time` - Int32 array of years
-    /// - `/band` - String array of band dimension names (A00, A01, ..., A63)
+    /// - `/band` - String array of dataset-defined band dimension names
     ///
     /// Must be called from within block_in_place or spawn_blocking.
     fn create_coordinate_arrays(
         zarr_store: &Arc<SyncStore>,
         path: &str,
         output_grid: &OutputGrid,
+        band_names: &[String],
     ) -> Result<()> {
         // Compute coordinate values
         let x_coords: Vec<f64> = (0..output_grid.width)
@@ -459,11 +464,9 @@ impl ZarrWriter {
         time_array.store_metadata()?;
         time_array.store_chunk(&[0], &time_coords)?;
 
-        // Create band coordinate array (AEF convention: A00, A01, ..., A63)
+        // Create band coordinate array (dataset-defined band names).
         let band_path = if path.is_empty() { "/band".to_string() } else { format!("/{}/band", path) };
-        let band_coords: Vec<String> = (0..output_grid.num_bands)
-            .map(|i| format!("A{:02}", i))
-            .collect();
+        let band_coords: Vec<String> = band_names.to_vec();
         let band_array = ArrayBuilder::new(
             vec![output_grid.num_bands as u64],
             vec![output_grid.num_bands as u64], // Single chunk
@@ -514,6 +517,7 @@ mod integration_tests {
 
     fn create_test_config(chunk_shape: ChunkShape) -> Config {
         Config {
+            dataset: "aef".to_string(),
             input: crate::config::InputConfig {
                 index_path: "test".to_string(),
                 cog_bucket: "test".to_string(),
@@ -551,8 +555,8 @@ mod integration_tests {
             chunk_counts: [
                 1,
                 1,
-                (height + chunk_shape.height - 1) / chunk_shape.height,
-                (width + chunk_shape.width - 1) / chunk_shape.width,
+                height.div_ceil(chunk_shape.height),
+                width.div_ceil(chunk_shape.width),
             ],
         }
     }
@@ -749,6 +753,7 @@ mod production_test {
             width: 4,
         };
         let config = crate::config::Config {
+            dataset: "aef".to_string(),
             input: crate::config::InputConfig {
                 index_path: "test".to_string(),
                 cog_bucket: "test".to_string(),
@@ -849,6 +854,7 @@ mod production_test {
             width: 4,
         };
         let config = crate::config::Config {
+            dataset: "aef".to_string(),
             input: crate::config::InputConfig {
                 index_path: "test".to_string(),
                 cog_bucket: "test".to_string(),
@@ -955,6 +961,7 @@ mod concurrent_test {
             width: 4,
         };
         let config = crate::config::Config {
+            dataset: "aef".to_string(),
             input: crate::config::InputConfig {
                 index_path: "test".to_string(),
                 cog_bucket: "test".to_string(),

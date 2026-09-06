@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 fn create_test_config(chunk_shape: ChunkShape) -> Config {
     Config {
+        dataset: "aef".to_string(),
         input: InputConfig {
             index_path: "test".to_string(),
             cog_bucket: "test".to_string(),
@@ -310,7 +311,7 @@ async fn test_data_integrity() {
         "/embeddings",
     ).await.unwrap();
 
-    let read_data = array.async_retrieve_chunk_elements::<i8>(&[0, 0, 0, 0]).await.unwrap();
+    let read_data = array.async_retrieve_chunk::<Vec<i8>>(&[0, 0, 0, 0]).await.unwrap();
     println!("Read back {} elements", read_data.len());
 
     // Verify first and last values
@@ -323,9 +324,10 @@ async fn test_data_integrity() {
 /// Test 7: mosaic_tiles → write flow (exact production data path)
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mosaic_to_write_flow() {
+    use crate::dtype::PixelData;
     use crate::index::CogTile;
     use crate::io::{PixelWindow, WindowData};
-    use crate::transform::{mosaic_tiles, ReprojectConfig, Reprojector};
+    use crate::transform::{mosaic_tiles, ReprojectConfig};
 
     let test_dir = std::path::PathBuf::from("target/test-zarr-mosaic-flow");
     if test_dir.exists() {
@@ -360,13 +362,13 @@ async fn test_mosaic_to_write_flow() {
 
     let window_data = WindowData {
         tile: tile.clone(),
-        data: ndarray::Array3::from_elem((64, 256, 256), 42i8),
+        data: PixelData::Int8(ndarray::Array3::from_elem((64, 256, 256), 42i8)),
         window: PixelWindow::new(0, 0, 256, 256),
         bounds_native: [500000.0, 4000000.0, 502560.0, 4002560.0],
+        is_bottom_up: true,
     };
 
     // Run mosaic_tiles like production (this uses spawn_blocking internally in prod)
-    let reprojector = Reprojector::new("EPSG:32610"); // Same as tile CRS for simplicity
     let reproject_config = ReprojectConfig {
         target_crs: "EPSG:32610".to_string(),
         target_resolution: 10.0,
@@ -375,7 +377,7 @@ async fn test_mosaic_to_write_flow() {
         num_bands: 64,
     };
 
-    let mosaic_result = mosaic_tiles(&[window_data], &reprojector, &reproject_config);
+    let mosaic_result = mosaic_tiles(&[window_data], &reproject_config);
     println!("Mosaic result: {:?}", mosaic_result.as_ref().map(|a| a.shape()));
     let mosaic = mosaic_result.unwrap();
 
@@ -386,7 +388,7 @@ async fn test_mosaic_to_write_flow() {
     let chunk = OutputChunk { time_idx: 0, row_idx: 0, col_idx: 0 };
     let writer_clone = writer.clone();
     let write_result = tokio::task::spawn_blocking(move || {
-        writer_clone.write_chunk_sync(&chunk, mosaic)
+        writer_clone.write_chunk_dyn(&chunk, mosaic)
     }).await.unwrap();
     println!("Write result: {:?}", write_result);
     write_result.unwrap();
@@ -402,9 +404,10 @@ async fn test_mosaic_to_write_flow() {
 /// Test 8: Multiple mosaics written concurrently (like scheduler)
 #[tokio::test(flavor = "multi_thread")]
 async fn test_concurrent_mosaic_writes() {
+    use crate::dtype::PixelData;
     use crate::index::CogTile;
     use crate::io::{PixelWindow, WindowData};
-    use crate::transform::{mosaic_tiles, ReprojectConfig, Reprojector};
+    use crate::transform::{mosaic_tiles, ReprojectConfig};
 
     let test_dir = std::path::PathBuf::from("target/test-zarr-concurrent-mosaic");
     if test_dir.exists() {
@@ -451,14 +454,14 @@ async fn test_concurrent_mosaic_writes() {
 
                 let window_data = WindowData {
                     tile: tile.clone(),
-                    data: ndarray::Array3::from_elem((64, 128, 128), 42i8),
+                    data: PixelData::Int8(ndarray::Array3::from_elem((64, 128, 128), 42i8)),
                     window: PixelWindow::new(0, 0, 128, 128),
                     bounds_native: [500000.0, 4000000.0, 501280.0, 4001280.0],
+                    is_bottom_up: true,
                 };
 
                 // Mosaic in spawn_blocking like production
                 let mosaic = tokio::task::spawn_blocking(move || {
-                    let reprojector = Reprojector::new("EPSG:32610");
                     let reproject_config = ReprojectConfig {
                         target_crs: "EPSG:32610".to_string(),
                         target_resolution: 10.0,
@@ -466,7 +469,7 @@ async fn test_concurrent_mosaic_writes() {
                         target_shape: (128, 128),
                         num_bands: 64,
                     };
-                    mosaic_tiles(&[window_data], &reprojector, &reproject_config)
+                    mosaic_tiles(&[window_data], &reproject_config)
                 })
                 .await
                 .unwrap()
@@ -474,7 +477,7 @@ async fn test_concurrent_mosaic_writes() {
 
                 // Write like production using spawn_blocking for sync API
                 tokio::task::spawn_blocking(move || {
-                    w.write_chunk_sync(&chunk, mosaic)
+                    w.write_chunk_dyn(&chunk, mosaic)
                 }).await.unwrap()
             }
         })
@@ -1041,6 +1044,7 @@ async fn test_sharding_enabled() {
     });
 
     let config = Config {
+        dataset: "aef".to_string(),
         input: InputConfig {
             index_path: "test".to_string(),
             cog_bucket: "test".to_string(),

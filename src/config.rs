@@ -7,6 +7,11 @@ use tracing;
 /// Main configuration for the mosaic pipeline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    /// Which geo-embedding dataset to mosaic (e.g. "aef", "spheer"). Default: "aef".
+    /// Selects the element type, tile discovery, and output metadata.
+    #[serde(default = "default_dataset")]
+    pub dataset: String,
+
     /// Input configuration
     pub input: InputConfig,
 
@@ -348,8 +353,16 @@ impl Config {
         Ok(serde_yaml::to_string(self)?)
     }
 
+    /// Resolve the configured dataset into its [`EmbeddingDataset`] implementor.
+    pub fn dataset(&self) -> anyhow::Result<Box<dyn crate::dataset::EmbeddingDataset>> {
+        crate::dataset::dataset_from_name(&self.dataset)
+    }
+
     /// Validate the configuration.
     pub fn validate(&self) -> anyhow::Result<()> {
+        // Fail fast on an unknown dataset name.
+        let _ = self.dataset()?;
+
         // Validate output destination
         match (&self.output.local_path, &self.output.bucket, &self.output.prefix) {
             (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
@@ -366,6 +379,14 @@ impl Config {
         }
         if self.output.chunk_shape.embedding == 0 {
             anyhow::bail!("Embedding chunk size must be > 0");
+        }
+        if self.output.chunk_shape.embedding != self.output.num_bands {
+            anyhow::bail!(
+                "chunk_shape.embedding ({}) must equal num_bands ({}): the pipeline always \
+                 writes full-band chunks",
+                self.output.chunk_shape.embedding,
+                self.output.num_bands
+            );
         }
         if self.output.chunk_shape.height == 0 || self.output.chunk_shape.width == 0 {
             anyhow::bail!("Spatial chunk sizes must be > 0");
@@ -408,6 +429,7 @@ impl Config {
 }
 
 // Default value functions for serde
+fn default_dataset() -> String { "aef".to_string() }
 fn default_output_crs() -> String { "EPSG:4326".to_string() }
 /// Meters per degree at the equator (Earth's circumference / 360).
 const METERS_PER_DEGREE_AT_EQUATOR: f64 = 111_320.0;
@@ -451,6 +473,7 @@ mod tests {
     #[test]
     fn test_config_validation_s3() {
         let config = Config {
+            dataset: "aef".to_string(),
             input: InputConfig {
                 index_path: "s3://bucket/index.parquet".to_string(),
                 cog_bucket: "cog-bucket".to_string(),
@@ -477,6 +500,7 @@ mod tests {
     #[test]
     fn test_config_validation_local() {
         let config = Config {
+            dataset: "aef".to_string(),
             input: InputConfig {
                 index_path: "s3://bucket/index.parquet".to_string(),
                 cog_bucket: "cog-bucket".to_string(),
@@ -504,6 +528,7 @@ mod tests {
     fn test_config_validation_invalid() {
         // Both local_path and bucket set - should fail
         let config = Config {
+            dataset: "aef".to_string(),
             input: InputConfig {
                 index_path: "s3://bucket/index.parquet".to_string(),
                 cog_bucket: "cog-bucket".to_string(),
@@ -531,6 +556,7 @@ mod tests {
     fn test_sharding_validation_zero_shard_shape() {
         // Zero shard_shape when sharding enabled - should fail
         let config = Config {
+            dataset: "aef".to_string(),
             input: InputConfig {
                 index_path: "s3://bucket/index.parquet".to_string(),
                 cog_bucket: "cog-bucket".to_string(),
@@ -563,6 +589,7 @@ mod tests {
     fn test_sharding_disabled_allows_any_chunk_shape() {
         // Sharding disabled - any chunk shape is valid
         let config = Config {
+            dataset: "aef".to_string(),
             input: InputConfig {
                 index_path: "s3://bucket/index.parquet".to_string(),
                 cog_bucket: "cog-bucket".to_string(),

@@ -4,7 +4,13 @@
 //! (destination → source) to sample from overlapping input tiles. Each block
 //! maintains its own local accumulator, eliminating the need for atomic operations.
 //! Mean computation uses ndarray's vectorized Zip operations.
+//!
+//! The inner loop is generic over [`Sample`] (the pixel element type), so a single
+//! code path serves both int8 (AEF) and float32 (Spheer) datasets. Source
+//! orientation (bottom-up vs top-down) is honored per tile so top-down COGs are not
+//! vertically flipped.
 
+use crate::dtype::{ChunkData, DataType, Sample};
 use crate::io::WindowData;
 use crate::transform::ReprojectConfig;
 use anyhow::Result;
@@ -15,9 +21,6 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Instant;
-
-/// Nodata value for AEF embeddings (int8).
-const NODATA: i8 = -128;
 
 /// Block size for parallel processing.
 /// Each output block is processed independently with its own accumulator.
@@ -55,10 +58,17 @@ fn get_cached_proj(target_crs: &str, source_crs: &str) -> Option<Rc<Proj>> {
     })
 }
 
-/// Pre-computed tile info with bounds in target CRS.
-struct TileInfo<'a> {
-    window: &'a WindowData,
-    /// Bounds in target CRS [min_x, min_y, max_x, max_y]
+/// Pre-computed tile info with bounds in target CRS and a typed data view.
+struct TileInfo<'a, S: Sample> {
+    /// Decoded pixel data (bands, height, width) in the source element type.
+    data: &'a Array3<S>,
+    /// Bounds in the tile's native CRS [min_x, min_y, max_x, max_y].
+    bounds_native: [f64; 4],
+    /// The tile's native CRS.
+    crs: &'a str,
+    /// Whether the source is stored bottom-up (row 0 = south).
+    is_bottom_up: bool,
+    /// Bounds in target CRS [min_x, min_y, max_x, max_y].
     bounds_target: [f64; 4],
 }
 
@@ -153,6 +163,11 @@ impl InverseGridCell {
 }
 
 /// Build an inverse grid for mapping output block pixels to source tile pixels.
+///
+/// `is_bottom_up` selects the source-row convention: bottom-up (AEF) puts row 0 at
+/// the southern edge (min_y); top-down (standard COGs, Spheer) puts row 0 at the
+/// northern edge (max_y).
+#[allow(clippy::too_many_arguments)]
 fn build_inverse_grid(
     block_row_start: usize,
     block_col_start: usize,
@@ -163,6 +178,7 @@ fn build_inverse_grid(
     source_bounds: &[f64; 4],
     src_height: usize,
     src_width: usize,
+    is_bottom_up: bool,
     inv_proj: &Proj,
 ) -> Vec<InverseGridCell> {
     let target_min_x = target_bounds[0];
@@ -172,6 +188,7 @@ fn build_inverse_grid(
     let src_pixel_y = (source_bounds[3] - source_bounds[1]) / src_height as f64;
     let src_min_x = source_bounds[0];
     let src_min_y = source_bounds[1];
+    let src_max_y = source_bounds[3];
 
     let mut cells = Vec::new();
 
@@ -202,7 +219,13 @@ fn build_inverse_grid(
                 match inv_proj.convert((world_x, world_y)) {
                     Ok((src_world_x, src_world_y)) => {
                         let src_col_f = (src_world_x - src_min_x) / src_pixel_x - 0.5;
-                        let src_row_f = (src_world_y - src_min_y) / src_pixel_y - 0.5;
+                        let src_row_f = if is_bottom_up {
+                            // Row 0 at min_y (south), rows increase northward (AEF).
+                            (src_world_y - src_min_y) / src_pixel_y - 0.5
+                        } else {
+                            // Row 0 at max_y (north), rows increase southward (standard COGs).
+                            (src_max_y - src_world_y) / src_pixel_y - 0.5
+                        };
                         src_corners[i] = (src_col_f, src_row_f);
                     }
                     Err(_) => {
@@ -229,31 +252,39 @@ fn build_inverse_grid(
     cells
 }
 
-/// Local block accumulator using ndarray.
-struct BlockAccumulator {
-    sum: Array3<i32>,
+/// Local block accumulator, generic over the pixel element type.
+struct BlockAccumulator<S: Sample> {
+    sum: Array3<S::Acc>,
     count: Array2<u16>,
     bands: usize,
 }
 
-impl BlockAccumulator {
+impl<S: Sample> BlockAccumulator<S> {
     fn new(bands: usize, height: usize, width: usize) -> Self {
         Self {
-            sum: Array3::zeros((bands, height, width)),
+            sum: Array3::from_elem((bands, height, width), S::ACC_ZERO),
             count: Array2::zeros((height, width)),
             bands,
         }
     }
 
     #[inline]
-    fn accumulate(&mut self, data: &Array3<i8>, src_row: usize, src_col: usize, out_row: usize, out_col: usize) {
+    fn accumulate(
+        &mut self,
+        data: &Array3<S>,
+        src_row: usize,
+        src_col: usize,
+        out_row: usize,
+        out_col: usize,
+    ) {
         let mut has_data = false;
 
         for b in 0..self.bands {
             let val = data[[b, src_row, src_col]];
-            if val != NODATA {
+            if val.is_valid() {
                 has_data = true;
-                self.sum[[b, out_row, out_col]] += val as i32;
+                self.sum[[b, out_row, out_col]] =
+                    S::accumulate(self.sum[[b, out_row, out_col]], val);
             }
         }
 
@@ -262,9 +293,9 @@ impl BlockAccumulator {
         }
     }
 
-    fn finalize(self) -> Array3<i8> {
+    fn finalize(self) -> Array3<S> {
         let (bands, height, width) = self.sum.dim();
-        let mut result = Array3::<i8>::from_elem((bands, height, width), NODATA);
+        let mut result = Array3::<S>::from_elem((bands, height, width), S::FILL);
 
         for b in 0..bands {
             let sum_band = self.sum.index_axis(Axis(0), b);
@@ -275,13 +306,7 @@ impl BlockAccumulator {
                 .and(&self.count)
                 .for_each(|r, &s, &c| {
                     if c > 0 {
-                        let c = c as i32;
-                        let half_c = c / 2;
-                        *r = if s >= 0 {
-                            ((s + half_c) / c) as i8
-                        } else {
-                            ((s - half_c) / c) as i8
-                        };
+                        *r = S::finalize(s, c as u32);
                     }
                 });
         }
@@ -292,17 +317,18 @@ impl BlockAccumulator {
 
 /// Process a single output block using inverse mapping.
 /// Only processes tiles that overlap this block's bounds.
-fn process_block(
+#[allow(clippy::too_many_arguments)]
+fn process_block<S: Sample>(
     block_row_start: usize,
     block_col_start: usize,
     block_height: usize,
     block_width: usize,
     block_bounds: &[f64; 4],
     bands: usize,
-    tiles: &[TileInfo],
+    tiles: &[TileInfo<S>],
     config: &ReprojectConfig,
-) -> Result<Array3<i8>> {
-    let mut accumulator = BlockAccumulator::new(bands, block_height, block_width);
+) -> Result<Array3<S>> {
+    let mut accumulator = BlockAccumulator::<S>::new(bands, block_height, block_width);
 
     // Only process tiles that intersect this block
     for tile_info in tiles {
@@ -311,11 +337,10 @@ fn process_block(
             continue;
         }
 
-        let window = tile_info.window;
-        let data = &window.data;
+        let data = tile_info.data;
         let (_, src_height, src_width) = data.dim();
-        let source_bounds = &window.bounds_native;
-        let source_crs = &window.tile.crs;
+        let source_bounds = &tile_info.bounds_native;
+        let source_crs = tile_info.crs;
 
         // Get cached inverse projection: target CRS → source CRS
         let inv_proj = match get_cached_proj(&config.target_crs, source_crs) {
@@ -323,8 +348,7 @@ fn process_block(
             None => continue,
         };
 
-        // Build the inverse grid for this tile
-        // Use &* to deref Rc<Proj> to &Proj
+        // Build the inverse grid for this tile (&Rc<Proj> coerces to &Proj)
         let grid = build_inverse_grid(
             block_row_start,
             block_col_start,
@@ -335,7 +359,8 @@ fn process_block(
             source_bounds,
             src_height,
             src_width,
-            &*inv_proj,
+            tile_info.is_bottom_up,
+            &inv_proj,
         );
 
         // Process each cell in the grid
@@ -389,40 +414,75 @@ fn compute_block_bounds(
     [min_x, min_y, max_x, max_y]
 }
 
-/// Mosaic multiple tile windows into a single output chunk using block-parallel inverse mapping.
+/// Mosaic multiple tile windows into a single output chunk.
+///
+/// Dispatches on the pixel element type of the input windows (all windows in a chunk
+/// share a dtype) and returns a typed [`ChunkData`]. If `windows` is empty, an
+/// all-fill int8 chunk is returned (the pipeline never sends empty window sets).
 pub fn mosaic_tiles(
     windows: &[WindowData],
-    _reprojector: &crate::transform::Reprojector,
     reproject_config: &ReprojectConfig,
-) -> Result<Array4<i8>> {
+) -> Result<ChunkData> {
+    let dtype = windows
+        .first()
+        .map(|w| w.data.data_type())
+        .unwrap_or(DataType::Int8);
+
+    match dtype {
+        DataType::Int8 => Ok(i8::into_chunk(mosaic_tiles_typed::<i8>(windows, reproject_config)?)),
+        DataType::Float32 => Ok(f32::into_chunk(mosaic_tiles_typed::<f32>(
+            windows,
+            reproject_config,
+        )?)),
+    }
+}
+
+/// Mosaic windows of a single known element type using block-parallel inverse mapping.
+#[allow(clippy::type_complexity)]
+fn mosaic_tiles_typed<S: Sample>(
+    windows: &[WindowData],
+    reproject_config: &ReprojectConfig,
+) -> Result<Array4<S>> {
     let (height, width) = reproject_config.target_shape;
     let bands = reproject_config.num_bands;
 
     if windows.is_empty() {
-        return Ok(Array4::from_elem((1, bands, height, width), NODATA));
+        return Ok(Array4::from_elem((1, bands, height, width), S::FILL));
     }
 
     let total_input_pixels: usize = windows
         .iter()
-        .map(|w| w.data.dim().1 * w.data.dim().2)
+        .map(|w| {
+            let (_, h, w2) = w.data.dim();
+            h * w2
+        })
         .sum();
     let output_pixels = height * width;
 
-    let num_block_rows = (height + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    let num_block_cols = (width + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    let num_block_rows = height.div_ceil(BLOCK_SIZE);
+    let num_block_cols = width.div_ceil(BLOCK_SIZE);
     let total_blocks = num_block_rows * num_block_cols;
 
-    // Pre-compute tile bounds in target CRS (once per tile, not per block)
+    // Pre-compute tile bounds in target CRS (once per tile, not per block) and a typed
+    // view of each window's data. Windows whose dtype does not match S are skipped
+    // (this should not happen since mosaic_tiles dispatches on the shared dtype).
     let prep_start = Instant::now();
-    let tiles: Vec<TileInfo> = windows
+    let tiles: Vec<TileInfo<S>> = windows
         .iter()
         .filter_map(|window| {
+            let data = S::extract(&window.data)?;
             let bounds_target = transform_tile_bounds(
                 &window.bounds_native,
                 &window.tile.crs,
                 &reproject_config.target_crs,
             )?;
-            Some(TileInfo { window, bounds_target })
+            Some(TileInfo {
+                data,
+                bounds_native: window.bounds_native,
+                crs: &window.tile.crs,
+                is_bottom_up: window.is_bottom_up,
+                bounds_target,
+            })
         })
         .collect();
     let prep_time = prep_start.elapsed();
@@ -461,10 +521,10 @@ pub fn mosaic_tiles(
         .collect();
 
     // Process blocks in parallel
-    let block_results: Vec<Result<((usize, usize, usize, usize), Array3<i8>)>> = blocks
+    let block_results: Vec<Result<((usize, usize, usize, usize), Array3<S>)>> = blocks
         .par_iter()
         .map(|&(row_start, col_start, block_height, block_width, ref block_bounds)| {
-            let block_data = process_block(
+            let block_data = process_block::<S>(
                 row_start,
                 col_start,
                 block_height,
@@ -482,7 +542,7 @@ pub fn mosaic_tiles(
 
     // Assemble blocks into final output
     let assemble_start = Instant::now();
-    let mut result = Array4::<i8>::from_elem((1, bands, height, width), NODATA);
+    let mut result = Array4::<S>::from_elem((1, bands, height, width), S::FILL);
 
     for block_result in block_results {
         let ((row_start, col_start, block_height, block_width), block_data) = block_result?;
@@ -542,7 +602,7 @@ mod tests {
 
     #[test]
     fn test_block_accumulator_single_pixel() {
-        let mut acc = BlockAccumulator::new(2, 4, 4);
+        let mut acc = BlockAccumulator::<i8>::new(2, 4, 4);
         let data = Array3::from_shape_vec((2, 2, 2), vec![10, 20, 30, 40, 50, 60, 70, 80])
             .unwrap();
 
@@ -555,7 +615,7 @@ mod tests {
 
     #[test]
     fn test_block_accumulator_mean() {
-        let mut acc = BlockAccumulator::new(1, 2, 2);
+        let mut acc = BlockAccumulator::<i8>::new(1, 2, 2);
 
         let data1 = Array3::from_shape_vec((1, 1, 1), vec![10]).unwrap();
         let data2 = Array3::from_shape_vec((1, 1, 1), vec![20]).unwrap();
@@ -569,12 +629,39 @@ mod tests {
 
     #[test]
     fn test_block_accumulator_nodata_skip() {
-        let mut acc = BlockAccumulator::new(2, 2, 2);
-        let data = Array3::from_shape_vec((2, 1, 1), vec![NODATA, NODATA]).unwrap();
+        let mut acc = BlockAccumulator::<i8>::new(2, 2, 2);
+        let data = Array3::from_shape_vec((2, 1, 1), vec![i8::FILL, i8::FILL]).unwrap();
 
         acc.accumulate(&data, 0, 0, 0, 0);
 
         assert_eq!(acc.count[[0, 0]], 0);
+    }
+
+    #[test]
+    fn test_block_accumulator_mean_f32() {
+        let mut acc = BlockAccumulator::<f32>::new(1, 1, 1);
+
+        let data1 = Array3::from_shape_vec((1, 1, 1), vec![10.0f32]).unwrap();
+        let data2 = Array3::from_shape_vec((1, 1, 1), vec![20.0f32]).unwrap();
+
+        acc.accumulate(&data1, 0, 0, 0, 0);
+        acc.accumulate(&data2, 0, 0, 0, 0);
+
+        let result = acc.finalize();
+        assert_eq!(result[[0, 0, 0]], 15.0);
+    }
+
+    #[test]
+    fn test_block_accumulator_nodata_f32() {
+        let mut acc = BlockAccumulator::<f32>::new(1, 1, 1);
+
+        // NaN input is nodata and must not contribute; an unfilled pixel finalizes to FILL (NaN).
+        let data = Array3::from_shape_vec((1, 1, 1), vec![f32::NAN]).unwrap();
+        acc.accumulate(&data, 0, 0, 0, 0);
+        assert_eq!(acc.count[[0, 0]], 0);
+
+        let result = acc.finalize();
+        assert!(result[[0, 0, 0]].is_nan());
     }
 
     #[test]
@@ -596,5 +683,30 @@ mod tests {
         let (x, y) = cell.interpolate(5, 5);
         assert!((x - 5.0).abs() < 0.01);
         assert!((y - 5.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_inverse_grid_top_down_vs_bottom_up() {
+        // A 1x1 degree source tile in EPSG:4326, 10 rows x 10 cols, 0.1 deg pixels.
+        // Identity projection (target == source CRS) isolates the orientation math.
+        let source_bounds = [0.0, 0.0, 1.0, 1.0];
+        let target_bounds = [0.0, 0.0, 1.0, 1.0];
+        let resolution = 0.1;
+        let inv_proj = Proj::new_known_crs("EPSG:4326", "EPSG:4326", None).unwrap();
+
+        // Output row 0 is the NORTH edge (world_y ≈ max_y - 0.05).
+        // Bottom-up source: north maps to a HIGH source row (near src_height).
+        let bu = build_inverse_grid(
+            0, 0, 10, 10, &target_bounds, resolution, &source_bounds, 10, 10, true, &inv_proj,
+        );
+        let bu_row0 = bu[0].interpolate(0, 0).1; // src_row for output (row0=north)
+        assert!(bu_row0 > 8.0, "bottom-up: north output row should map high, got {bu_row0}");
+
+        // Top-down source: north maps to a LOW source row (near 0).
+        let td = build_inverse_grid(
+            0, 0, 10, 10, &target_bounds, resolution, &source_bounds, 10, 10, false, &inv_proj,
+        );
+        let td_row0 = td[0].interpolate(0, 0).1;
+        assert!(td_row0 < 1.0, "top-down: north output row should map low, got {td_row0}");
     }
 }
