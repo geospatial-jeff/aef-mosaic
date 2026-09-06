@@ -208,6 +208,18 @@ impl InputIndex {
         Ok(Self { tiles, rtree })
     }
 
+    /// Build an index from an already-materialized set of tiles.
+    ///
+    /// Used by folder-scan discovery (e.g. Spheer), which reads each COG's header to
+    /// construct [`CogTile`]s rather than reading a precomputed parquet index.
+    pub fn from_tiles(tiles: Vec<CogTile>) -> Self {
+        let tiles: Vec<Arc<CogTile>> = tiles.into_iter().map(Arc::new).collect();
+        let rtree_tiles: Vec<ArcTile> = tiles.iter().map(|t| ArcTile(Arc::clone(t))).collect();
+        let rtree = RTree::bulk_load(rtree_tiles);
+        tracing::info!("Built index from {} scanned tiles", tiles.len());
+        Self { tiles, rtree }
+    }
+
     /// Extract tiles from a record batch.
     ///
     /// Memory-optimized: processes row-by-row and wraps in Arc immediately

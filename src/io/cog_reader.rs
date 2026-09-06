@@ -8,6 +8,7 @@
 //! 4. Assemble tiles into an array
 //! 5. Clip to the exact requested bounds
 
+use crate::dtype::{DataType, PixelData};
 use crate::index::CogTile;
 use crate::pipeline::Metrics;
 use anyhow::{Context, Result};
@@ -81,6 +82,35 @@ impl GeoTransform {
         })
     }
 
+    /// Build a GeoTransform from the ModelPixelScaleTag + ModelTiepointTag.
+    ///
+    /// This is the common GDAL/rasterio COG georeferencing (used by e.g. Spheer),
+    /// as opposed to a full ModelTransformationTag (used by AEF). The raster is
+    /// top-down, so the affine y-scale is negative.
+    ///
+    /// `pixel_scale` = `[scale_x, scale_y, scale_z]`; `tiepoint` = `[i, j, k, x, y, z]`
+    /// mapping pixel `(i, j)` to world `(x, y)`.
+    pub fn from_pixel_scale_tiepoint(pixel_scale: &[f64], tiepoint: &[f64]) -> Option<Self> {
+        if pixel_scale.len() < 2 || tiepoint.len() < 5 {
+            return None;
+        }
+        let scale_x = pixel_scale[0];
+        let scale_y = pixel_scale[1];
+        let (i, j) = (tiepoint[0], tiepoint[1]);
+        let (x, y) = (tiepoint[3], tiepoint[4]);
+        Some(Self {
+            a: scale_x,
+            b: 0.0,
+            // world x at pixel (0,0)
+            c: x - i * scale_x,
+            d: 0.0,
+            // negative scale_y => top-down (row 0 at max y)
+            e: -scale_y,
+            // world y at pixel (0,0): y + j*scale_y (since e = -scale_y and f = y - e*j)
+            f: y + j * scale_y,
+        })
+    }
+
     /// Convert world coordinates to pixel coordinates.
     ///
     /// Returns (column, row) as floating point for sub-pixel precision.
@@ -135,14 +165,34 @@ pub struct WindowData {
     /// The source tile metadata
     pub tile: CogTile,
 
-    /// Pixel data as int8 array: (bands, height, width)
-    pub data: Array3<i8>,
+    /// Pixel data as a typed array: (bands, height, width).
+    /// The element type (int8 / float32) matches the source COG.
+    pub data: PixelData,
 
     /// The pixel window that was read
     pub window: PixelWindow,
 
     /// Geographic bounds of this window in the tile's native CRS [min_x, min_y, max_x, max_y]
     pub bounds_native: [f64; 4],
+
+    /// Whether the source COG is stored bottom-up (row 0 = south, positive scale_y,
+    /// as in AEF) vs. standard top-down (row 0 = north). Drives the mosaic's
+    /// source-row indexing so top-down COGs are not vertically flipped.
+    pub is_bottom_up: bool,
+}
+
+/// Header metadata for a COG, used by folder-scan discovery to derive geometry and
+/// CRS without reading any pixel data.
+#[derive(Debug, Clone)]
+pub struct CogHeader {
+    /// Image width in pixels.
+    pub width: usize,
+    /// Image height in pixels.
+    pub height: usize,
+    /// Affine geotransform from the ModelTransformationTag, if present.
+    pub geo_transform: Option<GeoTransform>,
+    /// EPSG code from the GeoKeyDirectory (projected, else geographic), if present.
+    pub epsg: Option<u32>,
 }
 
 /// Cached TIFF metadata to avoid re-parsing headers on every read.
@@ -166,6 +216,8 @@ pub struct CachedTiff {
     tile_height: usize,
     /// Geotransform from ModelTransformationTag (if present)
     geo_transform: Option<GeoTransform>,
+    /// EPSG code from the GeoKeyDirectory (projected, else geographic), if present.
+    epsg: Option<u32>,
 }
 
 /// LRU cache for TIFF metadata with single-flight deduplication.
@@ -311,16 +363,28 @@ impl TiffMetadataCache {
         let tile_width = ifd.tile_width().unwrap_or(image_width as u32) as usize;
         let tile_height = ifd.tile_height().unwrap_or(image_height as u32) as usize;
 
-        // Extract geotransform from ModelTransformationTag.
-        // We use the geotransform as-is (even for bottom-up images like AEF COGs)
-        // because async-tiff reads using the TIFF's native row indexing.
+        // Extract geotransform. Prefer the full ModelTransformationTag (AEF, bottom-up);
+        // fall back to ModelPixelScaleTag + ModelTiepointTag (standard GDAL/rasterio COGs
+        // like Spheer, top-down). We use the transform as-is because async-tiff reads
+        // using the TIFF's native row indexing; orientation is carried via is_bottom_up.
         let geo_transform = ifd
             .model_transformation()
-            .and_then(GeoTransform::from_model_transformation);
+            .and_then(GeoTransform::from_model_transformation)
+            .or_else(|| match (ifd.model_pixel_scale(), ifd.model_tiepoint()) {
+                (Some(scale), Some(tie)) => GeoTransform::from_pixel_scale_tiepoint(scale, tie),
+                _ => None,
+            });
 
         if geo_transform.is_none() {
-            tracing::warn!("No ModelTransformationTag found in TIFF, pixel coordinate assumptions may be incorrect");
+            tracing::warn!("No geotransform (ModelTransformation or PixelScale+Tiepoint) found in TIFF, pixel coordinate assumptions may be incorrect");
         }
+
+        // Extract the EPSG code from the GeoKeyDirectory: prefer the projected CRS
+        // (e.g. UTM 32631 for Spheer), falling back to the geographic CRS.
+        let epsg = ifd
+            .geo_key_directory()
+            .and_then(|gkd| gkd.projected_type.or(gkd.geographic_type))
+            .map(|code| code as u32);
 
         Ok(Arc::new(CachedTiff {
             tiff: Arc::new(tiff),
@@ -332,6 +396,7 @@ impl TiffMetadataCache {
             tile_width,
             tile_height,
             geo_transform,
+            epsg,
         }))
     }
 
@@ -690,49 +755,100 @@ impl CogReader {
         let row_results = try_join_all(row_futures).await?;
         let fetched_tiles: Vec<_> = row_results.into_iter().flatten().collect();
 
-        // Step 4: Assemble tiles into a single array
-        let assembled_x = start_tile_x * tile_width;
-        let assembled_y = start_tile_y * tile_height;
-        let assembled_width = num_tiles_x * tile_width;
-        let assembled_height = num_tiles_y * tile_height;
+        // Source orientation drives the mosaic's row indexing (AEF is bottom-up,
+        // standard COGs like Spheer are top-down). Default to top-down if unknown.
+        let is_bottom_up = cached
+            .geo_transform
+            .map(|g| g.is_bottom_up())
+            .unwrap_or(false);
+
+        // Step 4/5: Assemble the internal tiles into one array and clip to the exact
+        // requested window, using the source COG's element type.
+        let geometry = AssembleGeometry {
+            start_tile_x,
+            start_tile_y,
+            end_tile_x,
+            end_tile_y,
+            tile_width,
+            tile_height,
+            image_width,
+            image_height,
+            bands,
+            is_planar,
+        };
+
+        let data = match detect_dtype(&fetched_tiles)? {
+            DataType::Int8 => {
+                PixelData::Int8(self.assemble_and_clip::<i8>(&fetched_tiles, &geometry, &window)?)
+            }
+            DataType::Float32 => {
+                PixelData::Float32(self.assemble_and_clip::<f32>(&fetched_tiles, &geometry, &window)?)
+            }
+        };
+
+        Ok(WindowData {
+            tile: tile.clone(),
+            data,
+            window,
+            bounds_native,
+            is_bottom_up,
+        })
+    }
+
+    /// Assemble the fetched internal tiles into a single contiguous array and clip it
+    /// to the exact requested window, in the destination element type `D`.
+    fn assemble_and_clip<D: TiffPixel>(
+        &self,
+        fetched_tiles: &[Arc<TileArray>],
+        geo: &AssembleGeometry,
+        window: &PixelWindow,
+    ) -> Result<Array3<D>> {
+        let assembled_x = geo.start_tile_x * geo.tile_width;
+        let assembled_y = geo.start_tile_y * geo.tile_height;
+        let num_tiles_x = geo.end_tile_x - geo.start_tile_x + 1;
+        let num_tiles_y = geo.end_tile_y - geo.start_tile_y + 1;
 
         // Clamp to image bounds (edge tiles may be smaller)
-        let assembled_width = assembled_width.min(image_width - assembled_x);
-        let assembled_height = assembled_height.min(image_height - assembled_y);
+        let assembled_width = (num_tiles_x * geo.tile_width).min(geo.image_width - assembled_x);
+        let assembled_height = (num_tiles_y * geo.tile_height).min(geo.image_height - assembled_y);
 
-        let mut assembled = Array3::<i8>::zeros((bands, assembled_height, assembled_width));
+        let mut assembled =
+            Array3::<D>::from_elem((geo.bands, assembled_height, assembled_width), D::default());
 
         let mut tile_idx = 0;
-        for ty in start_tile_y..=end_tile_y {
-            for tx in start_tile_x..=end_tile_x {
-                self.copy_tile_to_assembled(
-                    fetched_tiles[tile_idx].as_ref(),
+        for ty in geo.start_tile_y..=geo.end_tile_y {
+            for tx in geo.start_tile_x..=geo.end_tile_x {
+                let tile = fetched_tiles[tile_idx].as_ref();
+
+                // Position in output array (relative to start of assembled region)
+                let out_x = (tx - geo.start_tile_x) * geo.tile_width;
+                let out_y = (ty - geo.start_tile_y) * geo.tile_height;
+
+                // How many pixels to copy (may be less at edges)
+                let copy_width = tile.actual_width.min(assembled_width - out_x);
+                let copy_height = tile.actual_height.min(assembled_height - out_y);
+
+                D::copy_tile(
+                    tile,
                     &mut assembled,
-                    tx, ty,
-                    start_tile_x, start_tile_y,
-                    tile_width, tile_height,
-                    assembled_width, assembled_height,
-                    bands,
-                    is_planar,
+                    geo.bands,
+                    out_x,
+                    out_y,
+                    copy_width,
+                    copy_height,
+                    geo.is_planar,
                 )?;
                 tile_idx += 1;
             }
         }
 
-        // Step 5: Clip to the exact requested bounds
+        // Clip to the exact requested bounds
         let clip_x = window.x - assembled_x;
         let clip_y = window.y - assembled_y;
 
-        let clipped = assembled
+        Ok(assembled
             .slice(ndarray::s![.., clip_y..clip_y + window.height, clip_x..clip_x + window.width])
-            .to_owned();
-
-        Ok(WindowData {
-            tile: tile.clone(),
-            data: clipped,
-            window,
-            bounds_native,
-        })
+            .to_owned())
     }
 
     /// Fetch all tiles in a single row with request coalescing and single-flight deduplication.
@@ -974,111 +1090,38 @@ impl CogReader {
         Ok(decoded_tiles)
     }
 
-    /// Copy a decoded tile into the assembled array.
-    #[allow(clippy::too_many_arguments)]
-    fn copy_tile_to_assembled(
-        &self,
-        tile: &TileArray,
-        output: &mut Array3<i8>,
-        tx: usize,
-        ty: usize,
-        start_tx: usize,
-        start_ty: usize,
-        tile_width: usize,
-        tile_height: usize,
-        output_width: usize,
-        output_height: usize,
-        bands: usize,
-        is_planar: bool,
-    ) -> Result<()> {
-        let shape = tile.data.shape();
-
-        // Position in output array (relative to start of assembled region)
-        let out_x = (tx - start_tx) * tile_width;
-        let out_y = (ty - start_ty) * tile_height;
-
-        // How many pixels to copy (may be less at edges)
-        let copy_width = tile.actual_width.min(output_width - out_x);
-        let copy_height = tile.actual_height.min(output_height - out_y);
-
-        match tile.data.data() {
-            async_tiff::TypedArray::Int8(data) => {
-                self.copy_typed_data(
-                    data, output, bands, out_x, out_y, copy_width, copy_height,
-                    is_planar, shape, |v| v,
-                )?;
-            }
-            async_tiff::TypedArray::UInt8(data) => {
-                self.copy_typed_data(
-                    data, output, bands, out_x, out_y, copy_width, copy_height,
-                    is_planar, shape, |v| v as i8,
-                )?;
-            }
-            _ => anyhow::bail!("Unsupported data type: expected Int8 or UInt8"),
-        }
-        Ok(())
+    /// Read just the header metadata for a COG at the given path (an `s3://` URI or a
+    /// plain object-store key). Used by folder-scan discovery to derive geometry and
+    /// CRS without reading any pixel data. Uses the shared metadata cache.
+    pub async fn read_header(&self, s3_path: &str) -> Result<CogHeader> {
+        let object_path = Self::object_path_from_str(s3_path)?;
+        let path_str = object_path.to_string();
+        let cached = self
+            .metadata_cache
+            .get_or_load(&path_str, self.store.clone(), object_path)
+            .await?;
+        Ok(CogHeader {
+            width: cached.image_width,
+            height: cached.image_height,
+            geo_transform: cached.geo_transform,
+            epsg: cached.epsg,
+        })
     }
 
-    /// Generic copy function for typed data.
-    ///
-    /// Uses Rayon to parallelize over bands for improved throughput.
-    #[allow(clippy::too_many_arguments)]
-    fn copy_typed_data<T: Copy + Sync, F: Fn(T) -> i8 + Sync>(
-        &self,
-        data: &[T],
-        output: &mut Array3<i8>,
-        bands: usize,
-        out_x: usize,
-        out_y: usize,
-        copy_width: usize,
-        copy_height: usize,
-        is_planar: bool,
-        shape: [usize; 3],
-        convert: F,
-    ) -> Result<()> {
-        // Get raw slice for parallel writes - safe because each band writes to disjoint memory
-        let output_shape = output.dim();
-        let output_slice = output.as_slice_mut().expect("Array should be contiguous");
-        let out_height = output_shape.1;
-        let out_width = output_shape.2;
-
-        // Parallelize over bands using Rayon for significant speedup on 64-band data
-        (0..bands).into_par_iter().for_each(|b| {
-            for row in 0..copy_height {
-                for col in 0..copy_width {
-                    // Calculate source index based on layout
-                    let src_idx = if is_planar {
-                        // Planar: [bands, height, width]
-                        b * shape[1] * shape[2] + row * shape[2] + col
-                    } else {
-                        // Chunky: [height, width, bands]
-                        row * shape[1] * shape[2] + col * shape[2] + b
-                    };
-
-                    if src_idx < data.len() {
-                        // Output index: [band, row, col] in row-major order
-                        let out_idx = b * out_height * out_width + (out_y + row) * out_width + (out_x + col);
-                        // Safety: each band writes to its own disjoint slice of memory
-                        unsafe {
-                            let ptr = output_slice.as_ptr() as *mut i8;
-                            *ptr.add(out_idx) = convert(data[src_idx]);
-                        }
-                    }
-                }
-            }
-        });
-        Ok(())
-    }
-
-    /// Extract S3 path from tile.
+    /// Extract the object-store path for a tile.
     pub fn tile_path(&self, tile: &CogTile) -> Result<Path> {
+        Self::object_path_from_str(&tile.s3_path)
+    }
+
+    /// Parse an object-store [`Path`] from an `s3://bucket/key` URI or a plain key.
+    pub fn object_path_from_str(s3_path: &str) -> Result<Path> {
         // Handle both s3:// URIs and plain paths
-        let path_str = if tile.s3_path.starts_with("s3://") {
+        let path_str = if s3_path.starts_with("s3://") {
             // Extract key (path after bucket name)
-            let (_bucket, key) = super::parse_s3_uri(&tile.s3_path)?;
+            let (_bucket, key) = super::parse_s3_uri(s3_path)?;
             key
         } else {
-            &tile.s3_path
+            s3_path
         };
 
         Path::parse(path_str).with_context(|| format!("Invalid path: {}", path_str))
@@ -1097,6 +1140,156 @@ impl TileArray {
     fn size_bytes(&self) -> usize {
         self.data.data().as_ref().len() + std::mem::size_of::<Self>()
     }
+}
+
+/// Geometry describing how fetched internal TIFF tiles map into the assembled window.
+struct AssembleGeometry {
+    start_tile_x: usize,
+    start_tile_y: usize,
+    end_tile_x: usize,
+    end_tile_y: usize,
+    tile_width: usize,
+    tile_height: usize,
+    image_width: usize,
+    image_height: usize,
+    bands: usize,
+    is_planar: bool,
+}
+
+/// Determine the destination element type from the first decoded tile.
+///
+/// AEF stores Int8 (or UInt8); Spheer stores Float32. All tiles in a COG share a dtype.
+fn detect_dtype(tiles: &[Arc<TileArray>]) -> Result<DataType> {
+    let first = tiles
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("No tiles decoded for window"))?;
+    match first.data.data() {
+        async_tiff::TypedArray::Int8(_) | async_tiff::TypedArray::UInt8(_) => Ok(DataType::Int8),
+        async_tiff::TypedArray::Float32(_) => Ok(DataType::Float32),
+        _ => anyhow::bail!("Unsupported COG pixel data type (expected Int8, UInt8, or Float32)"),
+    }
+}
+
+/// A destination pixel element type that a decoded TIFF tile can be copied into.
+///
+/// Implemented for `i8` (AEF, accepting Int8/UInt8 source tiles) and `f32` (Spheer,
+/// accepting Float32 source tiles). The shared band-parallel copy lives in
+/// [`copy_typed_data`]; each impl only selects the source variant and conversion.
+trait TiffPixel: Copy + Default + Send + Sync + 'static {
+    #[allow(clippy::too_many_arguments)]
+    fn copy_tile(
+        tile: &TileArray,
+        output: &mut Array3<Self>,
+        bands: usize,
+        out_x: usize,
+        out_y: usize,
+        copy_width: usize,
+        copy_height: usize,
+        is_planar: bool,
+    ) -> Result<()>;
+}
+
+impl TiffPixel for i8 {
+    fn copy_tile(
+        tile: &TileArray,
+        output: &mut Array3<i8>,
+        bands: usize,
+        out_x: usize,
+        out_y: usize,
+        copy_width: usize,
+        copy_height: usize,
+        is_planar: bool,
+    ) -> Result<()> {
+        let shape = tile.data.shape();
+        match tile.data.data() {
+            async_tiff::TypedArray::Int8(data) => copy_typed_data(
+                data, output, bands, out_x, out_y, copy_width, copy_height, is_planar, shape, |v| v,
+            ),
+            async_tiff::TypedArray::UInt8(data) => copy_typed_data(
+                data, output, bands, out_x, out_y, copy_width, copy_height, is_planar, shape,
+                |v| v as i8,
+            ),
+            _ => anyhow::bail!("Expected Int8 or UInt8 tile data for an int8 dataset"),
+        }
+    }
+}
+
+impl TiffPixel for f32 {
+    fn copy_tile(
+        tile: &TileArray,
+        output: &mut Array3<f32>,
+        bands: usize,
+        out_x: usize,
+        out_y: usize,
+        copy_width: usize,
+        copy_height: usize,
+        is_planar: bool,
+    ) -> Result<()> {
+        let shape = tile.data.shape();
+        match tile.data.data() {
+            async_tiff::TypedArray::Float32(data) => copy_typed_data(
+                data, output, bands, out_x, out_y, copy_width, copy_height, is_planar, shape, |v| v,
+            ),
+            _ => anyhow::bail!("Expected Float32 tile data for a float32 dataset"),
+        }
+    }
+}
+
+/// Band-parallel copy of a decoded tile's pixels into the assembled destination array.
+///
+/// Handles both planar `(bands, height, width)` and chunky `(height, width, bands)`
+/// source layouts. Uses Rayon over bands; each band writes to a disjoint region.
+#[allow(clippy::too_many_arguments)]
+fn copy_typed_data<T, D, F>(
+    data: &[T],
+    output: &mut Array3<D>,
+    bands: usize,
+    out_x: usize,
+    out_y: usize,
+    copy_width: usize,
+    copy_height: usize,
+    is_planar: bool,
+    shape: [usize; 3],
+    convert: F,
+) -> Result<()>
+where
+    T: Copy + Sync,
+    D: Copy + Send + Sync,
+    F: Fn(T) -> D + Sync,
+{
+    // Get raw slice for parallel writes - safe because each band writes to disjoint memory
+    let output_shape = output.dim();
+    let output_slice = output.as_slice_mut().expect("Array should be contiguous");
+    let out_height = output_shape.1;
+    let out_width = output_shape.2;
+
+    // Parallelize over bands using Rayon for significant speedup on many-band data
+    (0..bands).into_par_iter().for_each(|b| {
+        for row in 0..copy_height {
+            for col in 0..copy_width {
+                // Calculate source index based on layout
+                let src_idx = if is_planar {
+                    // Planar: [bands, height, width]
+                    b * shape[1] * shape[2] + row * shape[2] + col
+                } else {
+                    // Chunky: [height, width, bands]
+                    row * shape[1] * shape[2] + col * shape[2] + b
+                };
+
+                if src_idx < data.len() {
+                    // Output index: [band, row, col] in row-major order
+                    let out_idx =
+                        b * out_height * out_width + (out_y + row) * out_width + (out_x + col);
+                    // Safety: each band writes to its own disjoint slice of memory
+                    unsafe {
+                        let ptr = output_slice.as_ptr() as *mut D;
+                        *ptr.add(out_idx) = convert(data[src_idx]);
+                    }
+                }
+            }
+        }
+    });
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1171,7 +1364,6 @@ mod tests {
 
     #[test]
     fn test_copy_planar_data() {
-        let reader = make_reader();
         let bands = 2;
         let copy_h = 2;
         let copy_w = 3;
@@ -1185,7 +1377,7 @@ mod tests {
         let mut output = Array3::<i8>::zeros((bands, copy_h, copy_w));
         let shape = [bands, copy_h, copy_w];
 
-        reader.copy_typed_data(
+        copy_typed_data(
             &data, &mut output, bands,
             0, 0,  // out_x, out_y
             copy_w, copy_h,
@@ -1203,7 +1395,6 @@ mod tests {
 
     #[test]
     fn test_copy_chunky_data() {
-        let reader = make_reader();
         let bands = 2;
         let copy_h = 2;
         let copy_w = 3;
@@ -1217,7 +1408,7 @@ mod tests {
         let mut output = Array3::<i8>::zeros((bands, copy_h, copy_w));
         let shape = [copy_h, copy_w, bands];
 
-        reader.copy_typed_data(
+        copy_typed_data(
             &data, &mut output, bands,
             0, 0,
             copy_w, copy_h,
@@ -1234,14 +1425,13 @@ mod tests {
 
     #[test]
     fn test_copy_with_offset() {
-        let reader = make_reader();
         let bands = 1;
 
         let data: Vec<i8> = vec![1, 2, 3, 4];
         let mut output = Array3::<i8>::zeros((bands, 4, 4));
         let shape = [bands, 2, 2];
 
-        reader.copy_typed_data(
+        copy_typed_data(
             &data, &mut output, bands,
             2, 2,  // offset into output
             2, 2,  // copy size
@@ -1301,6 +1491,36 @@ mod tests {
     fn test_geotransform_from_model_transformation_too_short() {
         let matrix: [f64; 4] = [10.0, 0.0, 0.0, 500000.0];
         assert!(GeoTransform::from_model_transformation(&matrix).is_none());
+    }
+
+    #[test]
+    fn test_geotransform_from_pixel_scale_tiepoint() {
+        // Standard top-down COG: 10m pixels, top-left origin at (500000, 4259840).
+        let pixel_scale = [10.0, 10.0, 0.0];
+        let tiepoint = [0.0, 0.0, 0.0, 500000.0, 4259840.0, 0.0];
+        let gt = GeoTransform::from_pixel_scale_tiepoint(&pixel_scale, &tiepoint).unwrap();
+
+        assert_eq!(gt.a, 10.0);
+        assert_eq!(gt.e, -10.0); // negative = top-down
+        assert_eq!(gt.c, 500000.0);
+        assert_eq!(gt.f, 4259840.0);
+        assert!(!gt.is_bottom_up());
+
+        // Pixel (0,0) maps to the top-left world coordinate.
+        let (col, row) = gt.world_to_pixel(500000.0, 4259840.0);
+        assert!(col.abs() < 1e-6);
+        assert!(row.abs() < 1e-6);
+
+        // 100m east, 50m south -> pixel (10, 5).
+        let (col, row) = gt.world_to_pixel(500100.0, 4259790.0);
+        assert!((col - 10.0).abs() < 1e-6);
+        assert!((row - 5.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_geotransform_from_pixel_scale_tiepoint_too_short() {
+        assert!(GeoTransform::from_pixel_scale_tiepoint(&[10.0], &[0.0, 0.0, 0.0, 1.0, 2.0, 0.0]).is_none());
+        assert!(GeoTransform::from_pixel_scale_tiepoint(&[10.0, 10.0, 0.0], &[0.0, 0.0]).is_none());
     }
 
     #[test]
@@ -1459,13 +1679,15 @@ mod integration_tests {
 
         match result {
             Ok(data) => {
-                let shape = data.data.shape();
-                assert_eq!(shape[0], 64, "Expected 64 bands");
-                assert_eq!(shape[1], 1024, "Expected height 1024");
-                assert_eq!(shape[2], 1024, "Expected width 1024");
+                let (b, h, w) = data.data.dim();
+                assert_eq!(b, 64, "Expected 64 bands");
+                assert_eq!(h, 1024, "Expected height 1024");
+                assert_eq!(w, 1024, "Expected width 1024");
 
-                let nonzero = data.data.iter().filter(|&&v| v != 0 && v != -128).count();
-                println!("Window shape: {:?}, non-zero pixels: {}", shape, nonzero);
+                if let PixelData::Int8(arr) = &data.data {
+                    let nonzero = arr.iter().filter(|&&v| v != 0 && v != -128).count();
+                    println!("Window shape: {:?}, non-zero pixels: {}", (b, h, w), nonzero);
+                }
             }
             Err(e) => {
                 if !e.to_string().contains("timeout") {
@@ -1491,11 +1713,11 @@ mod integration_tests {
 
         match result {
             Ok(data) => {
-                let shape = data.data.shape();
-                assert_eq!(shape[0], 64);
-                assert_eq!(shape[1], 256);
-                assert_eq!(shape[2], 256);
-                println!("Small window read successfully: {:?}", shape);
+                let (b, h, w) = data.data.dim();
+                assert_eq!(b, 64);
+                assert_eq!(h, 256);
+                assert_eq!(w, 256);
+                println!("Small window read successfully: {:?}", (b, h, w));
             }
             Err(e) => {
                 if !e.to_string().contains("timeout") {

@@ -314,6 +314,7 @@ mod tests {
 
     fn test_config() -> Config {
         Config {
+            dataset: "aef".to_string(),
             input: InputConfig {
                 index_path: "test".to_string(),
                 cog_bucket: "test".to_string(),
