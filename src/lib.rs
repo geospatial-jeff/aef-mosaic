@@ -1,7 +1,8 @@
-//! AEF Mosaic Pipeline
+//! Geo-embeddings Mosaic Pipeline
 //!
-//! High-performance pipeline to mosaic 235K+ AEF COG files into a contiguous Zarr array,
-//! targeting 25-30+ GB/s throughput on a single EC2 node.
+//! High-performance pipeline to mosaic large collections of geo-embedding COG files
+//! (e.g. AEF, Spheer) into a contiguous Zarr array, targeting 25-30+ GB/s throughput
+//! on a single EC2 node.
 //!
 //! # Architecture
 //!
@@ -9,13 +10,14 @@
 //!
 //! - **Index**: Tile index management with R-tree spatial queries
 //! - **I/O**: Async COG reading and Zarr writing using object_store
-//! - **Transform**: UTM→WGS84 reprojection and mean mosaicing
+//! - **Transform**: reprojection and mean mosaicing
 //! - **Pipeline**: Concurrent chunk processing with metrics
+//! - **Dataset**: Per-dataset behavior (dtype, discovery, metadata) behind a shared core
 //!
 //! # Usage
 //!
 //! ```no_run
-//! use aef_mosaic::{Config, run_pipeline};
+//! use geoembeddings_mosaic::{Config, run_pipeline};
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
@@ -28,13 +30,22 @@
 pub mod checkpoint;
 pub mod config;
 pub mod crs;
+pub mod dataset;
+pub mod discovery;
+pub mod dtype;
 pub mod index;
 pub mod io;
 pub mod pipeline;
 pub mod transform;
 
+#[cfg(test)]
+mod spheer_tests;
+
 pub use checkpoint::CheckpointManager;
 pub use config::{CheckpointConfig, Config, FilterConfig};
+pub use dataset::{DiscoveryMethod, EmbeddingDataset};
+pub use discovery::build_input_index;
+pub use dtype::{ChunkData, DataType, PixelData, Sample};
 pub use index::{InputIndex, OutputGrid, SpatialLookup};
 pub use io::{CogReader, ZarrWriter};
 pub use pipeline::{Metrics, MetricsReporter, Pipeline, PipelineConfig, PipelineStats};
@@ -60,23 +71,22 @@ pub async fn run_pipeline(config: Config) -> Result<PipelineStats> {
     let config = Arc::new(config);
 
     // Initialize tracing
-    tracing::info!("Starting AEF Mosaic Pipeline");
+    tracing::info!("Starting Geo-embeddings Mosaic Pipeline");
     tracing::info!("Configuration loaded");
 
     // Create object stores
     let cog_store = io::create_cog_store(&config)?;
     let output_store = io::create_output_store(&config)?;
 
-    // Load input index (reuse cog_store if loading from same bucket)
-    tracing::info!("Loading tile index from {}", config.input.index_path);
-    let input_index = if config.input.index_path.starts_with("s3://") {
-        let (_bucket, key) = io::parse_s3_uri(&config.input.index_path)?;
-        // Reuse the cog_store instead of creating a new connection pool
-        let path = object_store::path::Path::from(key);
-        InputIndex::from_s3(cog_store.clone(), &path).await?
-    } else {
-        InputIndex::from_local_parquet(&config.input.index_path)?
-    };
+    // Resolve the dataset and discover input tiles (parquet index or COG folder scan).
+    let dataset = config.dataset()?;
+    tracing::info!(
+        "Dataset: {}, discovering tiles from {}",
+        dataset.name(),
+        config.input.index_path
+    );
+    let input_index =
+        discovery::build_input_index(dataset.as_ref(), config.as_ref(), cog_store.clone()).await?;
 
     tracing::info!("Loaded {} tiles", input_index.len());
 

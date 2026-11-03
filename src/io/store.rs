@@ -24,8 +24,9 @@ pub fn parse_s3_uri(uri: &str) -> Result<(&str, &str)> {
         .with_context(|| format!("Invalid S3 URI: expected 's3://bucket/key' format in '{}'", uri))
 }
 use object_store::aws::AmazonS3Builder;
+use object_store::http::HttpBuilder;
 use object_store::local::LocalFileSystem;
-use object_store::{ClientOptions, ObjectStore};
+use object_store::{ClientOptions, HeaderMap, HeaderValue, ObjectStore};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -108,9 +109,45 @@ fn create_authenticated_store(bucket: &str, pool_size: usize) -> Result<Arc<dyn 
     Ok(Arc::new(builder.build()?))
 }
 
-/// Create a store for reading input COG tiles (anonymous, no credentials).
+/// Create an authenticated HTTP store for a gated HuggingFace dataset repo.
+///
+/// `repo` is `owner/name` (e.g. `spheer/spheer-fm-embeddings`); reads resolve to
+/// `https://huggingface.co/datasets/<repo>/resolve/main/<key>` with a bearer token.
+/// HF 302-redirects LFS files to a signed CDN URL; the HTTP client follows the
+/// redirect and (per cross-host policy) drops the Authorization header there, which is
+/// exactly what the signed CDN URL expects. Range requests are supported end to end.
+pub fn create_hf_store(repo: &str, token: &str, pool_size: usize) -> Result<Arc<dyn ObjectStore>> {
+    let url = format!("https://huggingface.co/datasets/{}/resolve/main", repo);
+    tracing::info!("Creating HuggingFace HTTP store for repo: {} (pool_size={})", repo, pool_size);
+
+    let mut headers = HeaderMap::new();
+    let value = HeaderValue::from_str(&format!("Bearer {}", token))
+        .context("Invalid HF token: cannot form Authorization header")?;
+    headers.insert("authorization", value);
+
+    let options = create_client_options(pool_size).with_default_headers(headers);
+
+    let store = HttpBuilder::new()
+        .with_url(url)
+        .with_client_options(options)
+        .build()
+        .context("Failed to build HuggingFace HTTP store")?;
+    Ok(Arc::new(store))
+}
+
+/// Create a store for reading input COG tiles.
+///
+/// - `hf://owner/name` -> authenticated HuggingFace HTTP store (token from `HF_TOKEN`).
+/// - otherwise -> anonymous S3 store on the given bucket (e.g. source.coop for AEF).
 pub fn create_cog_store(config: &crate::config::Config) -> Result<Arc<dyn ObjectStore>> {
-    create_anonymous_store(&config.input.cog_bucket, config.processing.max_concurrent_http)
+    let bucket = &config.input.cog_bucket;
+    if let Some(repo) = bucket.strip_prefix("hf://") {
+        let token = std::env::var("HF_TOKEN")
+            .context("HF_TOKEN environment variable must be set for hf:// COG buckets")?;
+        create_hf_store(repo, &token, config.processing.max_concurrent_http)
+    } else {
+        create_anonymous_store(bucket, config.processing.max_concurrent_http)
+    }
 }
 
 /// Create a store for writing output Zarr (authenticated).

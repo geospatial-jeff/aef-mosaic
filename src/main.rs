@@ -1,17 +1,17 @@
-//! AEF Mosaic Pipeline CLI
+//! Geo-embeddings Mosaic Pipeline CLI
 //!
-//! High-performance pipeline to mosaic AEF COG files into Zarr arrays.
+//! High-performance pipeline to mosaic geo-embedding COG files (AEF, Spheer) into Zarr arrays.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-use aef_mosaic::{run_pipeline, Config};
+use geoembeddings_mosaic::{run_pipeline, Config};
 
 #[derive(Parser)]
-#[command(name = "aef-mosaic")]
-#[command(about = "Mosaic AEF COG files into Zarr arrays", long_about = None)]
+#[command(name = "geoembeddings-mosaic")]
+#[command(about = "Mosaic geo-embedding COG files (AEF, Spheer) into Zarr arrays", long_about = None)]
 struct Cli {
     /// Path to configuration file
     #[arg(short, long, default_value = "config.yaml", global = true)]
@@ -125,19 +125,19 @@ fn analyze_work(config: &Config) -> Result<()> {
         .build()?;
 
     runtime.block_on(async {
-        use aef_mosaic::{io, InputIndex, OutputGrid, SpatialLookup};
+        use geoembeddings_mosaic::{discovery, io, OutputGrid, SpatialLookup};
         use std::sync::Arc;
 
-        // Load index
-        tracing::info!("Loading tile index from {}", config.input.index_path);
-        let input_index = if config.input.index_path.starts_with("s3://") {
-            let (bucket, key) = io::parse_s3_uri(&config.input.index_path)?;
-            let store = io::create_anonymous_store(bucket, config.processing.max_concurrent_http)?;
-            let path = object_store::path::Path::from(key);
-            InputIndex::from_s3(store, &path).await?
-        } else {
-            InputIndex::from_local_parquet(&config.input.index_path)?
-        };
+        // Resolve dataset and discover tiles (parquet index or COG folder scan).
+        let dataset = config.dataset()?;
+        let cog_store = io::create_cog_store(config)?;
+        tracing::info!(
+            "Dataset: {}, discovering tiles from {}",
+            dataset.name(),
+            config.input.index_path
+        );
+        let input_index =
+            discovery::build_input_index(dataset.as_ref(), config, cog_store).await?;
         tracing::info!("Loaded {} tiles", input_index.len());
 
         // Apply filter if specified
@@ -261,7 +261,12 @@ fn validate_command(config_path: PathBuf) -> Result<()> {
 
 fn generate_config_command(output: PathBuf) -> Result<()> {
     // Generate a commented YAML config
-    let yaml = r#"# AEF Mosaic Pipeline Configuration
+    let yaml = r#"# Geo-embeddings Mosaic Pipeline Configuration
+
+# Which geo-embedding dataset to mosaic:
+#   "aef"    - AlphaEarth Foundations (int8, parquet tile index, multi-UTM -> reprojected)
+#   "spheer" - Spheer FM Albatross (float32, folder scan of per-MGRS-tile COGs)
+dataset: aef
 
 # === INPUT: Where to read COG tiles from ===
 input:
@@ -334,6 +339,23 @@ processing:
 #
 #   # Years to process (empty or omit = all years)
 #   years: [2024]
+
+# === Example: Spheer (float32) configuration ===
+# dataset: spheer
+# input:
+#   # Prefix to scan for *.tif COGs (relative to the COG store root, or an s3:// URI)
+#   index_path: "albatross-EU-v2025/nl-tiles"
+#   cog_bucket: "your-bucket"
+# output:
+#   local_path: "/tmp/spheer-mosaic.zarr"
+#   crs: "EPSG:32631"        # native UTM zone (single-zone release: no reprojection needed)
+#   resolution: 10.0         # meters
+#   num_bands: 100
+#   chunk_shape:
+#     time: 1
+#     embedding: 100         # must equal num_bands
+#     height: 1024
+#     width: 1024
 "#;
 
     std::fs::write(&output, yaml)?;
@@ -349,20 +371,20 @@ mod tests {
     #[test]
     fn test_cli_parse_default() {
         // No subcommand - should default to Run
-        let cli = Cli::try_parse_from(["aef-mosaic"]);
+        let cli = Cli::try_parse_from(["geoembeddings-mosaic"]);
         assert!(cli.is_ok());
         assert!(cli.unwrap().command.is_none());
     }
 
     #[test]
     fn test_cli_parse_with_config() {
-        let cli = Cli::try_parse_from(["aef-mosaic", "-c", "other.yaml"]);
+        let cli = Cli::try_parse_from(["geoembeddings-mosaic", "-c", "other.yaml"]);
         assert!(cli.is_ok());
     }
 
     #[test]
     fn test_cli_parse_validate() {
-        let cli = Cli::try_parse_from(["aef-mosaic", "validate", "-c", "test.json"]);
+        let cli = Cli::try_parse_from(["geoembeddings-mosaic", "validate", "-c", "test.json"]);
         assert!(cli.is_ok());
     }
 }

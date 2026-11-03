@@ -1,0 +1,1047 @@
+use std::collections::HashMap;
+use std::ops::Range;
+use std::sync::Arc;
+
+use bytes::Bytes;
+use num_enum::TryFromPrimitive;
+
+use crate::error::{AsyncTiffError, AsyncTiffResult, TiffError};
+use crate::geo::{GeoKeyDirectory, GeoKeyTag};
+use crate::predictor::PredictorInfo;
+use crate::reader::{AsyncFileReader, Endianness};
+use crate::tag_value::TagValue;
+use crate::tags::{
+    Compression, PhotometricInterpretation, PlanarConfiguration, Predictor, ResolutionUnit,
+    SampleFormat, Tag,
+};
+use crate::tile::CompressedBytes;
+use crate::{DataType, Tile};
+
+const DOCUMENT_NAME: u16 = 269;
+
+/// An ImageFileDirectory representing Image content
+// The ordering of these tags matches the sorted order in TIFF spec Appendix A
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImageFileDirectory {
+    pub(crate) endianness: Endianness,
+
+    pub(crate) new_subfile_type: Option<u32>,
+
+    /// The number of columns in the image, i.e., the number of pixels per row.
+    pub(crate) image_width: u32,
+
+    /// The number of rows of pixels in the image.
+    pub(crate) image_height: u32,
+
+    pub(crate) bits_per_sample: Vec<u16>,
+
+    pub(crate) compression: Compression,
+
+    pub(crate) photometric_interpretation: PhotometricInterpretation,
+
+    pub(crate) document_name: Option<String>,
+
+    pub(crate) image_description: Option<String>,
+
+    pub(crate) strip_offsets: Option<Vec<u64>>,
+
+    pub(crate) orientation: Option<u16>,
+
+    /// The number of components per pixel.
+    ///
+    /// SamplesPerPixel is usually 1 for bilevel, grayscale, and palette-color images.
+    /// SamplesPerPixel is usually 3 for RGB images. If this value is higher, ExtraSamples should
+    /// give an indication of the meaning of the additional channels.
+    pub(crate) samples_per_pixel: u16,
+
+    pub(crate) rows_per_strip: Option<u32>,
+
+    pub(crate) strip_byte_counts: Option<Vec<u64>>,
+
+    pub(crate) min_sample_value: Option<Vec<u16>>,
+    pub(crate) max_sample_value: Option<Vec<u16>>,
+
+    /// The number of pixels per ResolutionUnit in the ImageWidth direction.
+    pub(crate) x_resolution: Option<f64>,
+
+    /// The number of pixels per ResolutionUnit in the ImageLength direction.
+    pub(crate) y_resolution: Option<f64>,
+
+    /// How the components of each pixel are stored.
+    ///
+    /// The specification defines these values:
+    ///
+    /// - Chunky format. The component values for each pixel are stored contiguously. For example,
+    ///   for RGB data, the data is stored as RGBRGBRGB
+    /// - Planar format. The components are stored in separate component planes. For example, RGB
+    ///   data is stored with the Red components in one component plane, the Green in another, and
+    ///   the Blue in another.
+    ///
+    /// The specification adds a warning that PlanarConfiguration=2 is not in widespread use and
+    /// that Baseline TIFF readers are not required to support it.
+    ///
+    /// If SamplesPerPixel is 1, PlanarConfiguration is irrelevant, and need not be included.
+    pub(crate) planar_configuration: PlanarConfiguration,
+
+    pub(crate) resolution_unit: Option<ResolutionUnit>,
+
+    /// Name and version number of the software package(s) used to create the image.
+    pub(crate) software: Option<String>,
+
+    /// Date and time of image creation.
+    ///
+    /// The format is: "YYYY:MM:DD HH:MM:SS", with hours like those on a 24-hour clock, and one
+    /// space character between the date and the time. The length of the string, including the
+    /// terminating NUL, is 20 bytes.
+    pub(crate) date_time: Option<String>,
+    pub(crate) artist: Option<String>,
+    pub(crate) host_computer: Option<String>,
+
+    pub(crate) predictor: Option<Predictor>,
+
+    /// A color map for palette color images.
+    ///
+    /// This field defines a Red-Green-Blue color map (often called a lookup table) for
+    /// palette-color images. In a palette-color image, a pixel value is used to index into an RGB
+    /// lookup table. For example, a palette-color pixel having a value of 0 would be displayed
+    /// according to the 0th Red, Green, Blue triplet.
+    ///
+    /// In a TIFF ColorMap, all the Red values come first, followed by the Green values, then the
+    /// Blue values. The number of values for each color is 2**BitsPerSample. Therefore, the
+    /// ColorMap field for an 8-bit palette-color image would have 3 * 256 values. The width of
+    /// each value is 16 bits, as implied by the type of SHORT. 0 represents the minimum intensity,
+    /// and 65535 represents the maximum intensity. Black is represented by 0,0,0, and white by
+    /// 65535, 65535, 65535.
+    ///
+    /// ColorMap must be included in all palette-color images.
+    ///
+    /// In Specification Supplement 1, support was added for ColorMaps containing other then RGB
+    /// values. This scheme includes the Indexed tag, with value 1, and a PhotometricInterpretation
+    /// different from PaletteColor then next denotes the colorspace of the ColorMap entries.
+    ///
+    /// <https://web.archive.org/web/20240329145324/https://www.awaresystems.be/imaging/tiff/tifftags/colormap.html>
+    pub(crate) color_map: Option<Arc<[u16]>>,
+
+    pub(crate) tile_width: Option<u32>,
+    pub(crate) tile_height: Option<u32>,
+
+    pub(crate) tile_offsets: Option<Vec<u64>>,
+    pub(crate) tile_byte_counts: Option<Vec<u64>>,
+
+    pub(crate) extra_samples: Option<Vec<u16>>,
+
+    pub(crate) sample_format: Vec<SampleFormat>,
+
+    pub(crate) jpeg_tables: Option<Bytes>,
+
+    pub(crate) copyright: Option<String>,
+
+    // Geospatial tags
+    pub(crate) geo_key_directory: Option<GeoKeyDirectory>,
+    pub(crate) model_pixel_scale: Option<Vec<f64>>,
+    pub(crate) model_tiepoint: Option<Vec<f64>>,
+    pub(crate) model_transformation: Option<Vec<f64>>,
+
+    // GDAL tags
+    pub(crate) gdal_nodata: Option<String>,
+    pub(crate) gdal_metadata: Option<String>,
+    pub(crate) other_tags: HashMap<Tag, TagValue>,
+}
+
+impl ImageFileDirectory {
+    /// Create a new ImageFileDirectory from tag data
+    pub fn from_tags(
+        tag_data: HashMap<Tag, TagValue>,
+        endianness: Endianness,
+    ) -> AsyncTiffResult<Self> {
+        let mut new_subfile_type = None;
+        let mut image_width = None;
+        let mut image_height = None;
+        let mut bits_per_sample = None;
+        let mut compression = None;
+        let mut photometric_interpretation = None;
+        let mut document_name = None;
+        let mut image_description = None;
+        let mut strip_offsets = None;
+        let mut orientation = None;
+        let mut samples_per_pixel = None;
+        let mut rows_per_strip = None;
+        let mut strip_byte_counts = None;
+        let mut min_sample_value = None;
+        let mut max_sample_value = None;
+        let mut x_resolution = None;
+        let mut y_resolution = None;
+        let mut planar_configuration = None;
+        let mut resolution_unit = None;
+        let mut software = None;
+        let mut date_time = None;
+        let mut artist = None;
+        let mut host_computer = None;
+        let mut predictor = None;
+        let mut color_map = None;
+        let mut tile_width = None;
+        let mut tile_height = None;
+        let mut tile_offsets = None;
+        let mut tile_byte_counts = None;
+        let mut extra_samples = None;
+        let mut sample_format = None;
+        let mut jpeg_tables = None;
+        let mut copyright = None;
+        let mut geo_key_directory_data = None;
+        let mut model_pixel_scale = None;
+        let mut model_tiepoint = None;
+        let mut model_transformation = None;
+        let mut geo_ascii_params: Option<String> = None;
+        let mut geo_double_params: Option<Vec<f64>> = None;
+        let mut gdal_nodata = None;
+        let mut gdal_metadata = None;
+
+        let mut other_tags = HashMap::new();
+
+        tag_data.into_iter().try_for_each(|(tag, value)| {
+            match tag {
+                Tag::NewSubfileType => new_subfile_type = Some(value.into_u32()?),
+                Tag::ImageWidth => image_width = Some(value.into_u32()?),
+                Tag::ImageLength => image_height = Some(value.into_u32()?),
+                Tag::BitsPerSample => bits_per_sample = Some(value.into_u16_vec()?),
+                Tag::Compression => {
+                    compression = Some(Compression::from_u16_exhaustive(value.into_u16()?))
+                }
+                Tag::PhotometricInterpretation => {
+                    photometric_interpretation =
+                        PhotometricInterpretation::from_u16(value.into_u16()?)
+                }
+                Tag::ImageDescription => image_description = Some(value.into_string()?),
+                Tag::StripOffsets => strip_offsets = Some(value.into_u64_vec()?),
+                Tag::Orientation => orientation = Some(value.into_u16()?),
+                Tag::SamplesPerPixel => samples_per_pixel = Some(value.into_u16()?),
+                Tag::RowsPerStrip => rows_per_strip = Some(value.into_u32()?),
+                Tag::StripByteCounts => strip_byte_counts = Some(value.into_u64_vec()?),
+                Tag::MinSampleValue => min_sample_value = Some(value.into_u16_vec()?),
+                Tag::MaxSampleValue => max_sample_value = Some(value.into_u16_vec()?),
+                Tag::XResolution => match value {
+                    TagValue::Rational(n, d) => x_resolution = Some(n as f64 / d as f64),
+                    _ => unreachable!("Expected rational type for XResolution."),
+                },
+                Tag::YResolution => match value {
+                    TagValue::Rational(n, d) => y_resolution = Some(n as f64 / d as f64),
+                    _ => unreachable!("Expected rational type for YResolution."),
+                },
+                Tag::PlanarConfiguration => {
+                    planar_configuration = PlanarConfiguration::from_u16(value.into_u16()?)
+                }
+                Tag::ResolutionUnit => {
+                    resolution_unit = ResolutionUnit::from_u16(value.into_u16()?)
+                }
+                Tag::Software => software = Some(value.into_string()?),
+                Tag::DateTime => date_time = Some(value.into_string()?),
+                Tag::Artist => artist = Some(value.into_string()?),
+                Tag::HostComputer => host_computer = Some(value.into_string()?),
+                Tag::Predictor => predictor = Predictor::from_u16(value.into_u16()?),
+                Tag::ColorMap => color_map = Some(Arc::from(value.into_u16_vec()?)),
+                Tag::TileWidth => tile_width = Some(value.into_u32()?),
+                Tag::TileLength => tile_height = Some(value.into_u32()?),
+                Tag::TileOffsets => tile_offsets = Some(value.into_u64_vec()?),
+                Tag::TileByteCounts => tile_byte_counts = Some(value.into_u64_vec()?),
+                Tag::ExtraSamples => extra_samples = Some(value.into_u16_vec()?),
+                Tag::SampleFormat => {
+                    let values = value.into_u16_vec()?;
+                    sample_format = Some(
+                        values
+                            .into_iter()
+                            .map(SampleFormat::from_u16_exhaustive)
+                            .collect(),
+                    );
+                }
+                Tag::JPEGTables => jpeg_tables = Some(value.into_u8_vec()?.into()),
+                Tag::Copyright => copyright = Some(value.into_string()?),
+
+                // Geospatial tags
+                // http://geotiff.maptools.org/spec/geotiff2.4.html
+                Tag::GeoKeyDirectory => geo_key_directory_data = Some(value.into_u16_vec()?),
+                Tag::ModelPixelScale => model_pixel_scale = Some(value.into_f64_vec()?),
+                Tag::ModelTiepoint => model_tiepoint = Some(value.into_f64_vec()?),
+                Tag::ModelTransformation => model_transformation = Some(value.into_f64_vec()?),
+                Tag::GeoAsciiParams => geo_ascii_params = Some(value.into_string()?),
+                Tag::GeoDoubleParams => geo_double_params = Some(value.into_f64_vec()?),
+                Tag::GdalNodata => gdal_nodata = Some(value.into_string()?),
+                Tag::GdalMetadata => gdal_metadata = Some(value.into_string()?),
+                // Tags for which the tiff crate doesn't have a hard-coded enum variant
+                Tag::Unknown(DOCUMENT_NAME) => document_name = Some(value.into_string()?),
+                _ => {
+                    other_tags.insert(tag, value);
+                }
+            };
+            Ok::<_, TiffError>(())
+        })?;
+
+        let mut geo_key_directory = None;
+
+        // We need to actually parse the GeoKeyDirectory after parsing all other tags because the
+        // GeoKeyDirectory relies on `GeoAsciiParamsTag` having been parsed.
+        if let Some(data) = geo_key_directory_data {
+            let mut chunks = data.chunks(4);
+
+            let header = chunks
+                .next()
+                .expect("If the geo key directory exists, a header should exist.");
+            let key_directory_version = header[0];
+            assert_eq!(key_directory_version, 1);
+
+            let key_revision = header[1];
+            assert_eq!(key_revision, 1);
+
+            let _key_minor_revision = header[2];
+            let number_of_keys = header[3];
+
+            let mut tags = HashMap::with_capacity(number_of_keys as usize);
+            for _ in 0..number_of_keys {
+                let chunk = chunks
+                    .next()
+                    .expect("There should be a chunk for each key.");
+
+                let key_id = chunk[0];
+                let tag_name = if let Ok(tag_name) = GeoKeyTag::try_from_primitive(key_id) {
+                    tag_name
+                } else {
+                    // Skip unknown GeoKeyTag ids. Some GeoTIFFs include keys that were proposed
+                    // but not included in the GeoTIFF spec. See
+                    // https://github.com/developmentseed/async-tiff/pull/131 and
+                    // https://github.com/virtual-zarr/virtual-tiff/issues/52
+                    continue;
+                };
+
+                let tag_location = chunk[1];
+                let count = chunk[2];
+                let value_offset = chunk[3];
+
+                if tag_location == 0 {
+                    tags.insert(tag_name, TagValue::Short(value_offset));
+                } else if Tag::from_u16_exhaustive(tag_location) == Tag::GeoAsciiParams {
+                    // If the tag_location points to the value of Tag::GeoAsciiParams, then we
+                    // need to extract a subslice from GeoAsciiParams
+
+                    let geo_ascii_params = geo_ascii_params
+                        .as_ref()
+                        .expect("GeoAsciiParamsTag exists but geo_ascii_params does not.");
+                    let value_offset = value_offset as usize;
+                    let mut s = &geo_ascii_params[value_offset..value_offset + count as usize];
+
+                    // It seems that this string subslice might always include the final |
+                    // character?
+                    if s.ends_with('|') {
+                        s = &s[0..s.len() - 1];
+                    }
+
+                    tags.insert(tag_name, TagValue::Ascii(s.to_string()));
+                } else if Tag::from_u16_exhaustive(tag_location) == Tag::GeoDoubleParams {
+                    // If the tag_location points to the value of Tag::GeoDoubleParams, then we
+                    // need to extract a subslice from GeoDoubleParams
+
+                    let geo_double_params = geo_double_params
+                        .as_ref()
+                        .expect("GeoDoubleParamsTag exists but geo_double_params does not.");
+                    let value_offset = value_offset as usize;
+                    let value = if count == 1 {
+                        TagValue::Double(geo_double_params[value_offset])
+                    } else {
+                        let x = geo_double_params[value_offset..value_offset + count as usize]
+                            .iter()
+                            .map(|val| TagValue::Double(*val))
+                            .collect();
+                        TagValue::List(x)
+                    };
+                    tags.insert(tag_name, value);
+                }
+            }
+            geo_key_directory = Some(GeoKeyDirectory::from_tags(tags)?);
+        }
+
+        let samples_per_pixel = samples_per_pixel.expect("samples_per_pixel not found");
+        let planar_configuration = if let Some(planar_configuration) = planar_configuration {
+            planar_configuration
+        } else if samples_per_pixel == 1 {
+            // If SamplesPerPixel is 1, PlanarConfiguration is irrelevant, and need not be included.
+            // https://web.archive.org/web/20240329145253/https://www.awaresystems.be/imaging/tiff/tifftags/planarconfiguration.html
+            PlanarConfiguration::Chunky
+        } else {
+            PlanarConfiguration::Chunky
+        };
+        Ok(Self {
+            endianness,
+            new_subfile_type,
+            image_width: image_width.expect("image_width not found"),
+            image_height: image_height.expect("image_height not found"),
+            bits_per_sample: bits_per_sample.expect("bits per sample not found"),
+            // Defaults to no compression
+            // https://web.archive.org/web/20240329145331/https://www.awaresystems.be/imaging/tiff/tifftags/compression.html
+            compression: compression.unwrap_or(Compression::None),
+            photometric_interpretation: photometric_interpretation
+                .expect("photometric interpretation not found"),
+            document_name,
+            image_description,
+            strip_offsets,
+            orientation,
+            samples_per_pixel,
+            rows_per_strip,
+            strip_byte_counts,
+            min_sample_value,
+            max_sample_value,
+            x_resolution,
+            y_resolution,
+            planar_configuration,
+            resolution_unit,
+            software,
+            date_time,
+            artist,
+            host_computer,
+            predictor,
+            color_map,
+            tile_width,
+            tile_height,
+            tile_offsets,
+            tile_byte_counts,
+            extra_samples,
+            // Uint8 is the default for SampleFormat
+            // https://web.archive.org/web/20240329145340/https://www.awaresystems.be/imaging/tiff/tifftags/sampleformat.html
+            sample_format: sample_format
+                .unwrap_or(vec![SampleFormat::Uint; samples_per_pixel as _]),
+            copyright,
+            jpeg_tables,
+            geo_key_directory,
+            model_pixel_scale,
+            model_tiepoint,
+            model_transformation,
+            gdal_nodata,
+            gdal_metadata,
+            other_tags,
+        })
+    }
+
+    /// A general indication of the kind of data contained in this subfile.
+    /// <https://web.archive.org/web/20240329145250/https://www.awaresystems.be/imaging/tiff/tifftags/newsubfiletype.html>
+    pub fn new_subfile_type(&self) -> Option<u32> {
+        self.new_subfile_type
+    }
+
+    /// The number of columns in the image, i.e., the number of pixels per row.
+    /// <https://web.archive.org/web/20240329145250/https://www.awaresystems.be/imaging/tiff/tifftags/imagewidth.html>
+    pub fn image_width(&self) -> u32 {
+        self.image_width
+    }
+
+    /// The number of rows of pixels in the image.
+    /// <https://web.archive.org/web/20240329145250/https://www.awaresystems.be/imaging/tiff/tifftags/imagelength.html>
+    pub fn image_height(&self) -> u32 {
+        self.image_height
+    }
+
+    /// Number of bits per component.
+    /// <https://web.archive.org/web/20240329145250/https://www.awaresystems.be/imaging/tiff/tifftags/bitspersample.html>
+    pub fn bits_per_sample(&self) -> &[u16] {
+        &self.bits_per_sample
+    }
+
+    /// Compression scheme used on the image data.
+    /// <https://web.archive.org/web/20240329145250/https://www.awaresystems.be/imaging/tiff/tifftags/compression.html>
+    pub fn compression(&self) -> Compression {
+        self.compression
+    }
+
+    /// The color space of the image data.
+    /// <https://web.archive.org/web/20240329145250/https://www.awaresystems.be/imaging/tiff/tifftags/photometricinterpretation.html>
+    pub fn photometric_interpretation(&self) -> PhotometricInterpretation {
+        self.photometric_interpretation
+    }
+
+    /// Document name.
+    pub fn document_name(&self) -> Option<&str> {
+        self.document_name.as_deref()
+    }
+
+    /// A string that describes the subject of the image.
+    /// <https://web.archive.org/web/20240329145250/https://www.awaresystems.be/imaging/tiff/tifftags/imagedescription.html>
+    pub fn image_description(&self) -> Option<&str> {
+        self.image_description.as_deref()
+    }
+
+    /// For each strip, the byte offset of that strip.
+    /// <https://web.archive.org/web/20240329145250/https://www.awaresystems.be/imaging/tiff/tifftags/stripoffsets.html>
+    pub fn strip_offsets(&self) -> Option<&[u64]> {
+        self.strip_offsets.as_deref()
+    }
+
+    /// The orientation of the image with respect to the rows and columns.
+    /// <https://web.archive.org/web/20240329145250/https://www.awaresystems.be/imaging/tiff/tifftags/orientation.html>
+    pub fn orientation(&self) -> Option<u16> {
+        self.orientation
+    }
+
+    /// The number of components per pixel.
+    ///
+    /// SamplesPerPixel is usually 1 for bilevel, grayscale, and palette-color images.
+    /// SamplesPerPixel is usually 3 for RGB images. If this value is higher, ExtraSamples should
+    /// give an indication of the meaning of the additional channels.
+    pub fn samples_per_pixel(&self) -> u16 {
+        self.samples_per_pixel
+    }
+
+    /// The number of rows per strip.
+    /// <https://web.archive.org/web/20240329145250/https://www.awaresystems.be/imaging/tiff/tifftags/rowsperstrip.html>
+    pub fn rows_per_strip(&self) -> Option<u32> {
+        self.rows_per_strip
+    }
+
+    /// For each strip, the number of bytes in the strip after compression.
+    /// <https://web.archive.org/web/20240329145250/https://www.awaresystems.be/imaging/tiff/tifftags/stripbytecounts.html>
+    pub fn strip_byte_counts(&self) -> Option<&[u64]> {
+        self.strip_byte_counts.as_deref()
+    }
+
+    /// The minimum component value used.
+    /// <https://web.archive.org/web/20240329145250/https://www.awaresystems.be/imaging/tiff/tifftags/minsamplevalue.html>
+    pub fn min_sample_value(&self) -> Option<&[u16]> {
+        self.min_sample_value.as_deref()
+    }
+
+    /// The maximum component value used.
+    /// <https://web.archive.org/web/20240329145250/https://www.awaresystems.be/imaging/tiff/tifftags/maxsamplevalue.html>
+    pub fn max_sample_value(&self) -> Option<&[u16]> {
+        self.max_sample_value.as_deref()
+    }
+
+    /// The number of pixels per ResolutionUnit in the ImageWidth direction.
+    /// <https://web.archive.org/web/20240329145250/https://www.awaresystems.be/imaging/tiff/tifftags/xresolution.html>
+    pub fn x_resolution(&self) -> Option<f64> {
+        self.x_resolution
+    }
+
+    /// The number of pixels per ResolutionUnit in the ImageLength direction.
+    /// <https://web.archive.org/web/20240329145250/https://www.awaresystems.be/imaging/tiff/tifftags/yresolution.html>
+    pub fn y_resolution(&self) -> Option<f64> {
+        self.y_resolution
+    }
+
+    /// How the components of each pixel are stored.
+    ///
+    /// The specification defines these values:
+    ///
+    /// - Chunky format. The component values for each pixel are stored contiguously. For example,
+    ///   for RGB data, the data is stored as RGBRGBRGB
+    /// - Planar format. The components are stored in separate component planes. For example, RGB
+    ///   data is stored with the Red components in one component plane, the Green in another, and
+    ///   the Blue in another.
+    ///
+    /// The specification adds a warning that PlanarConfiguration=2 is not in widespread use and
+    /// that Baseline TIFF readers are not required to support it.
+    ///
+    /// If SamplesPerPixel is 1, PlanarConfiguration is irrelevant, and need not be included.
+    ///
+    /// <https://web.archive.org/web/20240329145250/https://www.awaresystems.be/imaging/tiff/tifftags/planarconfiguration.html>
+    pub fn planar_configuration(&self) -> PlanarConfiguration {
+        self.planar_configuration
+    }
+
+    /// The unit of measurement for XResolution and YResolution.
+    /// <https://web.archive.org/web/20240329145250/https://www.awaresystems.be/imaging/tiff/tifftags/resolutionunit.html>
+    pub fn resolution_unit(&self) -> Option<ResolutionUnit> {
+        self.resolution_unit
+    }
+
+    /// Name and version number of the software package(s) used to create the image.
+    /// <https://web.archive.org/web/20240329145250/https://www.awaresystems.be/imaging/tiff/tifftags/software.html>
+    pub fn software(&self) -> Option<&str> {
+        self.software.as_deref()
+    }
+
+    /// Date and time of image creation.
+    ///
+    /// The format is: "YYYY:MM:DD HH:MM:SS", with hours like those on a 24-hour clock, and one
+    /// space character between the date and the time. The length of the string, including the
+    /// terminating NUL, is 20 bytes.
+    ///
+    /// <https://web.archive.org/web/20240329145250/https://www.awaresystems.be/imaging/tiff/tifftags/datetime.html>
+    pub fn date_time(&self) -> Option<&str> {
+        self.date_time.as_deref()
+    }
+
+    /// Person who created the image.
+    /// <https://web.archive.org/web/20240329145250/https://www.awaresystems.be/imaging/tiff/tifftags/artist.html>
+    pub fn artist(&self) -> Option<&str> {
+        self.artist.as_deref()
+    }
+
+    /// The computer and/or operating system in use at the time of image creation.
+    /// <https://web.archive.org/web/20240329145250/https://www.awaresystems.be/imaging/tiff/tifftags/hostcomputer.html>
+    pub fn host_computer(&self) -> Option<&str> {
+        self.host_computer.as_deref()
+    }
+
+    /// A mathematical operator that is applied to the image data before an encoding scheme is
+    /// applied.
+    /// <https://web.archive.org/web/20240329145250/https://www.awaresystems.be/imaging/tiff/tifftags/predictor.html>
+    pub fn predictor(&self) -> Option<Predictor> {
+        self.predictor
+    }
+
+    /// The tile width in pixels. This is the number of columns in each tile.
+    /// <https://web.archive.org/web/20240329145250/https://www.awaresystems.be/imaging/tiff/tifftags/tilewidth.html>
+    pub fn tile_width(&self) -> Option<u32> {
+        self.tile_width
+    }
+
+    /// The tile length (height) in pixels. This is the number of rows in each tile.
+    /// <https://web.archive.org/web/20240329145250/https://www.awaresystems.be/imaging/tiff/tifftags/tilelength.html>
+    pub fn tile_height(&self) -> Option<u32> {
+        self.tile_height
+    }
+
+    /// For each tile, the byte offset of that tile, as compressed and stored on disk.
+    /// <https://web.archive.org/web/20240329145250/https://www.awaresystems.be/imaging/tiff/tifftags/tileoffsets.html>
+    pub fn tile_offsets(&self) -> Option<&[u64]> {
+        self.tile_offsets.as_deref()
+    }
+
+    /// For each tile, the number of (compressed) bytes in that tile.
+    /// <https://web.archive.org/web/20240329145339/https://www.awaresystems.be/imaging/tiff/tifftags/tilebytecounts.html>
+    pub fn tile_byte_counts(&self) -> Option<&[u64]> {
+        self.tile_byte_counts.as_deref()
+    }
+
+    /// Description of extra components.
+    /// <https://web.archive.org/web/20240329145250/https://www.awaresystems.be/imaging/tiff/tifftags/extrasamples.html>
+    pub fn extra_samples(&self) -> Option<&[u16]> {
+        self.extra_samples.as_deref()
+    }
+
+    /// Specifies how to interpret each data sample in a pixel.
+    /// <https://web.archive.org/web/20240329145250/https://www.awaresystems.be/imaging/tiff/tifftags/sampleformat.html>
+    pub fn sample_format(&self) -> &[SampleFormat] {
+        &self.sample_format
+    }
+
+    /// JPEG quantization and/or Huffman tables.
+    /// <https://web.archive.org/web/20240329145250/https://www.awaresystems.be/imaging/tiff/tifftags/jpegtables.html>
+    pub fn jpeg_tables(&self) -> Option<&[u8]> {
+        self.jpeg_tables.as_deref()
+    }
+
+    /// Copyright notice.
+    /// <https://web.archive.org/web/20240329145250/https://www.awaresystems.be/imaging/tiff/tifftags/copyright.html>
+    pub fn copyright(&self) -> Option<&str> {
+        self.copyright.as_deref()
+    }
+
+    /// Geospatial tags
+    /// <https://web.archive.org/web/20240329145313/https://www.awaresystems.be/imaging/tiff/tifftags/geokeydirectorytag.html>
+    pub fn geo_key_directory(&self) -> Option<&GeoKeyDirectory> {
+        self.geo_key_directory.as_ref()
+    }
+
+    /// Used in interchangeable GeoTIFF files.
+    /// <https://web.archive.org/web/20240329145238/https://www.awaresystems.be/imaging/tiff/tifftags/modelpixelscaletag.html>
+    pub fn model_pixel_scale(&self) -> Option<&[f64]> {
+        self.model_pixel_scale.as_deref()
+    }
+
+    /// Used in interchangeable GeoTIFF files.
+    /// <https://web.archive.org/web/20240329145303/https://www.awaresystems.be/imaging/tiff/tifftags/modeltiepointtag.html>
+    pub fn model_tiepoint(&self) -> Option<&[f64]> {
+        self.model_tiepoint.as_deref()
+    }
+
+    /// Stores a full 4×4 affine transformation matrix that maps pixel/line coordinates directly
+    /// into model (map) coordinates.
+    pub fn model_transformation(&self) -> Option<&[f64]> {
+        self.model_transformation.as_deref()
+    }
+
+    /// GDAL NoData value
+    /// <https://gdal.org/en/stable/drivers/raster/gtiff.html#nodata-value>
+    pub fn gdal_nodata(&self) -> Option<&str> {
+        self.gdal_nodata.as_deref()
+    }
+
+    /// GDAL Metadata XML information
+    ///
+    /// Non standard metadata items are grouped together into a XML string stored in the non
+    /// standard `TIFFTAG_GDAL_METADATA` ASCII tag (code `42112`).
+    pub fn gdal_metadata(&self) -> Option<&str> {
+        self.gdal_metadata.as_deref()
+    }
+
+    /// Tags for which this crate doesn't have a hard-coded enum variant.
+    pub fn other_tags(&self) -> &HashMap<Tag, TagValue> {
+        &self.other_tags
+    }
+
+    /// A color map for palette color images.
+    ///
+    /// This field defines a Red-Green-Blue color map (often called a lookup table) for
+    /// palette-color images. In a palette-color image, a pixel value is used to index into an RGB
+    /// lookup table. For example, a palette-color pixel having a value of 0 would be displayed
+    /// according to the 0th Red, Green, Blue triplet.
+    ///
+    /// In a TIFF ColorMap, all the Red values come first, followed by the Green values, then the
+    /// Blue values. The number of values for each color is `2**BitsPerSample`. Therefore, the
+    /// ColorMap field for an 8-bit palette-color image would have `3 * 256` values. The width of
+    /// each value is 16 bits, as implied by the type of SHORT. 0 represents the minimum intensity,
+    /// and 65535 represents the maximum intensity. Black is represented by 0,0,0, and white by
+    /// 65535, 65535, 65535.
+    ///
+    /// ColorMap must be included in all palette-color images.
+    ///
+    /// <https://web.archive.org/web/20240329145324/https://www.awaresystems.be/imaging/tiff/tifftags/colormap.html>
+    pub fn colormap(&self) -> Option<&Arc<[u16]>> {
+        self.color_map.as_ref()
+    }
+
+    /// Get tile byte range for all bands in chunky configuration.
+    fn get_chunky_tile_byte_range(&self, x: usize, y: usize) -> Option<Range<u64>> {
+        let tile_offsets = self.tile_offsets.as_deref()?;
+        let tile_byte_counts = self.tile_byte_counts.as_deref()?;
+        let idx = (y * self.tile_count()?.0) + x;
+        let offset = tile_offsets[idx] as usize;
+        // TODO: aiocogeo has a -1 here, but I think that was in error
+        let byte_count = tile_byte_counts[idx] as usize;
+        Some(offset as _..(offset + byte_count) as _)
+    }
+
+    /// Get tile byte range for a specific band in planar configuration.
+    /// For planar TIFFs, tiles are organized as: all tiles for band 0, then all tiles for band 1, etc.
+    fn get_planar_tile_byte_range_for_band(
+        &self,
+        x: usize,
+        y: usize,
+        band: usize,
+    ) -> Option<Range<u64>> {
+        let tile_offsets = self.tile_offsets.as_deref()?;
+        let tile_byte_counts = self.tile_byte_counts.as_deref()?;
+        let (tiles_per_row, tiles_per_col) = self.tile_count()?;
+        let tiles_per_band = tiles_per_row * tiles_per_col;
+        let idx = (band * tiles_per_band) + (y * tiles_per_row) + x;
+        let offset = tile_offsets[idx] as usize;
+        let byte_count = tile_byte_counts[idx] as usize;
+        Some(offset as _..(offset + byte_count) as _)
+    }
+
+    /// Fetch the tile located at `x` column and `y` row using the provided reader.
+    ///
+    /// For planar configuration TIFFs, this automatically fetches all bands for the tile
+    /// at position (x, y) and combines them into a single Tile.
+    pub async fn fetch_tile(
+        &self,
+        x: usize,
+        y: usize,
+        reader: &dyn AsyncFileReader,
+    ) -> AsyncTiffResult<Tile> {
+        let data_type = DataType::from_tags(&self.sample_format, &self.bits_per_sample);
+        let lerc_parameters = self
+            .other_tags
+            .get(&Tag::LercParameters)
+            .and_then(|v| v.clone().into_u32_vec().ok());
+
+        let compressed_bytes = match self.planar_configuration {
+            PlanarConfiguration::Chunky => {
+                // For chunky format, fetch single tile
+                let range = self
+                    .get_chunky_tile_byte_range(x, y)
+                    .ok_or(AsyncTiffError::General("Not a tiled TIFF".to_string()))?;
+                let bytes = reader.get_bytes(range).await?;
+                CompressedBytes::Chunky(bytes)
+            }
+            PlanarConfiguration::Planar => {
+                // For planar format, fetch all bands separately
+                let num_bands = self.samples_per_pixel as usize;
+                let ranges = (0..num_bands)
+                    .map(|band| {
+                        self.get_planar_tile_byte_range_for_band(x, y, band)
+                            .ok_or(AsyncTiffError::General("Not a tiled TIFF".to_string()))
+                    })
+                    .collect::<AsyncTiffResult<Vec<_>>>()?;
+                let band_bytes = reader.get_byte_ranges(ranges).await?;
+                CompressedBytes::Planar(band_bytes)
+            }
+        };
+
+        Ok(Tile {
+            x,
+            y,
+            data_type,
+            width: self.tile_width.unwrap_or(self.image_width),
+            height: self.tile_height.unwrap_or(self.image_height),
+            planar_configuration: self.planar_configuration,
+            samples_per_pixel: self.samples_per_pixel,
+            predictor: self.predictor.unwrap_or(Predictor::None),
+            predictor_info: PredictorInfo::from_ifd(self),
+            compressed_bytes,
+            compression_method: self.compression,
+            photometric_interpretation: self.photometric_interpretation,
+            jpeg_tables: self.jpeg_tables.clone(),
+            lerc_parameters,
+        })
+    }
+
+    /// Fetch the tiles located at `x` column and `y` row using the provided reader.
+    pub async fn fetch_tiles(
+        &self,
+        xy: &[(usize, usize)],
+        reader: &dyn AsyncFileReader,
+    ) -> AsyncTiffResult<Vec<Tile>> {
+        let predictor_info = PredictorInfo::from_ifd(self);
+        let data_type = DataType::from_tags(&self.sample_format, &self.bits_per_sample);
+        let lerc_parameters = self
+            .other_tags
+            .get(&Tag::LercParameters)
+            .and_then(|v| v.clone().into_u32_vec().ok());
+
+        match self.planar_configuration {
+            PlanarConfiguration::Chunky => {
+                // For chunky format, fetch one tile per position
+                let byte_ranges = xy
+                    .iter()
+                    .map(|(x, y)| {
+                        self.get_chunky_tile_byte_range(*x, *y)
+                            .ok_or(AsyncTiffError::General("Not a tiled TIFF".to_string()))
+                    })
+                    .collect::<AsyncTiffResult<Vec<_>>>()?;
+
+                let buffers = reader.get_byte_ranges(byte_ranges).await?;
+
+                let mut tiles = vec![];
+                for (compressed_bytes, &(x, y)) in buffers.into_iter().zip(xy) {
+                    let tile = Tile {
+                        x,
+                        y,
+                        data_type,
+                        width: self.tile_width.unwrap_or(self.image_width),
+                        height: self.tile_height.unwrap_or(self.image_height),
+                        planar_configuration: self.planar_configuration,
+                        samples_per_pixel: self.samples_per_pixel,
+                        predictor: self.predictor.unwrap_or(Predictor::None),
+                        predictor_info,
+                        compressed_bytes: CompressedBytes::Chunky(compressed_bytes),
+                        compression_method: self.compression,
+                        photometric_interpretation: self.photometric_interpretation,
+                        jpeg_tables: self.jpeg_tables.clone(),
+                        lerc_parameters: lerc_parameters.clone(),
+                    };
+                    tiles.push(tile);
+                }
+                Ok(tiles)
+            }
+            PlanarConfiguration::Planar => {
+                // For planar format, fetch all bands for each tile position
+                let num_bands = self.samples_per_pixel as usize;
+                let mut all_ranges = Vec::with_capacity(xy.len() * num_bands);
+
+                for &(x, y) in xy {
+                    for band in 0..num_bands {
+                        let range = self
+                            .get_planar_tile_byte_range_for_band(x, y, band)
+                            .ok_or(AsyncTiffError::General("Not a tiled TIFF".to_string()))?;
+                        all_ranges.push(range);
+                    }
+                }
+
+                let all_buffers = reader.get_byte_ranges(all_ranges).await?;
+
+                let mut tiles = vec![];
+                for (i, &(x, y)) in xy.iter().enumerate() {
+                    let start = i * num_bands;
+                    let end = start + num_bands;
+                    // Note: this isn't doing a full copy of the buffers; it's just collecting the
+                    // existing Bytes references into a Vec
+                    let band_bytes = all_buffers[start..end].to_vec();
+
+                    let tile = Tile {
+                        x,
+                        y,
+                        data_type,
+                        width: self.tile_width.unwrap_or(self.image_width),
+                        height: self.tile_height.unwrap_or(self.image_height),
+                        planar_configuration: self.planar_configuration,
+                        samples_per_pixel: self.samples_per_pixel,
+                        predictor: self.predictor.unwrap_or(Predictor::None),
+                        predictor_info,
+                        compressed_bytes: CompressedBytes::Planar(band_bytes),
+                        compression_method: self.compression,
+                        photometric_interpretation: self.photometric_interpretation,
+                        jpeg_tables: self.jpeg_tables.clone(),
+                        lerc_parameters: lerc_parameters.clone(),
+                    };
+                    tiles.push(tile);
+                }
+                Ok(tiles)
+            }
+        }
+    }
+
+    /// Return the number of x/y tiles in the IFD
+    /// Returns `None` if this is not a tiled TIFF
+    pub fn tile_count(&self) -> Option<(usize, usize)> {
+        let x_count = (self.image_width as f64 / self.tile_width? as f64).ceil();
+        let y_count = (self.image_height as f64 / self.tile_height? as f64).ceil();
+        Some((x_count as usize, y_count as usize))
+    }
+}
+
+/// Calculate the actual pixel dimensions of a tile at position (x, y).
+///
+/// Edge tiles may be smaller than the nominal tile dimensions when the image
+/// dimensions are not exact multiples of the tile dimensions.
+///
+/// # Arguments
+/// * `x` - Tile column index (0-based)
+/// * `y` - Tile row index (0-based)
+/// * `image_width` - Total image width in pixels
+/// * `image_height` - Total image height in pixels
+/// * `tile_width` - Nominal tile width (None for stripped images)
+/// * `tile_height` - Nominal tile height (None for stripped images)
+/// * `rows_per_strip` - Rows per strip for stripped images (None for tiled images)
+///
+/// # Returns
+/// A tuple of (actual_width, actual_height) in pixels
+#[allow(dead_code)]
+// Note: this was originally implemented with the idea that the last tile (if unaligned) would be
+// this size, but apparently the end tile is still the same size as the others, just with padding.
+// Leaving this here in case it's useful later.
+pub(crate) fn compute_tile_dimensions(
+    x: usize,
+    y: usize,
+    image_width: u32,
+    image_height: u32,
+    tile_width: Option<u32>,
+    tile_height: Option<u32>,
+    rows_per_strip: Option<u32>,
+) -> (u32, u32) {
+    // For tiled images (both tile_width and tile_height must be present)
+    if let (Some(tile_width), Some(tile_height)) = (tile_width, tile_height) {
+        let x_offset = (x as u32) * tile_width;
+        let y_offset = (y as u32) * tile_height;
+
+        let actual_width = std::cmp::min(tile_width, image_width.saturating_sub(x_offset));
+        let actual_height = std::cmp::min(tile_height, image_height.saturating_sub(y_offset));
+
+        (actual_width, actual_height)
+    } else {
+        // For stripped images (or fallback)
+        let strip_height = rows_per_strip.unwrap_or(image_height);
+        let y_offset = (y as u32) * strip_height;
+        let actual_height = std::cmp::min(strip_height, image_height.saturating_sub(y_offset));
+
+        (image_width, actual_height)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tile_dimensions_full_tiles() {
+        // 512x512 image with 256x256 tiles - all tiles are full size
+        assert_eq!(
+            compute_tile_dimensions(0, 0, 512, 512, Some(256), Some(256), None),
+            (256, 256),
+            "Top-left tile should be full size"
+        );
+        assert_eq!(
+            compute_tile_dimensions(1, 0, 512, 512, Some(256), Some(256), None),
+            (256, 256),
+            "Top-right tile should be full size"
+        );
+        assert_eq!(
+            compute_tile_dimensions(0, 1, 512, 512, Some(256), Some(256), None),
+            (256, 256),
+            "Bottom-left tile should be full size"
+        );
+        assert_eq!(
+            compute_tile_dimensions(1, 1, 512, 512, Some(256), Some(256), None),
+            (256, 256),
+            "Bottom-right tile should be full size"
+        );
+    }
+
+    #[test]
+    fn test_tile_dimensions_edge_tiles() {
+        // 500x500 image with 256x256 tiles - edge tiles are partial
+        assert_eq!(
+            compute_tile_dimensions(0, 0, 500, 500, Some(256), Some(256), None),
+            (256, 256),
+            "Top-left tile should be full size"
+        );
+        assert_eq!(
+            compute_tile_dimensions(1, 0, 500, 500, Some(256), Some(256), None),
+            (244, 256),
+            "Top-right edge tile should be 244 pixels wide"
+        );
+        assert_eq!(
+            compute_tile_dimensions(0, 1, 500, 500, Some(256), Some(256), None),
+            (256, 244),
+            "Bottom-left edge tile should be 244 pixels tall"
+        );
+        assert_eq!(
+            compute_tile_dimensions(1, 1, 500, 500, Some(256), Some(256), None),
+            (244, 244),
+            "Bottom-right corner tile should be 244x244"
+        );
+    }
+
+    #[test]
+    fn test_strip_dimensions() {
+        // 1024x768 stripped image with 128 rows per strip
+        assert_eq!(
+            compute_tile_dimensions(0, 0, 1024, 768, None, None, Some(128)),
+            (1024, 128),
+            "First strip should be full width and height"
+        );
+        assert_eq!(
+            compute_tile_dimensions(0, 5, 1024, 768, None, None, Some(128)),
+            (1024, 128),
+            "Middle strip should be full size"
+        );
+        assert_eq!(
+            compute_tile_dimensions(0, 5, 1024, 768, None, None, Some(128)),
+            (1024, 128),
+            "Last strip (768 / 128 = 6 strips, index 5) should be full height"
+        );
+    }
+
+    #[test]
+    fn test_strip_dimensions_partial_last_strip() {
+        // 1024x700 stripped image with 128 rows per strip
+        // Last strip should be: 700 - (5 * 128) = 60 rows
+        assert_eq!(
+            compute_tile_dimensions(0, 0, 1024, 700, None, None, Some(128)),
+            (1024, 128),
+            "First strip should be full height"
+        );
+        assert_eq!(
+            compute_tile_dimensions(0, 5, 1024, 700, None, None, Some(128)),
+            (1024, 60),
+            "Last strip should be 60 pixels tall"
+        );
+    }
+
+    #[test]
+    fn test_single_tile_image() {
+        // Image smaller than tile size
+        assert_eq!(
+            compute_tile_dimensions(0, 0, 100, 100, Some(256), Some(256), None),
+            (100, 100),
+            "Single tile should match image dimensions"
+        );
+    }
+
+    #[test]
+    fn test_strip_default_height() {
+        // Stripped image with no rows_per_strip (defaults to full image height)
+        assert_eq!(
+            compute_tile_dimensions(0, 0, 1024, 768, None, None, None),
+            (1024, 768),
+            "Strip should default to full image height"
+        );
+    }
+}

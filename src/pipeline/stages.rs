@@ -23,14 +23,14 @@
 
 use crate::checkpoint::CheckpointManager;
 use crate::crs::{self, ProjCache};
+use crate::dtype::ChunkData;
 use crate::index::{CogTile, InputIndex, OutputChunk, OutputGrid, SpatialLookup};
 use crate::io::{CogReader, GeoTransform, PixelWindow, WindowData, ZarrWriter};
 use crate::pipeline::Metrics;
-use crate::transform::{mosaic_tiles, ReprojectConfig, Reprojector};
+use crate::transform::{mosaic_tiles, ReprojectConfig};
 use anyhow::Result;
 use dashmap::DashSet;
 use futures::stream::{self, StreamExt};
-use ndarray::Array4;
 use std::cell::RefCell;
 use std::sync::Arc;
 use std::time::Instant;
@@ -246,7 +246,7 @@ pub struct FetchedChunk {
 /// Data passed from mosaic worker to Zarr writer.
 pub struct MosaicedChunk {
     pub chunk: OutputChunk,
-    pub data: Array4<i8>,
+    pub data: ChunkData,
 }
 
 /// Configuration for the decoupled pipeline.
@@ -518,7 +518,6 @@ impl Pipeline {
                         num_bands: output_grid.num_bands,
                     };
 
-                    let target_crs = reproject_config.target_crs.clone();
                     let window_data = fetched.window_data;
                     let metrics_clone = metrics.clone();
 
@@ -526,8 +525,7 @@ impl Pipeline {
                     let mosaic_start = Instant::now();
                     let mosaic_result = tokio::task::spawn_blocking(move || {
                         let start = Instant::now();
-                        let reprojector = Reprojector::new(&target_crs);
-                        let result = mosaic_tiles(&window_data, &reprojector, &reproject_config);
+                        let result = mosaic_tiles(&window_data, &reproject_config);
                         metrics_clone.add_reproject_time(start.elapsed());
                         result
                     })
@@ -603,7 +601,7 @@ impl Pipeline {
 
                     let write_start = Instant::now();
                     let write_result = tokio::task::block_in_place(|| {
-                        writer.write_chunk_sync(&mosaiced.chunk, mosaiced.data)
+                        writer.write_chunk_dyn(&mosaiced.chunk, mosaiced.data)
                     });
                     let write_duration = write_start.elapsed();
 
